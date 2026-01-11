@@ -37,37 +37,23 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <asio/steady_timer.hpp>
 #include <asio/streambuf.hpp>
 #include <asio/use_awaitable.hpp>
+#include <concepts>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <utility>
-#include <concepts>
 
 #include "interface.hpp"
-
-template <>
-struct fmt::formatter<nats_asio::string_view> {
-    template <typename ParseContext>
-    constexpr auto parse(ParseContext& ctx) {
-        return ctx.begin();
-    }
-
-    template <typename FormatContext>
-    auto format(const nats_asio::string_view& d, FormatContext& ctx) {
-        return format_to(ctx.out(), "{}", d.data());
-    }
-};
 
 namespace nats_asio {
 
 namespace ssl = asio::ssl;
 
+constexpr auto sep = "\r\n";
+
 using asio::awaitable;
 using asio::use_awaitable;
 using asio::ip::tcp;
-
-constexpr auto sep = "\r\n";
-
 using string_view = std::string_view;
 using raw_socket = asio::ip::tcp::socket;
 using ssl_socket = asio::ssl::stream<asio::ip::tcp::socket>;
@@ -93,11 +79,9 @@ struct uni_socket {
     using endpoint_type = tcp::endpoint;
     using executor_type = typename Socket::executor_type;
 
-    uni_socket(aio& io, ssl::context& ctx) requires SslSocketType<Socket>
-        : m_socket(io, ctx) {}
+    uni_socket(aio& io, ssl::context& ctx) requires SslSocketType<Socket> : m_socket(io, ctx) {}
 
-    uni_socket(aio& io) requires RawSocketType<Socket>
-        : m_socket(io) {}
+    uni_socket(aio& io) requires RawSocketType<Socket> : m_socket(io) {}
 
     uni_socket(const uni_socket&) = delete;
     uni_socket& operator=(const uni_socket&) = delete;
@@ -342,8 +326,7 @@ struct parser_observer {
             co_return status("can't get line");
         }
 
-        if (header.size() < 3)
-        {
+        if (header.size() < 3) {
             co_return status("too small header");
         }
 
@@ -373,8 +356,8 @@ struct parser_observer {
                     std::size_t bytes_n = 0;
 
                     try {
-                        bytes_n =
-                            static_cast<std::size_t>(std::stoll(results[bytes_id].data(), nullptr, 10));
+                        bytes_n = static_cast<std::size_t>(
+                            std::stoll(results[bytes_id].data(), nullptr, 10));
                     } catch (const std::exception& e) {
                         co_return status(fmt::format("can't parse int in headers: {}", e.what()));
                     }
@@ -382,8 +365,8 @@ struct parser_observer {
                     if (reply_to) {
                         co_await observer->on_message(results[0], results[1], results[2], bytes_n);
                     } else {
-                        co_await observer->on_message(results[0], results[1], optional<string_view>(),
-                                                      bytes_n);
+                        co_await observer->on_message(results[0], results[1],
+                                                      optional<string_view>(), bytes_n);
                     }
 
                     co_await observer->consumed(bytes_n + 2);

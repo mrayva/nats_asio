@@ -123,9 +123,6 @@ struct iconnection {
 };
 using iconnection_sptr = std::shared_ptr<iconnection>;
 
-// typedef std::function<void(iconnection&, ctx)> on_connected_cb;
-// typedef std::function<void(iconnection&, ctx)> on_disconnected_cb;
-
 using on_connected_cb = std::function<asio::awaitable<void>(iconnection&)>;
 using on_disconnected_cb = std::function<asio::awaitable<void>(iconnection&)>;
 
