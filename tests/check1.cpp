@@ -36,7 +36,7 @@ TEST(small_messages, ping) {
     std::string payload("PING\r\n");
     std::string header;
     EXPECT_CALL(m, on_ping()).WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
-	
+
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
         auto s = co_await m.parse_header(header, ss, &m);
@@ -50,7 +50,7 @@ TEST(small_messages, pong) {
     std::string payload("PONG\r\n");
     std::string header;
     EXPECT_CALL(m, on_pong()).WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
-	
+
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
         auto s = co_await m.parse_header(header, ss, &m);
@@ -64,7 +64,7 @@ TEST(small_messages, ok) {
     std::string payload("+OK\r\n");
     std::string header;
     EXPECT_CALL(m, on_ok()).WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
-	
+
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
         auto s = co_await m.parse_header(header, ss, &m);
@@ -78,8 +78,7 @@ TEST(payload_messages, err) {
     string_view msg("some big error");
     auto payload = fmt::format("-ERR {}\r\n", msg);
     std::string header;
-    EXPECT_CALL(m, on_error(msg))
-        .WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
+    EXPECT_CALL(m, on_error(msg)).WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
@@ -88,7 +87,6 @@ TEST(payload_messages, err) {
         co_return;
     });
 }
-
 
 TEST(payload_messages, info) {
     parser_mock m;
@@ -96,7 +94,7 @@ TEST(payload_messages, info) {
     auto payload = fmt::format("INFO {}\r\n", info_msg);
     std::string header;
     EXPECT_CALL(m, on_info(info_msg)).WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
-	
+
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
         auto s = co_await m.parse_header(header, ss, &m);
@@ -105,15 +103,14 @@ TEST(payload_messages, info) {
     });
 }
 
-
 TEST(payload_messages, info_with_overflow) {
     parser_mock m;
     string_view info_msg(R"({"verbose":false,"pedantic":false,"tls_required":false})");
     std::string header;
     auto payload = fmt::format("INFO {}\r\n", info_msg);
-    auto payload_over = payload + "-ERR abrakadabra\r\n";	
+    auto payload_over = payload + "-ERR abrakadabra\r\n";
     EXPECT_CALL(m, on_info(info_msg)).WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
-	
+
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
         auto s = co_await m.parse_header(header, ss, &m);
@@ -133,16 +130,17 @@ TEST(payload_messages, on_message) {
     std::string payload = fmt::format("MSG {} {} {}\r\n{}\r\n", subject, sid, msg_size, msg);
     std::string payload2 =
         fmt::format("MSG {} {} {} {}\r\n{}\r\n", subject, sid, reply_to, msg_size, msg);
-		
+
     EXPECT_CALL(m, on_message(subject, sid, optional<string_view>(), msg_size))
         .WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
 
     EXPECT_CALL(m, on_message(subject, sid, optional<string_view>(reply_to), msg_size))
         .WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
 
-    EXPECT_CALL(m, consumed(msg_size + 2)).Times(2)
+    EXPECT_CALL(m, consumed(msg_size + 2))
+        .Times(2)
         .WillRepeatedly(testing::InvokeWithoutArgs(make_ready_awaitable));
-		
+
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
         auto s1 = co_await m.parse_header(header, ss, &m);
@@ -171,13 +169,13 @@ TEST(payload_messages, on_message_binary) {
     buffer.push_back('\r');
     buffer.push_back('\n');
     std::string header;
-	
+
     EXPECT_CALL(m, on_message(subject, sid, optional<string_view>(), msg_size))
         .WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
-		
+
     EXPECT_CALL(m, consumed(msg_size + 2))
-		.WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
-	
+        .WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
+
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss2(payload_header);
         auto s1 = co_await m.parse_header(header, ss2, &m);
@@ -204,13 +202,13 @@ TEST(payload_messages, on_message_not_full) {
     string_view subject("sub1.1");
     std::string header;
     auto payload = fmt::format("MSG {} {} {}\r\n{}", subject, sid, msg_size, msg);
-	
+
     EXPECT_CALL(m, on_message(subject, sid, optional<string_view>(), msg_size))
         .WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
-		
+
     EXPECT_CALL(m, consumed(msg_size + 2))
-		.WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
-	
+        .WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
+
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
         auto s1 = co_await m.parse_header(header, ss, &m);

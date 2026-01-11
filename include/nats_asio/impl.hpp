@@ -24,16 +24,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 
 #pragma once
 
+#include <asio/awaitable.hpp>
 #include <asio/buffer.hpp>
+#include <asio/co_spawn.hpp>
 #include <asio/connect.hpp>
 #include <asio/detached.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/read.hpp>
 #include <asio/read_until.hpp>
-
-// #include <asio/spawn.hpp>
-#include <asio/awaitable.hpp>
-#include <asio/co_spawn.hpp>
 #include <asio/ssl/context.hpp>
 #include <asio/ssl/stream.hpp>
 #include <asio/steady_timer.hpp>
@@ -493,7 +491,6 @@ public:
           m_connected_cb(connected_cb), m_disconnected_cb(disconnected_cb), m_ssl_ctx(ctx),
           m_socket(io, *ctx.get()) {}
 
-    // Constructor for Raw Sockets
     connection(aio& io, const on_connected_cb& connected_cb,
                const on_disconnected_cb& disconnected_cb)
         : m_sid(0), m_max_payload(0), m_io(io), m_is_connected(false), m_stop_flag(false),
@@ -504,10 +501,7 @@ public:
 
     virtual void start(const connect_config& conf) override {
         asio::co_spawn(
-            asio::make_strand(m_io),
-            [this, conf]() -> awaitable<void> {
-                return run(conf); // This returns the awaitable to co_spawn
-            },
+            asio::make_strand(m_io), [this, conf]() -> awaitable<void> { return run(conf); },
             asio::detached);
     }
 
@@ -540,13 +534,12 @@ public:
         std::size_t total_size = header.size() + n + 2;
 
         try {
-            // Use co_await and asio::use_awaitable instead of c[ec]
             co_await asio::async_write(m_socket, buffers, asio::use_awaitable);
         } catch (const std::system_error& e) {
             co_return status(e.code().message());
         }
 
-        co_return status(); // Success
+        co_return status();
     }
 
     virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) override {
@@ -561,13 +554,12 @@ public:
         std::string unsub_payload(fmt::format("UNSUB {}\r\n", sid));
 
         try {
-            // Use co_await and asio::use_awaitable instead of c[ec]
             co_await asio::async_write(m_socket, asio::buffer(unsub_payload), asio::use_awaitable);
         } catch (const std::system_error& e) {
             co_return status(e.code().message());
         }
 
-        co_return status(); // Success
+        co_return status();
     }
 
     virtual asio::awaitable<std::pair<isubscription_sptr, status>>
@@ -583,7 +575,6 @@ public:
                                   : fmt::format("SUB {} {} {}\r\n", subject, "", sid);
 
         try {
-            // C++20 awaitable usage
             co_await asio::async_write(m_socket, asio::buffer(payload), asio::use_awaitable);
         } catch (const std::system_error& e) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
@@ -653,11 +644,9 @@ private:
 
         auto b = m_buf.data();
         if (reply_to.has_value()) {
-            co_await it->second->m_cb(subject, reply_to, static_cast<const char*>(b.data()),
-                                      n /*, use_awaitable*/);
+            co_await it->second->m_cb(subject, reply_to, static_cast<const char*>(b.data()), n);
         } else {
-            co_await it->second->m_cb(subject, {}, static_cast<const char*>(b.data()),
-                                      n /*, use_awaitable*/);
+            co_await it->second->m_cb(subject, {}, static_cast<const char*>(b.data()), n);
         }
 
         co_return;
@@ -732,11 +721,10 @@ private:
                 should_disconnect = true;
             }
 
-            // Logic requiring co_await must be outside the catch block
             if (should_disconnect) {
                 m_is_connected = false;
                 asio::error_code ec;
-                m_socket.close(ec); // Synchronous void call
+                m_socket.close(ec);
 
                 if (m_disconnected_cb) {
                     co_await m_disconnected_cb(*this);
@@ -764,24 +752,6 @@ private:
             co_return status(e.what());
         }
     }
-
-    ///*
-    status handle_error(ctx /*c*/) {
-        if (ec) {
-            auto original_msg = ec.message();
-            m_is_connected = false;
-            co_await m_socket.close(ec); // TODO: handle it if error
-
-            if (m_disconnected_cb != nullptr) {
-                m_disconnected_cb(*this);
-            }
-
-            return status(original_msg);
-        }
-
-        return {};
-    }
-    //*/
 
     std::string prepare_info(const connect_config& o) {
         constexpr auto connect_payload = "CONNECT {}\r\n";

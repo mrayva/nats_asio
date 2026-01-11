@@ -21,23 +21,26 @@ class worker {
 public:
     worker(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval)
         : m_stats_interval(stats_interval), m_counter(0), m_ioc(ioc), m_log(console) {
-        asio::spawn(ioc, std::bind(&worker::stats_timer, this, std::placeholders::_1),
-                    asio::detached);
+        if (m_stats_interval > 0) {
+            asio::co_spawn(
+                ioc, [this]() -> asio::awaitable<void> { return stats_timer(); }, asio::detached);
+        }
     }
 
-    void stats_timer(asio::yield_context ctx) {
-        asio::steady_timer timer(m_ioc);
-        asio::error_code error;
+    asio::awaitable<void> stats_timer() {
+        asio::steady_timer timer(co_await asio::this_coro::executor);
 
-        for (;;) {
-            m_log->info("stats: messages {} during {} seconds", m_counter, m_stats_interval);
+        while (true) {
             timer.expires_after(std::chrono::seconds(m_stats_interval));
-            m_counter = 0;
-            timer.async_wait(ctx[error]);
 
-            if (error) {
-                return;
+            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+
+            if (ec) {
+                co_return;
             }
+
+            m_log->info("Stats: {} events/sec", m_counter / m_stats_interval);
+            m_counter = 0;
         }
     }
 
@@ -61,7 +64,6 @@ public:
     }
 
     asio::awaitable<void> publish() {
-        // Correctly get the executor from the coroutine context
         asio::steady_timer timer(co_await asio::this_coro::executor);
         const std::string msg("{\"value\": 123}");
 
@@ -76,11 +78,10 @@ public:
 
             timer.expires_after(std::chrono::milliseconds(m_publish_interval_ms));
 
-            // Use asio::as_tuple with use_awaitable to get the error_code back
             auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
 
             if (ec) {
-                co_return; // Exit if timer was cancelled or failed
+                co_return;
             }
         }
     }

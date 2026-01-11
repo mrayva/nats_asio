@@ -17,12 +17,12 @@ option(NATS_ASIO_INSTALL "Generate install target" ON)
 find_program(CLANG_FORMAT_EXE NAMES "clang-format")
 
 if(CLANG_FORMAT_EXE)
-    # 2. Gather all source and header files
     file(GLOB_RECURSE ALL_SOURCE_FILES 
         *.cpp *.hpp *.c *.h *.cxx *.hxx *.cc *.hh
     )
 
-    # 3. Define a custom 'format' target
+	list(FILTER ALL_SOURCE_FILES EXCLUDE REGEX ".*/build/.*")
+ 
     add_custom_target(format
         COMMAND ${CLANG_FORMAT_EXE} -i -style=file ${ALL_SOURCE_FILES}
         COMMENT "Formatting project files with clang-format..."
@@ -36,7 +36,6 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(asio CONFIG REQUIRED) 
 find_package(OpenSSL REQUIRED)
-find_package(Boost REQUIRED COMPONENTS context)
 
 add_library(nats_asio INTERFACE)
 add_library(nats_asio::nats_asio ALIAS nats_asio)
@@ -65,7 +64,6 @@ target_link_libraries(nats_asio
         spdlog::spdlog
         asio::asio 
         OpenSSL::SSL
-		Boost::context 
 )
 
 target_compile_features(nats_asio INTERFACE cxx_std_20)
