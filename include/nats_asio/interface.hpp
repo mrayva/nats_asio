@@ -24,15 +24,10 @@ persons to whom the Software is furnished to do so, subject to the following con
 
 #pragma once
 
-#include <fmt/format.h>
-
-#include <asio/deadline_timer.hpp>
 #include <asio/io_context.hpp>
-#include <asio/ip/tcp.hpp>
 #include <asio/spawn.hpp>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string_view>
 
 namespace nats_asio {
@@ -47,17 +42,13 @@ using on_message_cb = std::function<asio::awaitable<void>(std::string_view subje
                                                           std::optional<std::string_view> reply_to,
                                                           const char* raw, std::size_t n)>;
 
-} // namespace nats_asio
-
-namespace nats_asio {
-
 class status {
 public:
     status() = default;
 
     status(const std::string& error) : m_error(error) {}
 
-    virtual ~status() = default;
+    ~status() = default;
 
     bool failed() const {
         return m_error.has_value();
@@ -113,12 +104,13 @@ struct iconnection {
 
     virtual bool is_connected() = 0;
 
-    virtual asio::awaitable<status> publish(string_view subject, const char* raw, std::size_t n,
-                                            optional<string_view> reply_to) = 0;
+    [[nodiscard]] virtual asio::awaitable<status> publish(string_view subject, const char* raw,
+                                                          std::size_t n,
+                                                          optional<string_view> reply_to) = 0;
 
-    virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) = 0;
+    [[nodiscard]] virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) = 0;
 
-    virtual asio::awaitable<std::pair<isubscription_sptr, status>>
+    [[nodiscard]] virtual asio::awaitable<std::pair<isubscription_sptr, status>>
     subscribe(string_view subject, optional<string_view> queue, on_message_cb cb) = 0;
 };
 using iconnection_sptr = std::shared_ptr<iconnection>;

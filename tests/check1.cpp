@@ -39,7 +39,7 @@ TEST(small_messages, ping) {
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
-        auto s = co_await m.parse_header(header, ss, &m);
+        auto s = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(false, s.failed());
         co_return;
     });
@@ -53,7 +53,7 @@ TEST(small_messages, pong) {
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
-        auto s = co_await m.parse_header(header, ss, &m);
+        auto s = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(false, s.failed());
         co_return;
     });
@@ -67,7 +67,7 @@ TEST(small_messages, ok) {
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
-        auto s = co_await m.parse_header(header, ss, &m);
+        auto s = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(false, s.failed());
         co_return;
     });
@@ -82,7 +82,7 @@ TEST(payload_messages, err) {
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
-        auto s = co_await m.parse_header(header, ss, &m);
+        auto s = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(false, s.failed());
         co_return;
     });
@@ -97,7 +97,7 @@ TEST(payload_messages, info) {
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
-        auto s = co_await m.parse_header(header, ss, &m);
+        auto s = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(false, s.failed());
         co_return;
     });
@@ -113,7 +113,7 @@ TEST(payload_messages, info_with_overflow) {
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
-        auto s = co_await m.parse_header(header, ss, &m);
+        auto s = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(false, s.failed());
         co_return;
     });
@@ -143,10 +143,10 @@ TEST(payload_messages, on_message) {
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
-        auto s1 = co_await m.parse_header(header, ss, &m);
+        auto s1 = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(false, s1.failed());
         std::stringstream ss2(payload2);
-        auto s2 = co_await m.parse_header(header, ss2, &m);
+        auto s2 = co_await protocol_parser::parse_header(header, ss2, m);
         EXPECT_EQ(false, s2.failed());
     });
 }
@@ -178,7 +178,7 @@ TEST(payload_messages, on_message_binary) {
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss2(payload_header);
-        auto s1 = co_await m.parse_header(header, ss2, &m);
+        auto s1 = co_await protocol_parser::parse_header(header, ss2, m);
         EXPECT_EQ(false, s1.failed());
     });
 }
@@ -189,7 +189,7 @@ TEST(payload_messages, on_message_not_full_no_sep) {
     std::string header;
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
-        auto s1 = co_await m.parse_header(header, ss, &m);
+        auto s1 = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(true, s1.failed());
     });
 }
@@ -211,7 +211,7 @@ TEST(payload_messages, on_message_not_full) {
 
     async_process([&]() -> asio::awaitable<void> {
         std::stringstream ss(payload);
-        auto s1 = co_await m.parse_header(header, ss, &m);
+        auto s1 = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(false, s1.failed());
     });
 }

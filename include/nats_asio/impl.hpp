@@ -24,6 +24,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 
 #pragma once
 
+#include <fmt/format.h>
+
 #include <asio/awaitable.hpp>
 #include <asio/buffer.hpp>
 #include <asio/co_spawn.hpp>
@@ -319,9 +321,11 @@ struct parser_observer {
     virtual asio::awaitable<void> on_message(string_view subject, string_view sid,
                                              optional<string_view> reply_to, std::size_t n) = 0;
     virtual asio::awaitable<void> consumed(std::size_t n) = 0;
+};
 
-    asio::awaitable<status> parse_header(std::string& header, std::istream& is,
-                                         parser_observer* observer) {
+struct protocol_parser {
+    static asio::awaitable<status> parse_header(std::string& header, std::istream& is,
+                                                parser_observer& observer) {
         if (!std::getline(is, header)) {
             co_return status("can't get line");
         }
@@ -363,13 +367,13 @@ struct parser_observer {
                     }
 
                     if (reply_to) {
-                        co_await observer->on_message(results[0], results[1], results[2], bytes_n);
+                        co_await observer.on_message(results[0], results[1], results[2], bytes_n);
                     } else {
-                        co_await observer->on_message(results[0], results[1],
-                                                      optional<string_view>(), bytes_n);
+                        co_await observer.on_message(results[0], results[1],
+                                                     optional<string_view>(), bytes_n);
                     }
 
-                    co_await observer->consumed(bytes_n + 2);
+                    co_await observer.consumed(bytes_n + 2);
                     co_return status();
                 }
                 break;
@@ -377,24 +381,24 @@ struct parser_observer {
             case 'I': // INFO
                 if (v.starts_with("INFO ")) {
                     auto info_msg = v.substr(5);
-                    co_await observer->on_info(info_msg);
+                    co_await observer.on_info(info_msg);
                     co_return status();
                 }
                 break;
 
             case 'P': // PING, PONG
                 if (v == "PING") {
-                    co_await observer->on_ping();
+                    co_await observer.on_ping();
                     co_return status();
                 } else if (v == "PONG") {
-                    co_await observer->on_pong();
+                    co_await observer.on_pong();
                     co_return status();
                 }
                 break;
 
             case '+': // +OK
                 if (v == "+OK") {
-                    co_await observer->on_ok();
+                    co_await observer.on_ok();
                     co_return status();
                 }
                 break;
@@ -402,7 +406,7 @@ struct parser_observer {
             case '-': // -ERR
                 if (v.starts_with("-ERR")) {
                     auto err_msg = (v.size() > 5) ? v.substr(5) : string_view{};
-                    co_await observer->on_error(err_msg);
+                    co_await observer.on_error(err_msg);
                     co_return status();
                 }
                 break;
@@ -411,7 +415,7 @@ struct parser_observer {
         co_return status("unknown message");
     }
 
-    std::vector<string_view> split_sv(string_view str, string_view delims = " ") {
+    static std::vector<string_view> split_sv(string_view str, string_view delims = " ") {
         std::vector<string_view> output;
         output.reserve(str.size() / 2);
 
@@ -583,7 +587,7 @@ private:
     }
 
     awaitable<void> on_message(string_view subject, string_view sid_str,
-                               optional<string_view> reply_to, std::size_t n) {
+                               optional<string_view> reply_to, std::size_t n) override {
         int bytes_to_transfer = int(n) + 2 - int(m_buf.size());
 
         if (bytes_to_transfer > 0) {
@@ -635,7 +639,7 @@ private:
 
             std::string header;
             std::istream is(&m_buf);
-            auto s = co_await parse_header(header, is, this);
+            auto s = co_await protocol_parser::parse_header(header, is, *this);
             if (s.failed()) {
                 co_return s;
             }
@@ -679,7 +683,7 @@ private:
                 co_await asio::async_read_until(m_socket, m_buf, sep, asio::use_awaitable);
 
                 std::istream is(&m_buf);
-                auto s = co_await parse_header(header, is, this);
+                auto s = co_await protocol_parser::parse_header(header, is, *this);
                 if (s.failed()) {
                     continue;
                 }
