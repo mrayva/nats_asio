@@ -1,7 +1,7 @@
 # nats-asio
 
 ## Overview
-This is [nats-io](https://nats.io/) client writen in c++20 with use of [boost](https://www.boost.org/) [asio](https://www.boost.org/doc/libs/release/libs/asio/) and coroutines libraries.
+This is [nats-io](https://nats.io/) client writen in c++20 with use of [asio] coroutines libraries.
 
 ## Requirements
 For Library
