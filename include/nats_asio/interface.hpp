@@ -7,8 +7,8 @@ Copyright (c) 2019 Vladislav Troinich
     of this software and associated documentation files (the "Software"), to deal
     in the Software without restriction, including without limitation the rights
     to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-                                                              copies of the Software, and to permit persons to whom the
-Software is furnished to do so, subject to the following conditions:
+                                                              copies of the Software, and to permit
+persons to whom the Software is furnished to do so, subject to the following conditions:
 
     The above copyright notice and this permission notice shall be included in all
     copies or substantial portions of the Software.
@@ -25,44 +25,27 @@ Software is furnished to do so, subject to the following conditions:
 #pragma once
 
 #include <fmt/format.h>
-#include <spdlog/spdlog.h>
 
-#include <boost/asio/deadline_timer.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/spawn.hpp>
-
-#include <boost/concept/detail/general.hpp>
-
-#if __cplusplus >= 201703L
-#include <optional>
-#include <string_view>
-#else
-#include <boost/optional.hpp>
-#include <boost/utility/string_view.hpp>
-#endif
-
+#include <asio/deadline_timer.hpp>
+#include <asio/io_context.hpp>
+#include <asio/ip/tcp.hpp>
+#include <asio/spawn.hpp>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string_view>
 
 namespace nats_asio {
 
-#if __cplusplus >= 201703L
 using std::optional;
 using std::string_view;
 
-#else
-using boost::optional;
-using boost::string_view;
+typedef asio::io_context aio;
+typedef asio::yield_context ctx;
 
-#endif
-
-typedef boost::asio::io_context aio;
-typedef std::shared_ptr<spdlog::logger> logger;
-typedef boost::asio::yield_context ctx;
-
-typedef std::function<void(string_view subject, optional<string_view> reply_to, const char* raw, std::size_t n, ctx c)>
-    on_message_cb;
+using on_message_cb = std::function<asio::awaitable<void>(std::string_view subject,
+                                                          std::optional<std::string_view> reply_to,
+                                                          const char* raw, std::size_t n)>;
 
 } // namespace nats_asio
 
@@ -76,7 +59,9 @@ public:
 
     virtual ~status() = default;
 
-    bool failed() const { return m_error.has_value(); }
+    bool failed() const {
+        return m_error.has_value();
+    }
 
     std::string error() const {
         if (!m_error.has_value())
@@ -128,20 +113,24 @@ struct iconnection {
 
     virtual bool is_connected() = 0;
 
-    virtual status publish(string_view subject, const char* raw, std::size_t n, optional<string_view> reply_to,
-                           ctx c) = 0;
+    virtual asio::awaitable<status> publish(string_view subject, const char* raw, std::size_t n,
+                                            optional<string_view> reply_to) = 0;
 
-    virtual status unsubscribe(const isubscription_sptr& p, ctx c) = 0;
+    virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) = 0;
 
-    virtual std::pair<isubscription_sptr, status> subscribe(string_view subject, optional<string_view> queue,
-                                                            on_message_cb cb, ctx c) = 0;
+    virtual asio::awaitable<std::pair<isubscription_sptr, status>>
+    subscribe(string_view subject, optional<string_view> queue, on_message_cb cb) = 0;
 };
 typedef std::shared_ptr<iconnection> iconnection_sptr;
 
-typedef std::function<void(iconnection&, ctx)> on_connected_cb;
-typedef std::function<void(iconnection&, ctx)> on_disconnected_cb;
+// typedef std::function<void(iconnection&, ctx)> on_connected_cb;
+// typedef std::function<void(iconnection&, ctx)> on_disconnected_cb;
 
-iconnection_sptr create_connection(aio& io, const logger& log, const on_connected_cb& connected_cb,
-                                   const on_disconnected_cb& disconnected_cb, optional<ssl_config> ssl_conf);
+using on_connected_cb = std::function<asio::awaitable<void>(iconnection&)>;
+using on_disconnected_cb = std::function<asio::awaitable<void>(iconnection&)>;
+
+iconnection_sptr create_connection(aio& io, const on_connected_cb& connected_cb,
+                                   const on_disconnected_cb& disconnected_cb,
+                                   optional<ssl_config> ssl_conf);
 
 } // namespace nats_asio

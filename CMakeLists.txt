@@ -1,53 +1,148 @@
-cmake_minimum_required(VERSION 3.12)
+cmake_minimum_required(VERSION 3.15)
 
-project(nats_asio)
-
-set(CMAKE_CXX_STANDARD 14)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-option(ENABLE_TESTS "enable tests" OFF)
-option(BUILD_NATS_TOOL "build nats tool" OFF)
-
-add_definitions(-DSPDLOG_FMT_EXTERNAL)
-
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
-
-include(${CMAKE_BINARY_DIR}/conanbuildinfo.cmake)
-conan_basic_setup()
-
-find_package(Boost REQUIRED)
-find_package(spdlog REQUIRED)
-find_package(OpenSSL REQUIRED)
-
-include_directories(
-        "${CMAKE_CURRENT_LIST_DIR}/include"
+project(nats_asio 
+    VERSION 0.0.1
+    DESCRIPTION "Header-only C++ NATS client using standalone Asio"
+    LANGUAGES CXX
 )
 
-set(LINCLUDE "${CMAKE_CURRENT_LIST_DIR}/include/nats_asio")
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(NATS_ASIO_LIB_SRC
-        "${LINCLUDE}/interface.hpp"
-        "impl.hpp"
-        "impl.cpp"
-        )
+option(NATS_ASIO_BUILD_TESTS "Build tests" ON)
+option(NATS_ASIO_BUILD_SAMPLES "Build sample programs" ON)
+option(NATS_ASIO_INSTALL "Generate install target" ON)
 
-list(REMOVE_ITEM CONAN_LIBS "boost_unit_test_framework")
+find_program(CLANG_FORMAT_EXE NAMES "clang-format")
 
-add_library(nats_asio ${NATS_ASIO_LIB_SRC})
-target_link_libraries(nats_asio ${CONAN_LIBS})
+if(CLANG_FORMAT_EXE)
+    # 2. Gather all source and header files
+    file(GLOB_RECURSE ALL_SOURCE_FILES 
+        *.cpp *.hpp *.c *.h *.cxx *.hxx *.cc *.hh
+    )
 
-if (BUILD_NATS_TOOL)
-    add_executable(nats_tool samples/nats_tool.cpp)
-    target_link_libraries(nats_tool nats_asio ${CONAN_LIBS})
+    # 3. Define a custom 'format' target
+    add_custom_target(format
+        COMMAND ${CLANG_FORMAT_EXE} -i -style=file ${ALL_SOURCE_FILES}
+        COMMENT "Formatting project files with clang-format..."
+    )
+else()
+    message(WARNING "clang-format not found; 'format' target will not be available.")
 endif()
 
-if (ENABLE_TESTS)
+find_package(fmt CONFIG REQUIRED)
+find_package(nlohmann_json CONFIG REQUIRED)
+find_package(spdlog CONFIG REQUIRED)
+find_package(asio CONFIG REQUIRED) 
+find_package(OpenSSL REQUIRED)
+find_package(Boost REQUIRED COMPONENTS context)
+
+add_library(nats_asio INTERFACE)
+add_library(nats_asio::nats_asio ALIAS nats_asio)
+
+set(NATS_ASIO_HEADERS
+    include/nats_asio/interface.hpp
+    include/nats_asio/impl.hpp
+)
+
+target_sources(nats_asio INTERFACE
+    FILE_SET HEADERS
+    BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/include
+    FILES ${NATS_ASIO_HEADERS}
+)
+
+target_include_directories(nats_asio 
+    INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(nats_asio 
+    INTERFACE
+        fmt::fmt
+        nlohmann_json::nlohmann_json
+        spdlog::spdlog
+        asio::asio 
+        OpenSSL::SSL
+		Boost::context 
+)
+
+target_compile_features(nats_asio INTERFACE cxx_std_20)
+
+# Samples
+if(NATS_ASIO_BUILD_SAMPLES)
+    find_package(cxxopts CONFIG REQUIRED)
+    
+    add_executable(nats_tool samples/nats_tool.cpp)
+    target_link_libraries(nats_tool 
+        PRIVATE 
+            nats_asio::nats_asio
+            cxxopts::cxxopts
+    )
+    
+    set_target_properties(nats_tool PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+endif()
+
+# Tests
+if(NATS_ASIO_BUILD_TESTS)
     enable_testing()
-    find_package(GTest REQUIRED)
-    include_directories(${GTEST_INCLUDE_DIRS})
+    find_package(GTest CONFIG REQUIRED)
+    
     add_executable(parser_test tests/check1.cpp)
-    target_link_libraries(parser_test GTest::GTest GTest::Main ${CONAN_LIBS})
-    add_test(DefaultTestSuite default_test_suite)
-endif ()
+    target_link_libraries(parser_test 
+        PRIVATE 
+            nats_asio::nats_asio
+            GTest::gtest_main
+            GTest::gmock_main
+    )
+    
+    set_target_properties(parser_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+    )
+    
+    add_test(NAME parser_test COMMAND parser_test)
+endif()
 
-
+# Installation (same as before)
+if(NATS_ASIO_INSTALL)
+    include(GNUInstallDirs)
+    include(CMakePackageConfigHelpers)
+    
+    install(DIRECTORY include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.hpp"
+    )
+    
+    install(TARGETS nats_asio
+        EXPORT nats_asio-targets
+        FILE_SET HEADERS
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+    
+    install(EXPORT nats_asio-targets
+        FILE nats_asio-targets.cmake
+        NAMESPACE nats_asio::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nats_asio
+    )
+    
+    write_basic_package_version_file(
+        "${CMAKE_CURRENT_BINARY_DIR}/nats_asio-config-version.cmake"
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+    
+    configure_package_config_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nats_asio-config.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/nats_asio-config.cmake"
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nats_asio
+    )
+    
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/nats_asio-config.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/nats_asio-config-version.cmake"
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nats_asio
+    )
+endif()

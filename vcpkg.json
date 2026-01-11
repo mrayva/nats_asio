@@ -1,0 +1,13 @@
+{
+  "name": "nats-asio",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "cxxopts",
+    "fmt",
+	"nlohmann-json",
+	"spdlog",
+    "asio",
+    "openssl",
+	"gtest"
+  ]
+}

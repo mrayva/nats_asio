@@ -1,15 +1,16 @@
-#include <nats_asio/interface.hpp>
-
+#include <fmt/format.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
-#include "cxxopts.hpp"
-#include <fmt/format.h>
-
+#include <asio/as_tuple.hpp>
+#include <asio/detached.hpp>
 #include <fstream>
 #include <iostream>
+#include <nats_asio/impl.hpp>
+#include <nats_asio/interface.hpp>
 #include <tuple>
-#include <boost/optional.hpp>
+
+#include "cxxopts.hpp"
 
 const std::string grub_mode("grub");
 const std::string gen_mode("gen");
@@ -18,26 +19,71 @@ enum class mode { grubber, generator };
 
 class worker {
 public:
-    worker(boost::asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval);
+    worker(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval)
+        : m_stats_interval(stats_interval), m_counter(0), m_ioc(ioc), m_log(console) {
+        asio::spawn(ioc, std::bind(&worker::stats_timer, this, std::placeholders::_1),
+                    asio::detached);
+    }
 
-    void stats_timer(boost::asio::yield_context ctx);
+    void stats_timer(asio::yield_context ctx) {
+        asio::steady_timer timer(m_ioc);
+        asio::error_code error;
+
+        for (;;) {
+            m_log->info("stats: messages {} during {} seconds", m_counter, m_stats_interval);
+            timer.expires_after(std::chrono::seconds(m_stats_interval));
+            m_counter = 0;
+            timer.async_wait(ctx[error]);
+
+            if (error) {
+                return;
+            }
+        }
+    }
 
 protected:
     int m_stats_interval;
     std::size_t m_counter;
-    boost::asio::io_context& m_ioc;
+    asio::io_context& m_ioc;
     std::shared_ptr<spdlog::logger> m_log;
 };
 
-class generator
-
-    : public worker {
+class generator : public worker {
 public:
-    generator(boost::asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
+    generator(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
               const nats_asio::iconnection_sptr& conn, const std::string& topic, int stats_interval,
-              int publish_interval_ms);
+              int publish_interval_ms)
+        : worker(ioc, console, stats_interval), m_publish_interval_ms(publish_interval_ms),
+          m_topic(topic), m_conn(conn) {
+        if (m_publish_interval_ms >= 0) {
+            asio::co_spawn(ioc, publish(), asio::detached);
+        }
+    }
 
-    void publish(boost::asio::yield_context ctx);
+    asio::awaitable<void> publish() {
+        // Correctly get the executor from the coroutine context
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        const std::string msg("{\"value\": 123}");
+
+        for (;;) {
+            auto s = co_await m_conn->publish(m_topic, msg.data(), msg.size(), {});
+
+            if (s.failed()) {
+                m_log->error("publish failed with error {}", s.error());
+            } else {
+                m_counter++;
+            }
+
+            timer.expires_after(std::chrono::milliseconds(m_publish_interval_ms));
+
+            // Use asio::as_tuple with use_awaitable to get the error_code back
+            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+
+            if (ec) {
+                co_return; // Exit if timer was cancelled or failed
+            }
+        }
+    }
 
 private:
     int m_publish_interval_ms;
@@ -47,11 +93,21 @@ private:
 
 class grubber : public worker {
 public:
-    grubber(boost::asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
-            bool print_to_stdout);
+    grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
+            bool print_to_stdout)
+        : worker(ioc, console, stats_interval), m_print_to_stdout(print_to_stdout) {}
 
-    void on_message(nats_asio::string_view, nats_asio::optional<nats_asio::string_view>, const char* raw,
-                    std::size_t /*n*/, nats_asio::ctx);
+    asio::awaitable<void> on_message(nats_asio::string_view,
+                                     nats_asio::optional<nats_asio::string_view>, const char* raw,
+                                     std::size_t /*, nats_asio::ctx*/) {
+        m_counter++;
+
+        if (m_print_to_stdout) {
+            std::cout << raw << std::endl;
+        }
+
+        co_return;
+    }
 
 private:
     bool m_print_to_stdout;
@@ -93,24 +149,24 @@ int main(int argc, char* argv[]) {
         std::string ssl_ca_file;
         std::string ssl_dh_file;
         /* clang-format off */
-		options.add_options()
-		("h,help", "Print help")
-		("d,debug", "Enable debugging")
-		("address", "Address of NATS server", cxxopts::value<std::string>(conf.address))
-		("port", "Port of NATS server", cxxopts::value<uint16_t >(conf.port))
-		("user", "Username", cxxopts::value<std::string >(username))
-		("pass", "Password", cxxopts::value<std::string >(password))
-		("mode", "mode", cxxopts::value<std::string >(mode))
-		("topic", "topic", cxxopts::value<std::string >(topic))
-		("stats_interval", "stat interval seconds", cxxopts::value<int>(stats_interval))
-		("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
-		("print", "print messages to stdout", cxxopts::value<bool>(print_to_stdout))
-		("ssl", "Enable ssl")
-		("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
-		("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
-		("ssl_ca", "ssl_ca", cxxopts::value<std::string>(ssl_ca_file))
-		("ssl_dh", "ssl_dh", cxxopts::value<std::string>(ssl_dh_file))
-		;
+        options.add_options()
+        ("h,help", "Print help")
+        ("d,debug", "Enable debugging")
+        ("address", "Address of NATS server", cxxopts::value<std::string>(conf.address))
+        ("port", "Port of NATS server", cxxopts::value<uint16_t >(conf.port))
+        ("user", "Username", cxxopts::value<std::string >(username))
+        ("pass", "Password", cxxopts::value<std::string >(password))
+        ("mode", "mode", cxxopts::value<std::string >(mode))
+        ("topic", "topic", cxxopts::value<std::string >(topic))
+        ("stats_interval", "stat interval seconds", cxxopts::value<int>(stats_interval))
+        ("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
+        ("print", "print messages to stdout", cxxopts::value<bool>(print_to_stdout))
+        ("ssl", "Enable ssl")
+        ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
+        ("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
+        ("ssl_ca", "ssl_ca", cxxopts::value<std::string>(ssl_ca_file))
+        ("ssl_dh", "ssl_dh", cxxopts::value<std::string>(ssl_dh_file))
+        ;
         /* clang-format on */
         options.parse_positional({"mode"});
         auto result = options.parse(argc, argv);
@@ -131,7 +187,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        boost::optional<nats_asio::ssl_config> opt_ssl_conf;
+        std::optional<nats_asio::ssl_config> opt_ssl_conf;
         if (result.count("ssl")) {
             ssl_conf.ssl_cert = read_file(console, ssl_cert_file);
             ssl_conf.ssl_ca = read_file(console, ssl_ca_file);
@@ -139,7 +195,7 @@ int main(int argc, char* argv[]) {
             ssl_conf.ssl_dh = read_file(console, ssl_dh_file);
             opt_ssl_conf = ssl_conf;
         } else {
-            opt_ssl_conf = boost::none;
+            opt_ssl_conf = std::nullopt;
         }
 
         if (topic.empty()) {
@@ -164,40 +220,48 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        boost::asio::io_context ioc;
+        asio::io_context ioc;
         std::shared_ptr<grubber> grub_ptr;
         std::shared_ptr<generator> gen_ptr;
+        nats_asio::iconnection_sptr conn;
 
         if (m == mode::grubber) {
             grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, print_to_stdout);
         }
 
-        nats_asio::iconnection_sptr conn;
         conn = nats_asio::create_connection(
-            ioc, console,
-            [&](nats_asio::iconnection& /*c*/, nats_asio::ctx ctx) {
+            ioc,
+            [&](nats_asio::iconnection& /*c*/) -> asio::awaitable<void> /*nats_asio::ctx ctx)*/ {
                 console->info("on connected");
 
                 if (m == mode::grubber) {
-                    using namespace std::placeholders;
-                    auto r = conn->subscribe(topic, {},
-                                             std::bind(&grubber::on_message, grub_ptr.get(), _1, _2, _3, _4, _5), ctx);
+                    auto r = co_await conn->subscribe(
+                        topic, {},
+                        [grub_ptr](auto v1, auto v2, auto v3, auto v4) -> asio::awaitable<void> {
+                            return grub_ptr->on_message(v1, v2, v3, v4);
+                        });
 
                     if (r.second.failed()) {
                         console->error("failed to subscribe with error: {}", r.second.error());
                     }
                 }
+                co_return;
             },
-            [&console](nats_asio::iconnection&, nats_asio::ctx) { console->info("on disconnected"); }
-            , opt_ssl_conf
-            );
+            [&console](nats_asio::iconnection&) -> asio::awaitable<void> {
+                console->info("on disconnected");
+                co_return;
+            },
+            opt_ssl_conf);
+
         conn->start(conf);
 
         if (m == mode::generator) {
-            gen_ptr = std::make_shared<generator>(ioc, console, conn, topic, stats_interval, publish_interval);
+            gen_ptr = std::make_shared<generator>(ioc, console, conn, topic, stats_interval,
+                                                  publish_interval);
         }
 
         ioc.run();
+
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
         return 1;
@@ -207,65 +271,4 @@ int main(int argc, char* argv[]) {
     }
 
     return 0;
-}
-
-worker::worker(boost::asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval)
-    : m_stats_interval(stats_interval), m_counter(0), m_ioc(ioc), m_log(console) {
-    boost::asio::spawn(ioc, std::bind(&worker::stats_timer, this, std::placeholders::_1));
-}
-void worker::stats_timer(boost::asio::yield_context ctx) {
-    boost::asio::deadline_timer timer(m_ioc);
-    boost::system::error_code error;
-
-    for (;;) {
-        m_log->info("stats: messages {} during {} seconds", m_counter, m_stats_interval);
-        timer.expires_from_now(boost::posix_time::seconds(1 * m_stats_interval));
-        m_counter = 0;
-        timer.async_wait(ctx[error]);
-
-        if (error.failed()) {
-            return;
-        }
-    }
-}
-generator::generator(boost::asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
-                     const nats_asio::iconnection_sptr& conn, const std::string& topic, int stats_interval,
-                     int publish_interval_ms)
-    : worker(ioc, console, stats_interval), m_publish_interval_ms(publish_interval_ms), m_topic(topic), m_conn(conn) {
-    if (m_publish_interval_ms >= 0) {
-        boost::asio::spawn(ioc, std::bind(&generator::publish, this, std::placeholders::_1));
-    }
-}
-void generator::publish(boost::asio::yield_context ctx) {
-    boost::asio::deadline_timer timer(m_ioc);
-    boost::system::error_code error;
-    const std::string msg("{\"value\": 123}");
-
-    for (;;) {
-        auto s = m_conn->publish(m_topic, msg.data(), msg.size(), {}, ctx);
-
-        if (s.failed()) {
-            m_log->error("publish failed with error {}", s.error());
-        } else {
-            m_counter++;
-        }
-
-        timer.expires_from_now(boost::posix_time::milliseconds(1 * m_publish_interval_ms));
-        timer.async_wait(ctx[error]);
-
-        if (error.failed()) {
-            return;
-        }
-    }
-}
-grubber::grubber(boost::asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
-                 bool print_to_stdout)
-    : worker(ioc, console, stats_interval), m_print_to_stdout(print_to_stdout) {}
-void grubber::on_message(boost::string_view, nats_asio::optional<boost::string_view>, const char* raw, std::size_t,
-                         nats_asio::ctx) {
-    m_counter++;
-
-    if (m_print_to_stdout) {
-        std::cout << raw << std::endl;
-    }
 }
