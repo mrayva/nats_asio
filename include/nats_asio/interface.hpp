@@ -40,8 +40,8 @@ namespace nats_asio {
 using std::optional;
 using std::string_view;
 
-typedef asio::io_context aio;
-typedef asio::yield_context ctx;
+using aio = asio::io_context;
+using ctx = asio::yield_context;
 
 using on_message_cb = std::function<asio::awaitable<void>(std::string_view subject,
                                                           std::optional<std::string_view> reply_to,
@@ -81,7 +81,7 @@ struct isubscription {
 
     virtual void cancel() = 0;
 };
-typedef std::shared_ptr<isubscription> isubscription_sptr;
+using isubscription_sptr = std::shared_ptr<isubscription>;
 
 struct ssl_config {
     std::string ssl_key;
@@ -121,7 +121,7 @@ struct iconnection {
     virtual asio::awaitable<std::pair<isubscription_sptr, status>>
     subscribe(string_view subject, optional<string_view> queue, on_message_cb cb) = 0;
 };
-typedef std::shared_ptr<iconnection> iconnection_sptr;
+using iconnection_sptr = std::shared_ptr<iconnection>;
 
 // typedef std::function<void(iconnection&, ctx)> on_connected_cb;
 // typedef std::function<void(iconnection&, ctx)> on_disconnected_cb;

@@ -1,7 +1,7 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.25)
 
 project(nats_asio 
-    VERSION 0.0.1
+    VERSION 0.1.0
     DESCRIPTION "Header-only C++ NATS client using standalone Asio"
     LANGUAGES CXX
 )
@@ -17,8 +17,13 @@ option(NATS_ASIO_INSTALL "Generate install target" ON)
 find_program(CLANG_FORMAT_EXE NAMES "clang-format")
 
 if(CLANG_FORMAT_EXE)
+    # Globbing is generally discouraged for build sources, but acceptable for a dev-only format target.
+    # We exclude the build directory explicitly.
     file(GLOB_RECURSE ALL_SOURCE_FILES 
-        *.cpp *.hpp *.c *.h *.cxx *.hxx *.cc *.hh
+        LIST_DIRECTORIES false
+        CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp" 
+        "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
     )
 
 	list(FILTER ALL_SOURCE_FILES EXCLUDE REGEX ".*/build/.*")
@@ -108,11 +113,6 @@ endif()
 if(NATS_ASIO_INSTALL)
     include(GNUInstallDirs)
     include(CMakePackageConfigHelpers)
-    
-    install(DIRECTORY include/
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-        FILES_MATCHING PATTERN "*.hpp"
-    )
     
     install(TARGETS nats_asio
         EXPORT nats_asio-targets

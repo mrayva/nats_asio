@@ -37,14 +37,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <asio/steady_timer.hpp>
 #include <asio/streambuf.hpp>
 #include <asio/use_awaitable.hpp>
-#include <functional>
 #include <iostream>
-#include <map>
 #include <nlohmann/json.hpp>
 #include <string>
-#include <thread>
 #include <utility>
-#include <vector>
+#include <concepts>
 
 #include "interface.hpp"
 
@@ -84,18 +81,23 @@ auto& get_lowest_layer(Socket& s) {
     }
 }
 
+template <typename T>
+concept SslSocketType = std::same_as<T, ssl_socket>;
+
+template <typename T>
+concept RawSocketType = std::same_as<T, raw_socket>;
+
 template <class Socket>
 struct uni_socket {
     using socket_type = Socket;
     using endpoint_type = tcp::endpoint;
     using executor_type = typename Socket::executor_type;
 
-    template <typename T = Socket>
-    uni_socket(aio& io, std::enable_if_t<std::is_same_v<T, ssl_socket>, ssl::context&> ctx)
+    uni_socket(aio& io, ssl::context& ctx) requires SslSocketType<Socket>
         : m_socket(io, ctx) {}
 
-    template <typename T = Socket>
-    uni_socket(std::enable_if_t<std::is_same_v<T, raw_socket>, aio&> io) : m_socket(io) {}
+    uni_socket(aio& io) requires RawSocketType<Socket>
+        : m_socket(io) {}
 
     uni_socket(const uni_socket&) = delete;
     uni_socket& operator=(const uni_socket&) = delete;
@@ -324,14 +326,6 @@ inline asio::awaitable<void> uni_socket<ssl_socket>::async_connect(const endpoin
 }
 
 struct parser_observer {
-    enum class mt { INFO, CONNECT, PUB, SUB, UNSUB, MSG, PING, PONG, OK, ERR };
-
-    const std::map<std::string, mt, std::less<>> message_types_map{
-        {"INFO", mt::INFO},   {"CONNECT", mt::CONNECT}, {"PUB", mt::PUB},   {"SUB", mt::SUB},
-        {"UNSUB", mt::UNSUB}, {"MSG", mt::MSG},         {"PING", mt::PING}, {"PONG", mt::PONG},
-        {"+OK", mt::OK},      {"-ERR", mt::ERR},
-    };
-
     virtual ~parser_observer() = default;
     virtual asio::awaitable<void> on_ping() = 0;
     virtual asio::awaitable<void> on_pong() = 0;
@@ -348,101 +342,90 @@ struct parser_observer {
             co_return status("can't get line");
         }
 
-        if (header.size() < 4) // TODO: maybe delete this check?
+        if (header.size() < 3)
         {
             co_return status("too small header");
         }
 
-        if (header[header.size() - 1] != '\r') {
+        if (header.back() != '\r') {
             co_return status("unexpected len of server message");
         }
 
         header.pop_back();
         auto v = string_view(header);
-        auto p = v.find_first_of(" ");
 
-        if (p == string_view::npos) {
-            if (header.size() != 4 && header.size() != 3) // ok or ping/pong
-            {
-                co_return status("protocol violation from server");
-            }
-
-            p = header.size();
+        if (v.empty()) {
+            co_return status("protocol violation from server");
         }
 
-        auto it = message_types_map.find(v.substr(0, p));
+        switch (v[0]) {
+            case 'M': // MSG
+                if (v.starts_with("MSG ")) {
+                    auto info = v.substr(4);
+                    auto results = split_sv(info, " ");
 
-        if (it == message_types_map.end()) {
-            co_return status("unknown message");
+                    if (results.size() < 3 || results.size() > 4) {
+                        co_return status("unexpected message format");
+                    }
+
+                    bool reply_to = results.size() == 4;
+                    std::size_t bytes_id = reply_to ? 3 : 2;
+                    std::size_t bytes_n = 0;
+
+                    try {
+                        bytes_n =
+                            static_cast<std::size_t>(std::stoll(results[bytes_id].data(), nullptr, 10));
+                    } catch (const std::exception& e) {
+                        co_return status(fmt::format("can't parse int in headers: {}", e.what()));
+                    }
+
+                    if (reply_to) {
+                        co_await observer->on_message(results[0], results[1], results[2], bytes_n);
+                    } else {
+                        co_await observer->on_message(results[0], results[1], optional<string_view>(),
+                                                      bytes_n);
+                    }
+
+                    co_await observer->consumed(bytes_n + 2);
+                    co_return status();
+                }
+                break;
+
+            case 'I': // INFO
+                if (v.starts_with("INFO ")) {
+                    auto info_msg = v.substr(5);
+                    co_await observer->on_info(info_msg);
+                    co_return status();
+                }
+                break;
+
+            case 'P': // PING, PONG
+                if (v == "PING") {
+                    co_await observer->on_ping();
+                    co_return status();
+                } else if (v == "PONG") {
+                    co_await observer->on_pong();
+                    co_return status();
+                }
+                break;
+
+            case '+': // +OK
+                if (v == "+OK") {
+                    co_await observer->on_ok();
+                    co_return status();
+                }
+                break;
+
+            case '-': // -ERR
+                if (v.starts_with("-ERR")) {
+                    auto err_msg = (v.size() > 5) ? v.substr(5) : string_view{};
+                    co_await observer->on_error(err_msg);
+                    co_return status();
+                }
+                break;
         }
 
-        switch (it->second) {
-            case mt::INFO: {
-                p += 1; // space
-                auto info_msg = v.substr(p, v.size() - p);
-                co_await observer->on_info(info_msg);
-                break;
-            }
-
-            case mt::MSG: {
-                p += 1;
-                auto info = v.substr(p, v.size() - p);
-                auto results = split_sv(info, " ");
-
-                if (results.size() < 3 || results.size() > 4) {
-                    co_return status("unexpected message format");
-                }
-
-                bool replty_to = results.size() == 4;
-                std::size_t bytes_id = replty_to ? 3 : 2;
-                std::size_t bytes_n = 0;
-
-                try {
-                    bytes_n =
-                        static_cast<std::size_t>(std::stoll(results[bytes_id].data(), nullptr, 10));
-                } catch (const std::exception& e) {
-                    co_return status(fmt::format("can't parse int in headers: {}", e.what()));
-                }
-
-                if (replty_to) {
-                    co_await observer->on_message(results[0], results[1], results[2], bytes_n);
-                } else {
-                    co_await observer->on_message(results[0], results[1], optional<string_view>(),
-                                                  bytes_n);
-                }
-
-                co_await observer->consumed(bytes_n + 2);
-                co_return status();
-            }
-
-            case mt::PING: {
-                co_await observer->on_ping();
-                break;
-            }
-
-            case mt::PONG: {
-                co_await observer->on_pong();
-                break;
-            }
-
-            case mt::OK: {
-                co_await observer->on_ok();
-                break;
-            }
-
-            case mt::ERR: {
-                p += 1; // space
-                auto err_msg = v.substr(p, v.size() - p);
-                co_await observer->on_error(err_msg);
-                break;
-            }
-
-            default: {
-                co_return status("unexpected message type");
-            }
-        }
-
-        co_return status();
+        co_return status("unknown message");
     }
 
     std::vector<string_view> split_sv(string_view str, string_view delims = " ") {
@@ -480,7 +463,7 @@ struct subscription : public isubscription {
     uint64_t m_sid;
 };
 
-typedef std::shared_ptr<subscription> subscription_sptr;
+using subscription_sptr = std::shared_ptr<subscription>;
 
 template <class SocketType>
 class connection : public iconnection, public parser_observer {
