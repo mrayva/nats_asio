@@ -66,9 +66,10 @@ public:
     asio::awaitable<void> publish() {
         asio::steady_timer timer(co_await asio::this_coro::executor);
         const std::string msg("{\"value\": 123}");
+        std::span<const char> payload_span(msg.data(), msg.size());
 
         for (;;) {
-            auto s = co_await m_conn->publish(m_topic, msg.data(), msg.size(), {});
+            auto s = co_await m_conn->publish(m_topic, payload_span, {});
 
             if (s.failed()) {
                 m_log->error("publish failed with error {}", s.error());
@@ -99,12 +100,12 @@ public:
         : worker(ioc, console, stats_interval), m_print_to_stdout(print_to_stdout) {}
 
     asio::awaitable<void> on_message(nats_asio::string_view,
-                                     nats_asio::optional<nats_asio::string_view>, const char* raw,
-                                     std::size_t /*, nats_asio::ctx*/) {
+                                     nats_asio::optional<nats_asio::string_view>,
+                                     std::span<const char> payload) {
         m_counter++;
 
         if (m_print_to_stdout) {
-            std::cout << raw << std::endl;
+            std::cout.write(payload.data(), payload.size()) << std::endl;
         }
 
         co_return;
@@ -135,7 +136,7 @@ int main(int argc, char* argv[]) {
         cxxopts::Options options(argv[0], " - filters command line options");
         nats_asio::connect_config conf;
         nats_asio::ssl_config ssl_conf;
-        ssl_conf.ssl_verify = true;
+        ssl_conf.verify = true;
         conf.address = "127.0.0.1";
         conf.port = 4222;
         std::string username;
@@ -148,7 +149,6 @@ int main(int argc, char* argv[]) {
         std::string ssl_key_file;
         std::string ssl_cert_file;
         std::string ssl_ca_file;
-        std::string ssl_dh_file;
         /* clang-format off */
         options.add_options()
         ("h,help", "Print help")
@@ -166,7 +166,6 @@ int main(int argc, char* argv[]) {
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
         ("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
         ("ssl_ca", "ssl_ca", cxxopts::value<std::string>(ssl_ca_file))
-        ("ssl_dh", "ssl_dh", cxxopts::value<std::string>(ssl_dh_file))
         ;
         /* clang-format on */
         options.parse_positional({"mode"});
@@ -190,10 +189,9 @@ int main(int argc, char* argv[]) {
 
         std::optional<nats_asio::ssl_config> opt_ssl_conf;
         if (result.count("ssl")) {
-            ssl_conf.ssl_cert = read_file(console, ssl_cert_file);
-            ssl_conf.ssl_ca = read_file(console, ssl_ca_file);
-            ssl_conf.ssl_key = read_file(console, ssl_key_file);
-            ssl_conf.ssl_dh = read_file(console, ssl_dh_file);
+            ssl_conf.cert = read_file(console, ssl_cert_file);
+            ssl_conf.ca = read_file(console, ssl_ca_file);
+            ssl_conf.key = read_file(console, ssl_key_file);
             opt_ssl_conf = ssl_conf;
         } else {
             opt_ssl_conf = std::nullopt;
@@ -238,8 +236,8 @@ int main(int argc, char* argv[]) {
                 if (m == mode::grubber) {
                     auto r = co_await conn->subscribe(
                         topic, {},
-                        [grub_ptr](auto v1, auto v2, auto v3, auto v4) -> asio::awaitable<void> {
-                            return grub_ptr->on_message(v1, v2, v3, v4);
+                        [grub_ptr](auto v1, auto v2, auto v3) -> asio::awaitable<void> {
+                            return grub_ptr->on_message(v1, v2, v3);
                         });
 
                     if (r.second.failed()) {
@@ -250,6 +248,10 @@ int main(int argc, char* argv[]) {
             },
             [&console](nats_asio::iconnection&) -> asio::awaitable<void> {
                 console->info("on disconnected");
+                co_return;
+            },
+            [&console](nats_asio::iconnection&, nats_asio::string_view err) -> asio::awaitable<void> {
+                console->error("on error: {}", err);
                 co_return;
             },
             opt_ssl_conf);

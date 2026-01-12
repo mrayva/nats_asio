@@ -31,6 +31,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <asio/co_spawn.hpp>
 #include <asio/connect.hpp>
 #include <asio/detached.hpp>
+#include <asio/strand.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/read.hpp>
 #include <asio/read_until.hpp>
@@ -40,7 +41,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <asio/streambuf.hpp>
 #include <asio/use_awaitable.hpp>
 #include <concepts>
-#include <iostream>
+#include <istream>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <utility>
@@ -51,7 +52,23 @@ namespace nats_asio {
 
 namespace ssl = asio::ssl;
 
-constexpr auto sep = "\r\n";
+namespace protocol {
+    constexpr string_view crlf = "\r\n";
+    constexpr string_view pub_fmt = "PUB {} {} {}\r\n";
+    constexpr string_view sub_fmt = "SUB {} {} {}\r\n";
+    constexpr string_view unsub_fmt = "UNSUB {}\r\n";
+    constexpr string_view connect_fmt = "CONNECT {}\r\n";
+    constexpr string_view pong = "PONG\r\n";
+
+    constexpr string_view op_msg = "MSG";
+    constexpr string_view op_hmsg = "HMSG";
+    constexpr string_view op_ping = "PING";
+    constexpr string_view op_pong = "PONG";
+    constexpr string_view op_ok = "+OK";
+    constexpr string_view op_err = "-ERR";
+    constexpr string_view op_info = "INFO";
+    constexpr string_view delim = " ";
+}
 
 using asio::awaitable;
 using asio::use_awaitable;
@@ -101,7 +118,7 @@ struct uni_socket {
 
     template <class Buf>
     asio::awaitable<void> async_read_until_raw(Buf& buf) {
-        co_await asio::async_read_until(get_lowest_layer(m_socket), buf, sep);
+        co_await asio::async_read_until(get_lowest_layer(m_socket), buf, std::string(protocol::crlf));
     }
 
     template <class Buf, class Transfer>
@@ -127,7 +144,7 @@ struct uni_socket {
     void close(asio::error_code& ec);
     void close() {
         asio::error_code ec;
-        co_return close(ec);
+        close(ec);
     }
 
     bool is_open() const;
@@ -347,9 +364,9 @@ struct protocol_parser {
 
         switch (v[0]) {
             case 'M': // MSG
-                if (v.starts_with("MSG ")) {
-                    auto info = v.substr(4);
-                    auto results = split_sv(info, " ");
+                if (v.starts_with(protocol::op_msg) && v.size() > protocol::op_msg.size() && v[protocol::op_msg.size()] == ' ') {
+                    auto info = v.substr(protocol::op_msg.size() + 1);
+                    auto results = split_sv(info, protocol::delim);
 
                     if (results.size() < 3 || results.size() > 4) {
                         co_return status("unexpected message format");
@@ -379,33 +396,33 @@ struct protocol_parser {
                 break;
 
             case 'I': // INFO
-                if (v.starts_with("INFO ")) {
-                    auto info_msg = v.substr(5);
+                if (v.starts_with(protocol::op_info)) {
+                    auto info_msg = (v.size() > protocol::op_info.size()) ? v.substr(protocol::op_info.size() + 1) : string_view{};
                     co_await observer.on_info(info_msg);
                     co_return status();
                 }
                 break;
 
             case 'P': // PING, PONG
-                if (v == "PING") {
+                if (v == protocol::op_ping) {
                     co_await observer.on_ping();
                     co_return status();
-                } else if (v == "PONG") {
+                } else if (v == protocol::op_pong) {
                     co_await observer.on_pong();
                     co_return status();
                 }
                 break;
 
             case '+': // +OK
-                if (v == "+OK") {
+                if (v == protocol::op_ok) {
                     co_await observer.on_ok();
                     co_return status();
                 }
                 break;
 
             case '-': // -ERR
-                if (v.starts_with("-ERR")) {
-                    auto err_msg = (v.size() > 5) ? v.substr(5) : string_view{};
+                if (v.starts_with(protocol::op_err)) {
+                    auto err_msg = (v.size() > protocol::op_err.size()) ? v.substr(protocol::op_err.size() + 1) : string_view{};
                     co_await observer.on_error(err_msg);
                     co_return status();
                 }
@@ -417,7 +434,7 @@ struct protocol_parser {
 
     static std::vector<string_view> split_sv(string_view str, string_view delims = " ") {
         std::vector<string_view> output;
-        output.reserve(str.size() / 2);
+        output.reserve(4); // Typical NATS headers have 3-4 tokens
 
         for (auto first = str.data(), second = str.data(), last = first + str.size();
              second != last && first != last; first = second + 1) {
@@ -432,20 +449,31 @@ struct protocol_parser {
     }
 };
 
-struct subscription : public isubscription {
+class subscription : public isubscription {
+public:
     subscription(uint64_t sid, const on_message_cb& cb) : m_cancel(false), m_cb(cb), m_sid(sid) {}
 
     subscription(const subscription&) = delete;
     subscription& operator=(const subscription&) = delete;
 
-    virtual void cancel() override {
-        m_cancel = true;
-    };
-    virtual uint64_t sid() override {
-        return m_sid;
-    };
+    void cancel() noexcept override {
+        m_cancel.store(true);
+    }
 
-    bool m_cancel;
+    [[nodiscard]] uint64_t sid() noexcept override {
+        return m_sid;
+    }
+
+    [[nodiscard]] bool is_cancelled() const noexcept {
+        return m_cancel.load();
+    }
+
+    [[nodiscard]] const on_message_cb& callback() const noexcept {
+        return m_cb;
+    }
+
+private:
+    std::atomic<bool> m_cancel;
     on_message_cb m_cb;
     uint64_t m_sid;
 };
@@ -456,15 +484,17 @@ template <class SocketType>
 class connection : public iconnection, public parser_observer {
 public:
     connection(aio& io, const on_connected_cb& connected_cb,
-               const on_disconnected_cb& disconnected_cb, const std::shared_ptr<ssl::context>& ctx)
+               const on_disconnected_cb& disconnected_cb, const on_error_cb& error_cb,
+               const std::shared_ptr<ssl::context>& ctx)
         : m_sid(0), m_max_payload(0), m_io(io), m_is_connected(false), m_stop_flag(false),
-          m_connected_cb(connected_cb), m_disconnected_cb(disconnected_cb), m_ssl_ctx(ctx),
-          m_socket(io, *ctx.get()) {}
+          m_connected_cb(connected_cb), m_disconnected_cb(disconnected_cb), m_error_cb(error_cb),
+          m_ssl_ctx(ctx), m_socket(io, *ctx.get()) {}
 
     connection(aio& io, const on_connected_cb& connected_cb,
-               const on_disconnected_cb& disconnected_cb)
+               const on_disconnected_cb& disconnected_cb, const on_error_cb& error_cb)
         : m_sid(0), m_max_payload(0), m_io(io), m_is_connected(false), m_stop_flag(false),
-          m_connected_cb(connected_cb), m_disconnected_cb(disconnected_cb), m_socket(io) {}
+          m_connected_cb(connected_cb), m_disconnected_cb(disconnected_cb), m_error_cb(error_cb),
+          m_socket(io) {}
 
     connection(const connection&) = delete;
     connection& operator=(const connection&) = delete;
@@ -475,33 +505,35 @@ public:
             asio::detached);
     }
 
-    virtual void stop() override {
+    virtual void stop() noexcept override {
         m_stop_flag = true;
     }
-    virtual bool is_connected() override {
+    [[nodiscard]] virtual bool is_connected() noexcept override {
         return m_is_connected;
     }
 
-    virtual asio::awaitable<status> publish(string_view subject, const char* raw, std::size_t n,
+    virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                             optional<string_view> reply_to) override {
         if (!m_is_connected) {
             co_return status("not connected");
         }
 
-        const std::string pub_header_payload("PUB {} {} {}\r\n");
+        if (m_max_payload > 0 && payload.size() > m_max_payload) {
+            co_return status("message size exceeds server limit");
+        }
+
         std::vector<asio::const_buffer> buffers;
         std::string header;
 
         if (reply_to.has_value()) {
-            header = fmt::format(fmt::runtime(pub_header_payload), subject, reply_to.value(), n);
+            header = fmt::format(fmt::runtime(protocol::pub_fmt), subject, reply_to.value(), payload.size());
         } else {
-            header = fmt::format(fmt::runtime(pub_header_payload), subject, "", n);
+            header = fmt::format(fmt::runtime(protocol::pub_fmt), subject, "", payload.size());
         }
 
         buffers.emplace_back(asio::buffer(header.data(), header.size()));
-        buffers.emplace_back(asio::buffer(raw, n));
-        buffers.emplace_back(asio::buffer("\r\n", 2));
-        std::size_t total_size = header.size() + n + 2;
+        buffers.emplace_back(asio::buffer(payload.data(), payload.size()));
+        buffers.emplace_back(asio::buffer(protocol::crlf.data(), protocol::crlf.size()));
 
         try {
             co_await asio::async_write(m_socket, buffers, asio::use_awaitable);
@@ -513,23 +545,7 @@ public:
     }
 
     virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) override {
-        auto sid = p->sid();
-        auto it = m_subs.find(sid);
-
-        if (it == m_subs.end()) {
-            co_return status(fmt::format("subscription not found {}", sid));
-        }
-        m_subs.erase(it);
-
-        std::string unsub_payload(fmt::format("UNSUB {}\r\n", sid));
-
-        try {
-            co_await asio::async_write(m_socket, asio::buffer(unsub_payload), asio::use_awaitable);
-        } catch (const std::system_error& e) {
-            co_return status(e.code().message());
-        }
-
-        co_return status();
+        co_return co_await unsubscribe_impl(p);
     }
 
     virtual asio::awaitable<std::pair<isubscription_sptr, status>>
@@ -541,8 +557,8 @@ public:
 
         auto sid = next_sid();
         std::string payload = queue.has_value()
-                                  ? fmt::format("SUB {} {} {}\r\n", subject, queue.value(), sid)
-                                  : fmt::format("SUB {} {} {}\r\n", subject, "", sid);
+                                  ? fmt::format(fmt::runtime(protocol::sub_fmt), subject, queue.value(), sid)
+                                  : fmt::format(fmt::runtime(protocol::sub_fmt), subject, "", sid);
 
         try {
             co_await asio::async_write(m_socket, asio::buffer(payload), asio::use_awaitable);
@@ -559,9 +575,8 @@ public:
 
 private:
     awaitable<void> on_ping() override {
-        const std::string pong("PONG\r\n");
-        co_await asio::async_write(m_socket, asio::buffer(pong),
-                                   asio::transfer_exactly(pong.size()), use_awaitable);
+        co_await asio::async_write(m_socket, asio::buffer(protocol::pong.data(), protocol::pong.size()),
+                                   use_awaitable);
         co_return;
     }
 
@@ -574,25 +589,38 @@ private:
     }
 
     awaitable<void> on_error(string_view err) override {
+        if (m_error_cb) {
+            co_await m_error_cb(*this, err);
+        }
         co_return;
     }
 
     awaitable<void> on_info(string_view info) override {
         using nlohmann::json;
-        auto j = json::parse(info);
-        if (j.contains("max_payload") && j["max_payload"].is_number()) {
-            m_max_payload = j["max_payload"].get<std::size_t>();
+        std::string err_msg;
+        try {
+            auto j = json::parse(info);
+            if (j.contains("max_payload") && j["max_payload"].is_number()) {
+                m_max_payload = j["max_payload"].get<std::size_t>();
+            }
+        } catch (const json::exception& e) {
+            err_msg = fmt::format("failed to parse INFO from server: {}", e.what());
+        }
+
+        if (!err_msg.empty()) {
+            co_await on_error(err_msg);
         }
         co_return;
     }
 
     awaitable<void> on_message(string_view subject, string_view sid_str,
                                optional<string_view> reply_to, std::size_t n) override {
-        int bytes_to_transfer = int(n) + 2 - int(m_buf.size());
+        // Signed arithmetic: result can be negative if buffer already has enough data
+        auto bytes_to_transfer = static_cast<std::ptrdiff_t>(n + 2) - static_cast<std::ptrdiff_t>(m_buf.size());
 
         if (bytes_to_transfer > 0) {
             co_await asio::async_read(m_socket, m_buf,
-                                      asio::transfer_at_least(std::size_t(bytes_to_transfer)),
+                                      asio::transfer_at_least(static_cast<std::size_t>(bytes_to_transfer)),
                                       use_awaitable);
         }
 
@@ -608,17 +636,14 @@ private:
             co_return;
         }
 
-        if (it->second->m_cancel) {
+        if (it->second->is_cancelled()) {
             co_await unsubscribe_impl(it->second);
+            co_return;  // Don't deliver message to cancelled subscription
         }
 
         auto b = m_buf.data();
-        if (reply_to.has_value()) {
-            co_await it->second->m_cb(subject, reply_to, static_cast<const char*>(b.data()), n);
-        } else {
-            co_await it->second->m_cb(subject, {}, static_cast<const char*>(b.data()), n);
-        }
-
+        std::span<const char> payload_span(static_cast<const char*>(b.data()), n);
+        co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
         co_return;
     }
 
@@ -635,7 +660,7 @@ private:
 
             co_await asio::async_connect(m_socket.lowest_layer(), results, use_awaitable);
 
-            co_await asio::async_read_until(m_socket, m_buf, "\r\n", use_awaitable);
+            co_await asio::async_read_until(m_socket, m_buf, std::string(protocol::crlf), use_awaitable);
 
             std::string header;
             std::istream is(&m_buf);
@@ -657,6 +682,8 @@ private:
 
     asio::awaitable<void> run(const connect_config& conf) {
         std::string header;
+        uint32_t retry_delay_ms = conf.retry_initial_delay_ms;
+        uint32_t retry_count = 0;
 
         for (;;) {
             if (m_stop_flag) {
@@ -666,11 +693,27 @@ private:
             if (!m_is_connected) {
                 auto s = co_await do_connect(conf);
                 if (s.failed()) {
+                    // Check max attempts (0 = unlimited)
+                    if (conf.retry_max_attempts > 0 && retry_count >= conf.retry_max_attempts) {
+                        if (m_error_cb) {
+                            co_await m_error_cb(*this, "max reconnection attempts reached");
+                        }
+                        co_return;
+                    }
+
                     asio::steady_timer timer(co_await asio::this_coro::executor);
-                    timer.expires_after(std::chrono::seconds(1));
+                    timer.expires_after(std::chrono::milliseconds(retry_delay_ms));
                     co_await timer.async_wait(asio::use_awaitable);
+
+                    // Exponential backoff: double delay, cap at max
+                    retry_delay_ms = std::min(retry_delay_ms * 2, conf.retry_max_delay_ms);
+                    retry_count++;
                     continue;
                 }
+
+                // Reset backoff on successful connection
+                retry_delay_ms = conf.retry_initial_delay_ms;
+                retry_count = 0;
 
                 m_is_connected = true;
                 if (m_connected_cb) {
@@ -680,7 +723,7 @@ private:
 
             bool should_disconnect = false;
             try {
-                co_await asio::async_read_until(m_socket, m_buf, sep, asio::use_awaitable);
+                co_await asio::async_read_until(m_socket, m_buf, std::string(protocol::crlf), asio::use_awaitable);
 
                 std::istream is(&m_buf);
                 auto s = co_await protocol_parser::parse_header(header, is, *this);
@@ -704,7 +747,7 @@ private:
         co_return;
     }
 
-    awaitable<status> unsubscribe_impl(const subscription_sptr& p) {
+    awaitable<status> unsubscribe_impl(const isubscription_sptr& p) {
         auto sid = p->sid();
         auto it = m_subs.find(sid);
 
@@ -713,10 +756,9 @@ private:
         }
         m_subs.erase(it);
 
-        std::string unsub_payload(fmt::format("UNSUB {}\r\n", sid));
+        std::string unsub_payload(fmt::format(fmt::runtime(protocol::unsub_fmt), sid));
         try {
-            co_await asio::async_write(m_socket, asio::buffer(unsub_payload),
-                                       asio::transfer_exactly(unsub_payload.size()), use_awaitable);
+            co_await asio::async_write(m_socket, asio::buffer(unsub_payload), use_awaitable);
             co_return status{};
         } catch (const std::system_error& e) {
             co_return status(e.what());
@@ -724,7 +766,6 @@ private:
     }
 
     std::string prepare_info(const connect_config& o) {
-        constexpr auto connect_payload = "CONNECT {}\r\n";
         constexpr auto name = "nats_asio";
         constexpr auto lang = "cpp";
         constexpr auto version = "0.0.1";
@@ -747,7 +788,7 @@ private:
         }
 
         auto info = j.dump();
-        auto connect_data = fmt::format(connect_payload, info);
+        auto connect_data = fmt::format(fmt::runtime(protocol::connect_fmt), info);
         return connect_data;
     }
 
@@ -755,7 +796,7 @@ private:
         return m_sid++;
     }
 
-    uint64_t m_sid;
+    std::atomic<uint64_t> m_sid;
     std::size_t m_max_payload;
     aio& m_io;
 
@@ -765,7 +806,8 @@ private:
     std::unordered_map<uint64_t, subscription_sptr> m_subs;
     on_connected_cb m_connected_cb;
     on_disconnected_cb m_disconnected_cb;
-    asio::error_code ec;
+    on_error_cb m_error_cb;
+
 
     asio::streambuf m_buf;
 
@@ -776,40 +818,39 @@ private:
 inline void load_certificates(const ssl_config& conf, ssl::context& ctx) {
     ctx.set_options(ssl::context::tls_client);
 
-    if (conf.ssl_verify) {
+    if (conf.verify) {
         ctx.set_verify_mode(ssl::verify_peer);
     } else {
         ctx.set_verify_mode(ssl::verify_none);
     }
 
-    if (!conf.ssl_cert.empty()) {
-        ctx.use_certificate(asio::buffer(conf.ssl_cert.data(), conf.ssl_cert.size()),
+    if (!conf.cert.empty()) {
+        ctx.use_certificate(asio::buffer(conf.cert.data(), conf.cert.size()),
                             ssl::context::file_format::pem);
     }
 
-    if (!conf.ssl_ca.empty()) {
-        ctx.add_certificate_authority(asio::buffer(conf.ssl_ca.data(), conf.ssl_ca.size()));
+    if (!conf.ca.empty()) {
+        ctx.add_certificate_authority(asio::buffer(conf.ca.data(), conf.ca.size()));
     }
 
-    if (!conf.ssl_dh.empty()) {
-        ctx.use_tmp_dh_file(conf.ssl_dh);
-    }
-
-    if (!conf.ssl_key.empty()) {
-        ctx.use_private_key(asio::buffer(conf.ssl_key.data(), conf.ssl_key.size()),
+    if (!conf.key.empty()) {
+        ctx.use_private_key(asio::buffer(conf.key.data(), conf.key.size()),
                             ssl::context::file_format::pem);
     }
 }
 
 inline iconnection_sptr create_connection(aio& io, const on_connected_cb& connected_cb,
                                           const on_disconnected_cb& disconnected_cb,
+                                          const on_error_cb& error_cb,
                                           optional<ssl_config> ssl_conf) {
     if (ssl_conf.has_value()) {
         auto ssl_ctx = std::make_shared<ssl::context>(ssl::context::tlsv12_client);
         load_certificates(ssl_conf.value(), *ssl_ctx);
-        return std::make_shared<connection<ssl_socket>>(io, connected_cb, disconnected_cb, ssl_ctx);
+        return std::make_shared<connection<ssl_socket>>(io, connected_cb, disconnected_cb, error_cb,
+                                                        ssl_ctx);
     } else {
-        return std::make_shared<connection<raw_socket>>(io, connected_cb, disconnected_cb);
+        return std::make_shared<connection<raw_socket>>(io, connected_cb, disconnected_cb,
+                                                        error_cb);
     }
 }
 
