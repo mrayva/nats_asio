@@ -64,12 +64,21 @@ private:
     optional<std::string> m_error;
 };
 
+struct subscribe_options {
+    optional<std::string_view> queue_group{};
+    uint32_t max_messages = 0;  // 0 = unlimited, auto-unsubscribe after N messages
+};
+
 struct isubscription {
     virtual ~isubscription() = default;
 
     [[nodiscard]] virtual uint64_t sid() noexcept = 0;
 
     virtual void cancel() noexcept = 0;
+
+    [[nodiscard]] virtual uint32_t max_messages() const noexcept = 0;
+
+    [[nodiscard]] virtual uint32_t message_count() const noexcept = 0;
 };
 using isubscription_sptr = std::shared_ptr<isubscription>;
 
@@ -113,7 +122,7 @@ struct iconnection {
     [[nodiscard]] virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) = 0;
 
     [[nodiscard]] virtual asio::awaitable<std::pair<isubscription_sptr, status>>
-    subscribe(string_view subject, optional<string_view> queue, on_message_cb cb) = 0;
+    subscribe(string_view subject, on_message_cb cb, subscribe_options opts = {}) = 0;
 };
 using iconnection_sptr = std::shared_ptr<iconnection>;
 
@@ -124,5 +133,11 @@ using on_error_cb = std::function<asio::awaitable<void>(iconnection&, string_vie
 [[nodiscard]] iconnection_sptr create_connection(aio& io, const on_connected_cb& connected_cb,
                                    const on_disconnected_cb& disconnected_cb,
                                    const on_error_cb& error_cb, optional<ssl_config> ssl_conf);
+
+// Simplified connection factory - creates connection and starts it
+[[nodiscard]] iconnection_sptr connect(aio& io, string_view address, uint16_t port = 4222);
+
+// Simplified connection factory with SSL
+[[nodiscard]] iconnection_sptr connect(aio& io, string_view address, uint16_t port, ssl_config ssl_conf);
 
 } // namespace nats_asio

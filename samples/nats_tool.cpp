@@ -234,7 +234,7 @@ int main(int argc, char* argv[]) {
 
                 if (m == mode::grubber) {
                     auto r = co_await conn->subscribe(
-                        topic, {},
+                        topic,
                         [grub_ptr](auto v1, auto v2, auto v3) -> asio::awaitable<void> {
                             return grub_ptr->on_message(v1, v2, v3);
                         });

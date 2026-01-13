@@ -451,7 +451,8 @@ struct protocol_parser {
 
 class subscription : public isubscription {
 public:
-    subscription(uint64_t sid, const on_message_cb& cb) : m_cancel(false), m_cb(cb), m_sid(sid) {}
+    subscription(uint64_t sid, const on_message_cb& cb, uint32_t max_msgs = 0)
+        : m_cancel(false), m_cb(cb), m_sid(sid), m_max_messages(max_msgs), m_message_count(0) {}
 
     subscription(const subscription&) = delete;
     subscription& operator=(const subscription&) = delete;
@@ -464,6 +465,14 @@ public:
         return m_sid;
     }
 
+    [[nodiscard]] uint32_t max_messages() const noexcept override {
+        return m_max_messages;
+    }
+
+    [[nodiscard]] uint32_t message_count() const noexcept override {
+        return m_message_count.load();
+    }
+
     [[nodiscard]] bool is_cancelled() const noexcept {
         return m_cancel.load();
     }
@@ -472,10 +481,21 @@ public:
         return m_cb;
     }
 
+    // Increment message count and return true if should auto-unsubscribe
+    [[nodiscard]] bool increment_and_check() noexcept {
+        if (m_max_messages == 0) {
+            return false;  // Unlimited
+        }
+        uint32_t count = ++m_message_count;
+        return count >= m_max_messages;
+    }
+
 private:
     std::atomic<bool> m_cancel;
     on_message_cb m_cb;
     uint64_t m_sid;
+    uint32_t m_max_messages;
+    std::atomic<uint32_t> m_message_count;
 };
 
 using subscription_sptr = std::shared_ptr<subscription>;
@@ -549,15 +569,15 @@ public:
     }
 
     virtual asio::awaitable<std::pair<isubscription_sptr, status>>
-    subscribe(string_view subject, optional<string_view> queue, on_message_cb cb) override {
+    subscribe(string_view subject, on_message_cb cb, subscribe_options opts = {}) override {
         if (!m_is_connected) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
                                                             status("not connected")};
         }
 
         auto sid = next_sid();
-        std::string payload = queue.has_value()
-                                  ? fmt::format(fmt::runtime(protocol::sub_fmt), subject, queue.value(), sid)
+        std::string payload = opts.queue_group.has_value()
+                                  ? fmt::format(fmt::runtime(protocol::sub_fmt), subject, opts.queue_group.value(), sid)
                                   : fmt::format(fmt::runtime(protocol::sub_fmt), subject, "", sid);
 
         try {
@@ -567,7 +587,7 @@ public:
                                                             status(e.code().message())};
         }
 
-        auto sub = std::make_shared<subscription>(sid, cb);
+        auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
         m_subs.emplace(sid, sub);
 
         co_return std::pair<isubscription_sptr, status>{sub, status()};
@@ -644,6 +664,11 @@ private:
         auto b = m_buf.data();
         std::span<const char> payload_span(static_cast<const char*>(b.data()), n);
         co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+
+        // Check for auto-unsubscribe after delivering message
+        if (it->second->increment_and_check()) {
+            co_await unsubscribe_impl(it->second);
+        }
         co_return;
     }
 
@@ -851,6 +876,39 @@ inline iconnection_sptr create_connection(aio& io, const on_connected_cb& connec
         return std::make_shared<connection<raw_socket>>(io, connected_cb, disconnected_cb,
                                                         error_cb);
     }
+}
+
+// Simplified connection factory - creates connection and starts it
+inline iconnection_sptr connect(aio& io, string_view address, uint16_t port) {
+    // No-op callbacks for simplified usage
+    auto noop_connected = [](iconnection&) -> asio::awaitable<void> { co_return; };
+    auto noop_disconnected = [](iconnection&) -> asio::awaitable<void> { co_return; };
+    auto noop_error = [](iconnection&, string_view) -> asio::awaitable<void> { co_return; };
+
+    auto conn = create_connection(io, noop_connected, noop_disconnected, noop_error, std::nullopt);
+
+    connect_config conf;
+    conf.address = std::string(address);
+    conf.port = port;
+    conn->start(conf);
+
+    return conn;
+}
+
+// Simplified connection factory with SSL
+inline iconnection_sptr connect(aio& io, string_view address, uint16_t port, ssl_config ssl_conf) {
+    auto noop_connected = [](iconnection&) -> asio::awaitable<void> { co_return; };
+    auto noop_disconnected = [](iconnection&) -> asio::awaitable<void> { co_return; };
+    auto noop_error = [](iconnection&, string_view) -> asio::awaitable<void> { co_return; };
+
+    auto conn = create_connection(io, noop_connected, noop_disconnected, noop_error, ssl_conf);
+
+    connect_config conf;
+    conf.address = std::string(address);
+    conf.port = port;
+    conn->start(conf);
+
+    return conn;
 }
 
 } // namespace nats_asio
