@@ -808,7 +808,6 @@ private:
     on_disconnected_cb m_disconnected_cb;
     on_error_cb m_error_cb;
 
-
     asio::streambuf m_buf;
 
     std::shared_ptr<ssl::context> m_ssl_ctx;

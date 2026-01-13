@@ -22,7 +22,7 @@ cxxopts/2.2.1
 ```
 
 ## Usage of library
- - You can just copy `interface.hpp` and `impl.hpp` in you project (don't forget to include `impl.hpp` somewhere)
+ - Include `<nats_asio/nats_asio.hpp>` in your project
 
 And then add `nats_asio/0.0.13@_/_` to dependencies. 
 

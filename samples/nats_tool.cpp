@@ -6,8 +6,7 @@
 #include <asio/detached.hpp>
 #include <fstream>
 #include <iostream>
-#include <nats_asio/impl.hpp>
-#include <nats_asio/interface.hpp>
+#include <nats_asio/nats_asio.hpp>
 #include <tuple>
 
 #include "cxxopts.hpp"

@@ -2,7 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <iostream>
-#include <nats_asio/impl.hpp>
+#include <nats_asio/nats_asio.hpp>
 #include <sstream>
 
 using namespace nats_asio;
