@@ -4,17 +4,21 @@
 
 #include <asio/as_tuple.hpp>
 #include <asio/detached.hpp>
+#include <asio/posix/stream_descriptor.hpp>
+#include <asio/read_until.hpp>
 #include <fstream>
 #include <iostream>
 #include <nats_asio/nats_asio.hpp>
 #include <tuple>
+#include <unistd.h>
 
 #include "cxxopts.hpp"
 
 const std::string grub_mode("grub");
 const std::string gen_mode("gen");
+const std::string pub_mode("pub");
 
-enum class mode { grubber, generator };
+enum class mode { grubber, generator, publisher };
 
 class worker {
 public:
@@ -114,6 +118,123 @@ private:
     bool m_print_to_stdout;
 };
 
+class publisher : public worker {
+public:
+    publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
+              std::vector<nats_asio::iconnection_sptr> connections, const std::string& topic,
+              int stats_interval, int max_in_flight = 1000)
+        : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
+          m_topic(topic), m_next_conn(0), m_in_flight(0), m_max_in_flight(max_in_flight),
+          m_stdin(ioc, ::dup(STDIN_FILENO)) {
+        asio::co_spawn(ioc, read_and_publish(), asio::detached);
+    }
+
+    asio::awaitable<void> read_and_publish() {
+        asio::streambuf buf;
+
+        for (;;) {
+            // Async read line from stdin
+            auto [ec, bytes_read] = co_await asio::async_read_until(
+                m_stdin, buf, '\n', asio::as_tuple(asio::use_awaitable));
+
+            if (ec) {
+                if (ec == asio::error::eof || ec == asio::error::not_found) {
+                    break;  // EOF or no more data
+                }
+                m_log->error("stdin read error: {}", ec.message());
+                break;
+            }
+
+            // Extract line from buffer (without newline)
+            std::string line;
+            std::istream is(&buf);
+            std::getline(is, line);
+
+            // Wait until at least one connection is ready
+            while (!has_connected_connection()) {
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(100));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+
+            // Backpressure: wait if too many publishes in flight
+            while (m_in_flight >= m_max_in_flight) {
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(5));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+
+            // Round-robin connection selection
+            auto conn = get_next_connection();
+
+            // Capture message in shared_ptr for async lifetime
+            auto msg = std::make_shared<std::string>(std::move(line));
+
+            m_in_flight++;
+
+            // Fire-and-forget: dispatch publish without waiting
+            asio::co_spawn(
+                m_ioc,
+                [this, conn, msg]() -> asio::awaitable<void> {
+                    std::span<const char> payload_span(msg->data(), msg->size());
+                    auto s = co_await conn->publish(m_topic, payload_span, {});
+
+                    if (s.failed()) {
+                        m_log->error("publish failed: {}", s.error());
+                    } else {
+                        m_counter++;
+                    }
+                    m_in_flight--;
+                    co_return;
+                },
+                asio::detached);
+        }
+
+        // Wait for all in-flight publishes to complete
+        m_log->info("EOF reached, waiting for {} in-flight publishes", m_in_flight.load());
+        while (m_in_flight > 0) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(50));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        m_log->info("All publishes complete, stopping");
+        m_ioc.stop();
+        co_return;
+    }
+
+private:
+    bool has_connected_connection() const {
+        for (const auto& conn : m_connections) {
+            if (conn->is_connected()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    nats_asio::iconnection_sptr get_next_connection() {
+        std::size_t attempts = 0;
+        while (attempts < m_connections.size()) {
+            auto conn = m_connections[m_next_conn % m_connections.size()];
+            m_next_conn++;
+            if (conn->is_connected()) {
+                return conn;
+            }
+            attempts++;
+        }
+        // Fallback to first connection (shouldn't happen if has_connected_connection passed)
+        return m_connections[0];
+    }
+
+    std::vector<nats_asio::iconnection_sptr> m_connections;
+    std::string m_topic;
+    std::size_t m_next_conn;
+    std::atomic<int> m_in_flight;
+    int m_max_in_flight;
+    asio::posix::stream_descriptor m_stdin;
+};
+
 std::string read_file(const std::shared_ptr<spdlog::logger>& console, const std::string& path) {
     try {
         if (path.empty()) {
@@ -144,6 +265,8 @@ int main(int argc, char* argv[]) {
         std::string topic;
         int stats_interval = 1;
         int publish_interval = -1;
+        int num_connections = 1;
+        int max_in_flight = 1000;
         bool print_to_stdout = false;
         std::string ssl_key_file;
         std::string ssl_cert_file;
@@ -160,6 +283,8 @@ int main(int argc, char* argv[]) {
         ("topic", "topic", cxxopts::value<std::string >(topic))
         ("stats_interval", "stat interval seconds", cxxopts::value<int>(stats_interval))
         ("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
+        ("n,connections", "Number of connections for pub mode (default: 1)", cxxopts::value<int>(num_connections))
+        ("max_in_flight", "Max in-flight publishes for pub mode (default: 1000)", cxxopts::value<int>(max_in_flight))
         ("print", "print messages to stdout", cxxopts::value<bool>(print_to_stdout))
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
@@ -202,8 +327,8 @@ int main(int argc, char* argv[]) {
 
         mode = result["mode"].as<std::string>();
 
-        if (mode != grub_mode && mode != gen_mode) {
-            console->error("Invalid mode. Could be `{}` or `{}`", grub_mode, gen_mode);
+        if (mode != grub_mode && mode != gen_mode && mode != pub_mode) {
+            console->error("Invalid mode. Could be `{}`, `{}`, or `{}`", grub_mode, gen_mode, pub_mode);
             return 1;
         }
 
@@ -212,6 +337,11 @@ int main(int argc, char* argv[]) {
         if (mode == grub_mode) {
             m = mode::grubber;
             publish_interval = -1;
+        } else if (mode == pub_mode) {
+            m = mode::publisher;
+            if (num_connections < 1) {
+                num_connections = 1;
+            }
         } else {
             if (publish_interval < 0) {
                 publish_interval = 1000;
@@ -221,45 +351,74 @@ int main(int argc, char* argv[]) {
         asio::io_context ioc;
         std::shared_ptr<grubber> grub_ptr;
         std::shared_ptr<generator> gen_ptr;
+        std::shared_ptr<publisher> pub_ptr;
         nats_asio::iconnection_sptr conn;
+        std::vector<nats_asio::iconnection_sptr> pub_connections;
 
         if (m == mode::grubber) {
             grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, print_to_stdout);
         }
 
-        conn = nats_asio::create_connection(
-            ioc,
-            [&](nats_asio::iconnection& /*c*/) -> asio::awaitable<void> /*nats_asio::ctx ctx)*/ {
-                console->info("on connected");
-
-                if (m == mode::grubber) {
-                    auto r = co_await conn->subscribe(
-                        topic,
-                        [grub_ptr](auto v1, auto v2, auto v3) -> asio::awaitable<void> {
-                            return grub_ptr->on_message(v1, v2, v3);
-                        });
-
-                    if (r.second.failed()) {
-                        console->error("failed to subscribe with error: {}", r.second.error());
+        // Helper to create a connection
+        auto make_connection = [&](int conn_id = -1) {
+            return nats_asio::create_connection(
+                ioc,
+                [&, conn_id](nats_asio::iconnection& /*c*/) -> asio::awaitable<void> {
+                    if (conn_id >= 0) {
+                        console->info("connection {} connected", conn_id);
+                    } else {
+                        console->info("on connected");
                     }
-                }
-                co_return;
-            },
-            [&console](nats_asio::iconnection&) -> asio::awaitable<void> {
-                console->info("on disconnected");
-                co_return;
-            },
-            [&console](nats_asio::iconnection&, nats_asio::string_view err) -> asio::awaitable<void> {
-                console->error("on error: {}", err);
-                co_return;
-            },
-            opt_ssl_conf);
 
-        conn->start(conf);
+                    if (m == mode::grubber) {
+                        auto r = co_await conn->subscribe(
+                            topic,
+                            [grub_ptr](auto v1, auto v2, auto v3) -> asio::awaitable<void> {
+                                return grub_ptr->on_message(v1, v2, v3);
+                            });
 
-        if (m == mode::generator) {
-            gen_ptr = std::make_shared<generator>(ioc, console, conn, topic, stats_interval,
-                                                  publish_interval);
+                        if (r.second.failed()) {
+                            console->error("failed to subscribe with error: {}", r.second.error());
+                        }
+                    }
+                    co_return;
+                },
+                [&console, conn_id](nats_asio::iconnection&) -> asio::awaitable<void> {
+                    if (conn_id >= 0) {
+                        console->info("connection {} disconnected", conn_id);
+                    } else {
+                        console->info("on disconnected");
+                    }
+                    co_return;
+                },
+                [&console, conn_id](nats_asio::iconnection&, nats_asio::string_view err) -> asio::awaitable<void> {
+                    if (conn_id >= 0) {
+                        console->error("connection {} error: {}", conn_id, err);
+                    } else {
+                        console->error("on error: {}", err);
+                    }
+                    co_return;
+                },
+                opt_ssl_conf);
+        };
+
+        if (m == mode::publisher) {
+            // Create multiple connections for publisher mode
+            console->info("Creating {} connections for pub mode", num_connections);
+            for (int i = 0; i < num_connections; i++) {
+                auto c = make_connection(i);
+                c->start(conf);
+                pub_connections.push_back(c);
+            }
+            pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval, max_in_flight);
+        } else {
+            conn = make_connection();
+            conn->start(conf);
+
+            if (m == mode::generator) {
+                gen_ptr = std::make_shared<generator>(ioc, console, conn, topic, stats_interval,
+                                                      publish_interval);
+            }
         }
 
         ioc.run();
