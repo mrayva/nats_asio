@@ -25,10 +25,13 @@ persons to whom the Software is furnished to do so, subject to the following con
 #pragma once
 
 #include <asio/io_context.hpp>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace nats_asio {
 
@@ -37,9 +40,32 @@ using std::string_view;
 
 using aio = asio::io_context;
 
+// Message headers (name-value pairs)
+using headers_t = std::vector<std::pair<std::string, std::string>>;
+
+// Complete message with headers support
+struct message {
+    std::string subject;
+    optional<std::string> reply_to;
+    headers_t headers;
+    std::vector<char> payload;
+};
+
+// JetStream publish acknowledgment
+struct js_pub_ack {
+    std::string stream;
+    uint64_t sequence = 0;
+    optional<std::string> domain;
+    bool duplicate = false;
+};
+
+// Callback for messages without headers (legacy)
 using on_message_cb = std::function<asio::awaitable<void>(std::string_view subject,
                                                           std::optional<std::string_view> reply_to,
                                                           std::span<const char> payload)>;
+
+// Callback for messages with headers
+using on_message_with_headers_cb = std::function<asio::awaitable<void>(const message& msg)>;
 
 class status {
 public:
@@ -116,8 +142,34 @@ struct iconnection {
 
     [[nodiscard]] virtual bool is_connected() noexcept = 0;
 
+    // Basic publish (no headers)
     [[nodiscard]] virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                                           optional<string_view> reply_to) = 0;
+
+    // Publish with headers (HPUB)
+    [[nodiscard]] virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
+                                                          const headers_t& headers,
+                                                          optional<string_view> reply_to = {}) = 0;
+
+    // Request-reply pattern with timeout
+    [[nodiscard]] virtual asio::awaitable<std::pair<message, status>> request(
+        string_view subject, std::span<const char> payload,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Request-reply with headers
+    [[nodiscard]] virtual asio::awaitable<std::pair<message, status>> request(
+        string_view subject, std::span<const char> payload, const headers_t& headers,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // JetStream publish with acknowledgment
+    [[nodiscard]] virtual asio::awaitable<std::pair<js_pub_ack, status>> js_publish(
+        string_view subject, std::span<const char> payload,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // JetStream publish with headers
+    [[nodiscard]] virtual asio::awaitable<std::pair<js_pub_ack, status>> js_publish(
+        string_view subject, std::span<const char> payload, const headers_t& headers,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
 
     [[nodiscard]] virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) = 0;
 

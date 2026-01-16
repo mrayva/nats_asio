@@ -26,6 +26,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 
 #include <fmt/format.h>
 
+#include <asio/as_tuple.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/buffer.hpp>
 #include <asio/co_spawn.hpp>
@@ -40,6 +41,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <asio/steady_timer.hpp>
 #include <asio/streambuf.hpp>
 #include <asio/use_awaitable.hpp>
+#include <atomic>
 #include <concepts>
 #include <istream>
 #include <nlohmann/json.hpp>
@@ -55,10 +57,13 @@ namespace ssl = asio::ssl;
 namespace protocol {
     constexpr string_view crlf = "\r\n";
     constexpr string_view pub_fmt = "PUB {} {} {}\r\n";
+    constexpr string_view hpub_fmt = "HPUB {} {} {} {}\r\n";      // subject reply hdr_len total_len
+    constexpr string_view hpub_no_reply_fmt = "HPUB {} {} {}\r\n"; // subject hdr_len total_len
     constexpr string_view sub_fmt = "SUB {} {} {}\r\n";
     constexpr string_view unsub_fmt = "UNSUB {}\r\n";
     constexpr string_view connect_fmt = "CONNECT {}\r\n";
     constexpr string_view pong = "PONG\r\n";
+    constexpr string_view nats_hdr_line = "NATS/1.0\r\n";
 
     constexpr string_view op_msg = "MSG";
     constexpr string_view op_hmsg = "HMSG";
@@ -68,6 +73,59 @@ namespace protocol {
     constexpr string_view op_err = "-ERR";
     constexpr string_view op_info = "INFO";
     constexpr string_view delim = " ";
+}
+
+// Generate unique inbox for request-reply
+inline std::string generate_inbox() {
+    static std::atomic<uint64_t> counter{0};
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    return fmt::format("_INBOX.{}.{}", now, counter++);
+}
+
+// Serialize headers to NATS format: "NATS/1.0\r\nKey: Value\r\n...\r\n"
+inline std::string serialize_headers(const headers_t& headers) {
+    std::string result(protocol::nats_hdr_line);
+    for (const auto& [key, value] : headers) {
+        result += key;
+        result += ": ";
+        result += value;
+        result += "\r\n";
+    }
+    result += "\r\n";  // Empty line terminates headers
+    return result;
+}
+
+// Parse headers from NATS format
+inline headers_t parse_headers(string_view data) {
+    headers_t headers;
+
+    // Skip "NATS/1.0\r\n" prefix
+    auto pos = data.find("\r\n");
+    if (pos == string_view::npos) return headers;
+    data = data.substr(pos + 2);
+
+    // Parse each header line until empty line
+    while (!data.empty() && data != "\r\n") {
+        pos = data.find("\r\n");
+        if (pos == string_view::npos) break;
+
+        auto line = data.substr(0, pos);
+        data = data.substr(pos + 2);
+
+        if (line.empty()) break;  // Empty line = end of headers
+
+        auto colon = line.find(':');
+        if (colon != string_view::npos) {
+            auto key = line.substr(0, colon);
+            auto value = line.substr(colon + 1);
+            // Trim leading space from value
+            if (!value.empty() && value[0] == ' ') {
+                value = value.substr(1);
+            }
+            headers.emplace_back(std::string(key), std::string(value));
+        }
+    }
+    return headers;
 }
 
 using asio::awaitable;
@@ -337,6 +395,10 @@ struct parser_observer {
     virtual asio::awaitable<void> on_info(string_view info) = 0;
     virtual asio::awaitable<void> on_message(string_view subject, string_view sid,
                                              optional<string_view> reply_to, std::size_t n) = 0;
+    // HMSG: message with headers
+    virtual asio::awaitable<void> on_hmessage(string_view subject, string_view sid,
+                                              optional<string_view> reply_to,
+                                              std::size_t header_len, std::size_t total_len) = 0;
     virtual asio::awaitable<void> consumed(std::size_t n) = 0;
 };
 
@@ -363,6 +425,39 @@ struct protocol_parser {
         }
 
         switch (v[0]) {
+            case 'H': // HMSG
+                if (v.starts_with(protocol::op_hmsg) && v.size() > protocol::op_hmsg.size() && v[protocol::op_hmsg.size()] == ' ') {
+                    auto info = v.substr(protocol::op_hmsg.size() + 1);
+                    auto results = split_sv(info, protocol::delim);
+
+                    // HMSG subject sid [reply] hdr_len total_len
+                    if (results.size() < 4 || results.size() > 5) {
+                        co_return status("unexpected HMSG format");
+                    }
+
+                    bool has_reply = results.size() == 5;
+                    std::size_t hdr_idx = has_reply ? 3 : 2;
+                    std::size_t total_idx = has_reply ? 4 : 3;
+                    std::size_t hdr_len = 0, total_len = 0;
+
+                    try {
+                        hdr_len = static_cast<std::size_t>(std::stoll(results[hdr_idx].data(), nullptr, 10));
+                        total_len = static_cast<std::size_t>(std::stoll(results[total_idx].data(), nullptr, 10));
+                    } catch (const std::exception& e) {
+                        co_return status(fmt::format("can't parse HMSG lengths: {}", e.what()));
+                    }
+
+                    if (has_reply) {
+                        co_await observer.on_hmessage(results[0], results[1], results[2], hdr_len, total_len);
+                    } else {
+                        co_await observer.on_hmessage(results[0], results[1], optional<string_view>(), hdr_len, total_len);
+                    }
+
+                    co_await observer.consumed(total_len + 2);
+                    co_return status();
+                }
+                break;
+
             case 'M': // MSG
                 if (v.starts_with(protocol::op_msg) && v.size() > protocol::op_msg.size() && v[protocol::op_msg.size()] == ' ') {
                     auto info = v.substr(protocol::op_msg.size() + 1);
@@ -593,7 +688,192 @@ public:
         co_return std::pair<isubscription_sptr, status>{sub, status()};
     }
 
+    // Publish with headers (HPUB)
+    virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
+                                            const headers_t& headers,
+                                            optional<string_view> reply_to = {}) override {
+        if (!m_is_connected) {
+            co_return status("not connected");
+        }
+
+        auto hdr_data = serialize_headers(headers);
+        std::size_t hdr_len = hdr_data.size();
+        std::size_t total_len = hdr_len + payload.size();
+
+        if (m_max_payload > 0 && total_len > m_max_payload) {
+            co_return status("message size exceeds server limit");
+        }
+
+        std::vector<asio::const_buffer> buffers;
+        std::string cmd;
+
+        if (reply_to.has_value()) {
+            cmd = fmt::format(fmt::runtime(protocol::hpub_fmt), subject, reply_to.value(), hdr_len, total_len);
+        } else {
+            cmd = fmt::format(fmt::runtime(protocol::hpub_no_reply_fmt), subject, hdr_len, total_len);
+        }
+
+        buffers.emplace_back(asio::buffer(cmd.data(), cmd.size()));
+        buffers.emplace_back(asio::buffer(hdr_data.data(), hdr_data.size()));
+        buffers.emplace_back(asio::buffer(payload.data(), payload.size()));
+        buffers.emplace_back(asio::buffer(protocol::crlf.data(), protocol::crlf.size()));
+
+        try {
+            co_await asio::async_write(m_socket, buffers, asio::use_awaitable);
+        } catch (const std::system_error& e) {
+            co_return status(e.code().message());
+        }
+
+        co_return status();
+    }
+
+    // Request-reply pattern
+    virtual asio::awaitable<std::pair<message, status>> request(
+        string_view subject, std::span<const char> payload,
+        std::chrono::milliseconds timeout) override {
+        co_return co_await request_impl(subject, payload, {}, timeout);
+    }
+
+    // Request-reply with headers
+    virtual asio::awaitable<std::pair<message, status>> request(
+        string_view subject, std::span<const char> payload, const headers_t& headers,
+        std::chrono::milliseconds timeout) override {
+        co_return co_await request_impl(subject, payload, headers, timeout);
+    }
+
+    // JetStream publish
+    virtual asio::awaitable<std::pair<js_pub_ack, status>> js_publish(
+        string_view subject, std::span<const char> payload,
+        std::chrono::milliseconds timeout) override {
+        co_return co_await js_publish_impl(subject, payload, {}, timeout);
+    }
+
+    // JetStream publish with headers
+    virtual asio::awaitable<std::pair<js_pub_ack, status>> js_publish(
+        string_view subject, std::span<const char> payload, const headers_t& headers,
+        std::chrono::milliseconds timeout) override {
+        co_return co_await js_publish_impl(subject, payload, headers, timeout);
+    }
+
 private:
+    // Shared state for request-reply pattern
+    struct request_state {
+        std::atomic<bool> received{false};
+        message response;
+    };
+
+    // Request implementation
+    asio::awaitable<std::pair<message, status>> request_impl(
+        string_view subject, std::span<const char> payload,
+        const headers_t& headers, std::chrono::milliseconds timeout) {
+
+        if (!m_is_connected) {
+            co_return std::pair<message, status>{{}, status("not connected")};
+        }
+
+        // Generate unique inbox
+        auto inbox = generate_inbox();
+
+        // Create shared state for response
+        auto state = std::make_shared<request_state>();
+
+        // Subscribe to inbox with auto-unsubscribe after 1 message
+        auto [sub, sub_status] = co_await subscribe(
+            inbox,
+            [state](string_view subj, optional<string_view> reply,
+                   std::span<const char> data) -> asio::awaitable<void> {
+                if (!state->received.exchange(true)) {
+                    state->response.subject = std::string(subj);
+                    if (reply) state->response.reply_to = std::string(*reply);
+                    state->response.payload.assign(data.begin(), data.end());
+                }
+                co_return;
+            },
+            {.max_messages = 1});
+
+        if (sub_status.failed()) {
+            co_return std::pair<message, status>{{}, sub_status};
+        }
+
+        // Publish request with reply-to inbox
+        status pub_status;
+        if (headers.empty()) {
+            pub_status = co_await publish(subject, payload, inbox);
+        } else {
+            pub_status = co_await publish(subject, payload, headers, inbox);
+        }
+
+        if (pub_status.failed()) {
+            co_await unsubscribe(sub);
+            co_return std::pair<message, status>{{}, pub_status};
+        }
+
+        // Wait for response with timeout using polling
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+
+        while (!state->received.load()) {
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                co_await unsubscribe(sub);
+                co_return std::pair<message, status>{{}, status("request timeout")};
+            }
+
+            // Poll every 5ms
+            timer.expires_after(std::chrono::milliseconds(5));
+            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            if (ec && ec != asio::error::operation_aborted) {
+                co_await unsubscribe(sub);
+                co_return std::pair<message, status>{{}, status(ec.message())};
+            }
+        }
+
+        co_return std::pair<message, status>{std::move(state->response), status()};
+    }
+
+    // JetStream publish implementation
+    asio::awaitable<std::pair<js_pub_ack, status>> js_publish_impl(
+        string_view subject, std::span<const char> payload,
+        const headers_t& headers, std::chrono::milliseconds timeout) {
+
+        // Use request-reply pattern
+        auto [response, req_status] = co_await request_impl(subject, payload, headers, timeout);
+
+        if (req_status.failed()) {
+            co_return std::pair<js_pub_ack, status>{{}, req_status};
+        }
+
+        // Parse JetStream pub ack from response
+        js_pub_ack ack;
+        try {
+            using nlohmann::json;
+            std::string payload_str(response.payload.begin(), response.payload.end());
+            auto j = json::parse(payload_str);
+
+            if (j.contains("error")) {
+                auto err_msg = j["error"].value("description", "unknown JetStream error");
+                co_return std::pair<js_pub_ack, status>{{}, status(err_msg)};
+            }
+
+            if (j.contains("stream")) {
+                ack.stream = j["stream"].get<std::string>();
+            }
+            if (j.contains("seq")) {
+                ack.sequence = j["seq"].get<uint64_t>();
+            }
+            if (j.contains("domain")) {
+                ack.domain = j["domain"].get<std::string>();
+            }
+            if (j.contains("duplicate")) {
+                ack.duplicate = j["duplicate"].get<bool>();
+            }
+        } catch (const std::exception& e) {
+            co_return std::pair<js_pub_ack, status>{{}, status(fmt::format("failed to parse pub ack: {}", e.what()))};
+        }
+
+        co_return std::pair<js_pub_ack, status>{std::move(ack), status()};
+    }
+
     awaitable<void> on_ping() override {
         co_await asio::async_write(m_socket, asio::buffer(protocol::pong.data(), protocol::pong.size()),
                                    use_awaitable);
@@ -663,6 +943,55 @@ private:
 
         auto b = m_buf.data();
         std::span<const char> payload_span(static_cast<const char*>(b.data()), n);
+        co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+
+        // Check for auto-unsubscribe after delivering message
+        if (it->second->increment_and_check()) {
+            co_await unsubscribe_impl(it->second);
+        }
+        co_return;
+    }
+
+    awaitable<void> on_hmessage(string_view subject, string_view sid_str,
+                                optional<string_view> reply_to,
+                                std::size_t header_len, std::size_t total_len) override {
+        // Calculate payload length (total_len includes headers)
+        std::size_t payload_len = total_len - header_len;
+
+        // Ensure we have enough data in buffer
+        auto bytes_to_transfer = static_cast<std::ptrdiff_t>(total_len + 2) - static_cast<std::ptrdiff_t>(m_buf.size());
+        if (bytes_to_transfer > 0) {
+            co_await asio::async_read(m_socket, m_buf,
+                                      asio::transfer_at_least(static_cast<std::size_t>(bytes_to_transfer)),
+                                      use_awaitable);
+        }
+
+        std::size_t sid_u = 0;
+        try {
+            sid_u = static_cast<std::size_t>(std::stoll(sid_str.data(), nullptr, 10));
+        } catch (const std::exception& e) {
+            co_return;
+        }
+
+        auto it = m_subs.find(sid_u);
+        if (it == m_subs.end()) {
+            co_return;
+        }
+
+        if (it->second->is_cancelled()) {
+            co_await unsubscribe_impl(it->second);
+            co_return;
+        }
+
+        // Extract headers and payload from buffer
+        auto b = m_buf.data();
+        const char* data_ptr = static_cast<const char*>(b.data());
+
+        // Parse headers (skip them for now, deliver payload to callback)
+        // Note: headers are from data_ptr[0] to data_ptr[header_len]
+        // Payload is from data_ptr[header_len] to data_ptr[total_len]
+        std::span<const char> payload_span(data_ptr + header_len, payload_len);
+
         co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
 
         // Check for auto-unsubscribe after delivering message

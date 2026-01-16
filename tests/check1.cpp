@@ -18,6 +18,10 @@ struct parser_mock : public parser_observer {
                 (string_view subject, string_view sid, optional<string_view> reply_to,
                  std::size_t n),
                 (override));
+    MOCK_METHOD(asio::awaitable<void>, on_hmessage,
+                (string_view subject, string_view sid, optional<string_view> reply_to,
+                 std::size_t header_len, std::size_t total_len),
+                (override));
 };
 
 // Change the signature to accept a function returning awaitable<void>

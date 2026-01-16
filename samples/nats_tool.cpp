@@ -72,7 +72,7 @@ public:
         std::span<const char> payload_span(msg.data(), msg.size());
 
         for (;;) {
-            auto s = co_await m_conn->publish(m_topic, payload_span, {});
+            auto s = co_await m_conn->publish(m_topic, payload_span, std::nullopt);
 
             if (s.failed()) {
                 m_log->error("publish failed with error {}", s.error());
@@ -122,9 +122,11 @@ class publisher : public worker {
 public:
     publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
               std::vector<nats_asio::iconnection_sptr> connections, const std::string& topic,
-              int stats_interval, int max_in_flight = 1000)
+              int stats_interval, int max_in_flight = 1000, bool jetstream = false,
+              int js_timeout_ms = 5000)
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
           m_topic(topic), m_next_conn(0), m_in_flight(0), m_max_in_flight(max_in_flight),
+          m_jetstream(jetstream), m_js_timeout(std::chrono::milliseconds(js_timeout_ms)),
           m_stdin(ioc, ::dup(STDIN_FILENO)) {
         asio::co_spawn(ioc, read_and_publish(), asio::detached);
     }
@@ -177,12 +179,21 @@ public:
                 m_ioc,
                 [this, conn, msg]() -> asio::awaitable<void> {
                     std::span<const char> payload_span(msg->data(), msg->size());
-                    auto s = co_await conn->publish(m_topic, payload_span, {});
 
-                    if (s.failed()) {
-                        m_log->error("publish failed: {}", s.error());
+                    if (m_jetstream) {
+                        auto [ack, s] = co_await conn->js_publish(m_topic, payload_span, m_js_timeout);
+                        if (s.failed()) {
+                            m_log->error("js_publish failed: {}", s.error());
+                        } else {
+                            m_counter++;
+                        }
                     } else {
-                        m_counter++;
+                        auto s = co_await conn->publish(m_topic, payload_span, std::nullopt);
+                        if (s.failed()) {
+                            m_log->error("publish failed: {}", s.error());
+                        } else {
+                            m_counter++;
+                        }
                     }
                     m_in_flight--;
                     co_return;
@@ -232,6 +243,8 @@ private:
     std::size_t m_next_conn;
     std::atomic<int> m_in_flight;
     int m_max_in_flight;
+    bool m_jetstream;
+    std::chrono::milliseconds m_js_timeout;
     asio::posix::stream_descriptor m_stdin;
 };
 
@@ -285,6 +298,8 @@ int main(int argc, char* argv[]) {
         ("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
         ("n,connections", "Number of connections for pub mode (default: 1)", cxxopts::value<int>(num_connections))
         ("max_in_flight", "Max in-flight publishes for pub mode (default: 1000)", cxxopts::value<int>(max_in_flight))
+        ("js,jetstream", "Use JetStream publish with acknowledgment (pub mode only)")
+        ("js_timeout", "JetStream publish timeout in ms (default: 5000)", cxxopts::value<int>())
         ("print", "print messages to stdout", cxxopts::value<bool>(print_to_stdout))
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
@@ -410,7 +425,10 @@ int main(int argc, char* argv[]) {
                 c->start(conf);
                 pub_connections.push_back(c);
             }
-            pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval, max_in_flight);
+            bool use_jetstream = result.count("jetstream") > 0;
+            int js_timeout_ms = result.count("js_timeout") ? result["js_timeout"].as<int>() : 5000;
+            pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
+                                                   max_in_flight, use_jetstream, js_timeout_ms);
         } else {
             conn = make_connection();
             conn->start(conf);
