@@ -59,14 +59,70 @@ struct js_pub_ack {
     bool duplicate = false;
 };
 
-// Callback for messages without headers (legacy)
-using on_message_cb = std::function<asio::awaitable<void>(std::string_view subject,
-                                                          std::optional<std::string_view> reply_to,
-                                                          std::span<const char> payload)>;
+// JetStream message with metadata
+struct js_message {
+    message msg;                                           // base message with payload/headers
+    std::string stream;                                    // stream name
+    std::string consumer;                                  // consumer name
+    uint64_t stream_sequence = 0;                          // sequence in stream
+    uint64_t consumer_sequence = 0;                        // sequence for this consumer
+    uint64_t num_delivered = 0;                            // delivery attempt count
+    uint64_t num_pending = 0;                              // remaining messages
+    std::chrono::system_clock::time_point timestamp;       // message timestamp
+};
 
-// Callback for messages with headers
-using on_message_with_headers_cb = std::function<asio::awaitable<void>(const message& msg)>;
+// JetStream acknowledgment policy
+enum class js_ack_policy { none, all, explicit_ };
 
+// JetStream replay policy
+enum class js_replay_policy { instant, original };
+
+// JetStream deliver policy
+enum class js_deliver_policy {
+    all,                  // all messages
+    last,                 // last message only
+    new_,                 // only new messages
+    by_start_sequence,    // from specific sequence
+    by_start_time,        // from specific time
+    last_per_subject      // last message per subject
+};
+
+// Consumer configuration
+struct js_consumer_config {
+    std::string stream;                                    // required: stream name
+    optional<std::string> durable_name;                    // durable consumer name
+    optional<std::string> filter_subject;                  // subject filter
+    optional<std::string> deliver_subject;                 // for push consumers (auto-generated if empty)
+    optional<std::string> deliver_group;                   // queue group for push consumers
+
+    js_ack_policy ack = js_ack_policy::explicit_;
+    std::chrono::seconds ack_wait{30};
+    uint64_t max_deliver = 0;                              // 0 = unlimited
+    uint64_t max_ack_pending = 1000;
+
+    js_replay_policy replay = js_replay_policy::instant;
+    js_deliver_policy deliver = js_deliver_policy::all;
+    optional<uint64_t> opt_start_seq;
+    optional<std::chrono::system_clock::time_point> opt_start_time;
+
+    // Flow control
+    bool flow_control = false;
+    std::chrono::milliseconds idle_heartbeat{0};           // 0 = disabled
+};
+
+// Consumer info returned from server
+struct js_consumer_info {
+    std::string stream;
+    std::string name;
+    std::string deliver_subject;
+    uint64_t num_pending = 0;
+    uint64_t num_ack_pending = 0;
+    uint64_t num_redelivered = 0;
+    uint64_t delivered_stream_seq = 0;
+    uint64_t delivered_consumer_seq = 0;
+};
+
+// Status class for error handling - must be defined before ijs_subscription
 class status {
 public:
     status() = default;
@@ -88,6 +144,45 @@ public:
 
 private:
     optional<std::string> m_error;
+};
+
+// Callback for messages without headers (legacy)
+using on_message_cb = std::function<asio::awaitable<void>(std::string_view subject,
+                                                          std::optional<std::string_view> reply_to,
+                                                          std::span<const char> payload)>;
+
+// Callback for messages with headers
+using on_message_with_headers_cb = std::function<asio::awaitable<void>(const message& msg)>;
+
+// Forward declaration
+struct ijs_subscription;
+using ijs_subscription_sptr = std::shared_ptr<ijs_subscription>;
+
+// Callback for JetStream messages
+using on_js_message_cb = std::function<asio::awaitable<void>(ijs_subscription& sub, const js_message& msg)>;
+
+// JetStream subscription interface
+struct ijs_subscription {
+    virtual ~ijs_subscription() = default;
+
+    [[nodiscard]] virtual const js_consumer_info& info() const noexcept = 0;
+
+    virtual void stop() noexcept = 0;
+
+    [[nodiscard]] virtual bool is_active() const noexcept = 0;
+
+    // Acknowledge message (mark as processed)
+    [[nodiscard]] virtual asio::awaitable<status> ack(const js_message& msg) = 0;
+
+    // Negative acknowledge (request redelivery)
+    [[nodiscard]] virtual asio::awaitable<status> nak(const js_message& msg,
+                                                       std::chrono::milliseconds delay = {}) = 0;
+
+    // Mark as in-progress (extend ack deadline)
+    [[nodiscard]] virtual asio::awaitable<status> in_progress(const js_message& msg) = 0;
+
+    // Terminate processing (don't redeliver)
+    [[nodiscard]] virtual asio::awaitable<status> term(const js_message& msg) = 0;
 };
 
 struct subscribe_options {
@@ -171,10 +266,31 @@ struct iconnection {
         string_view subject, std::span<const char> payload, const headers_t& headers,
         std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
 
+    // JetStream subscribe (push consumer) - creates/binds consumer and subscribes to delivery subject
+    [[nodiscard]] virtual asio::awaitable<std::pair<ijs_subscription_sptr, status>>
+    js_subscribe(const js_consumer_config& config, on_js_message_cb cb) = 0;
+
+    // JetStream fetch (pull consumer) - fetch batch of messages on demand
+    [[nodiscard]] virtual asio::awaitable<std::pair<std::vector<js_message>, status>>
+    js_fetch(string_view stream, string_view consumer, uint32_t batch = 1,
+             std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Get consumer info
+    [[nodiscard]] virtual asio::awaitable<std::pair<js_consumer_info, status>>
+    js_get_consumer_info(string_view stream, string_view consumer) = 0;
+
+    // Delete a consumer
+    [[nodiscard]] virtual asio::awaitable<status>
+    js_delete_consumer(string_view stream, string_view consumer) = 0;
+
     [[nodiscard]] virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) = 0;
 
     [[nodiscard]] virtual asio::awaitable<std::pair<isubscription_sptr, status>>
     subscribe(string_view subject, on_message_cb cb, subscribe_options opts = {}) = 0;
+
+    // Subscribe with headers support (for JetStream messages via HMSG)
+    [[nodiscard]] virtual asio::awaitable<std::pair<isubscription_sptr, status>>
+    subscribe(string_view subject, on_message_with_headers_cb cb, subscribe_options opts = {}) = 0;
 };
 using iconnection_sptr = std::shared_ptr<iconnection>;
 

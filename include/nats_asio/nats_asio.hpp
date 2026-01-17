@@ -43,8 +43,11 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <asio/use_awaitable.hpp>
 #include <atomic>
 #include <concepts>
+#include <iomanip>
 #include <istream>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -549,6 +552,10 @@ public:
     subscription(uint64_t sid, const on_message_cb& cb, uint32_t max_msgs = 0)
         : m_cancel(false), m_cb(cb), m_sid(sid), m_max_messages(max_msgs), m_message_count(0) {}
 
+    // Constructor with headers callback for JetStream messages
+    subscription(uint64_t sid, const on_message_with_headers_cb& headers_cb, uint32_t max_msgs = 0)
+        : m_cancel(false), m_headers_cb(headers_cb), m_sid(sid), m_max_messages(max_msgs), m_message_count(0) {}
+
     subscription(const subscription&) = delete;
     subscription& operator=(const subscription&) = delete;
 
@@ -576,6 +583,14 @@ public:
         return m_cb;
     }
 
+    [[nodiscard]] bool has_headers_callback() const noexcept {
+        return m_headers_cb != nullptr;
+    }
+
+    [[nodiscard]] const on_message_with_headers_cb& headers_callback() const noexcept {
+        return m_headers_cb;
+    }
+
     // Increment message count and return true if should auto-unsubscribe
     [[nodiscard]] bool increment_and_check() noexcept {
         if (m_max_messages == 0) {
@@ -588,12 +603,145 @@ public:
 private:
     std::atomic<bool> m_cancel;
     on_message_cb m_cb;
+    on_message_with_headers_cb m_headers_cb;
     uint64_t m_sid;
     uint32_t m_max_messages;
     std::atomic<uint32_t> m_message_count;
 };
 
 using subscription_sptr = std::shared_ptr<subscription>;
+
+// Forward declaration
+template <class SocketType>
+class connection;
+
+// JetStream subscription implementation
+template <class SocketType>
+class js_subscription : public ijs_subscription {
+public:
+    js_subscription(connection<SocketType>* conn, const js_consumer_info& info,
+                    isubscription_sptr underlying_sub)
+        : m_conn(conn), m_info(info), m_underlying_sub(std::move(underlying_sub)),
+          m_active(true) {}
+
+    js_subscription(const js_subscription&) = delete;
+    js_subscription& operator=(const js_subscription&) = delete;
+
+    [[nodiscard]] const js_consumer_info& info() const noexcept override {
+        return m_info;
+    }
+
+    void stop() noexcept override {
+        m_active = false;
+        if (m_underlying_sub) {
+            m_underlying_sub->cancel();
+        }
+    }
+
+    [[nodiscard]] bool is_active() const noexcept override {
+        return m_active.load();
+    }
+
+    [[nodiscard]] asio::awaitable<status> ack(const js_message& msg) override {
+        return send_ack(msg, "+ACK");
+    }
+
+    [[nodiscard]] asio::awaitable<status> nak(const js_message& msg,
+                                               std::chrono::milliseconds delay) override {
+        if (delay.count() > 0) {
+            // NAK with delay in nanoseconds
+            auto delay_ns = delay.count() * 1000000LL;
+            return send_ack(msg, fmt::format("-NAK {{\"delay\":{}}}", delay_ns));
+        }
+        return send_ack(msg, "-NAK");
+    }
+
+    [[nodiscard]] asio::awaitable<status> in_progress(const js_message& msg) override {
+        return send_ack(msg, "+WPI");  // Work in Progress
+    }
+
+    [[nodiscard]] asio::awaitable<status> term(const js_message& msg) override {
+        return send_ack(msg, "+TERM");
+    }
+
+private:
+    asio::awaitable<status> send_ack(const js_message& msg, std::string_view ack_body);
+
+    connection<SocketType>* m_conn;
+    js_consumer_info m_info;
+    isubscription_sptr m_underlying_sub;
+    std::atomic<bool> m_active;
+};
+
+template <class SocketType>
+using js_subscription_sptr = std::shared_ptr<js_subscription<SocketType>>;
+
+// Helper to parse JetStream message metadata from headers
+inline js_message parse_js_message_metadata(const message& msg) {
+    js_message js_msg;
+    js_msg.msg = msg;
+
+    for (const auto& [key, value] : msg.headers) {
+        if (key == "Nats-Stream") {
+            js_msg.stream = value;
+        } else if (key == "Nats-Consumer") {
+            js_msg.consumer = value;
+        } else if (key == "Nats-Sequence") {
+            // Format: "stream_seq consumer_seq"
+            auto space_pos = value.find(' ');
+            if (space_pos != std::string::npos) {
+                js_msg.stream_sequence = std::stoull(value.substr(0, space_pos));
+                js_msg.consumer_sequence = std::stoull(value.substr(space_pos + 1));
+            }
+        } else if (key == "Nats-Num-Delivered") {
+            js_msg.num_delivered = std::stoull(value);
+        } else if (key == "Nats-Num-Pending") {
+            js_msg.num_pending = std::stoull(value);
+        } else if (key == "Nats-Time-Stamp") {
+            // Parse ISO 8601 timestamp (simplified)
+            // Format: 2021-08-15T23:24:24.123456789Z
+            std::tm tm = {};
+            std::istringstream ss(value);
+            ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+            auto tp = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+            js_msg.timestamp = tp;
+        }
+    }
+
+    return js_msg;
+}
+
+// Helper to convert ack_policy enum to string
+inline std::string js_ack_policy_to_string(js_ack_policy policy) {
+    switch (policy) {
+        case js_ack_policy::none: return "none";
+        case js_ack_policy::all: return "all";
+        case js_ack_policy::explicit_: return "explicit";
+    }
+    return "explicit";
+}
+
+// Helper to convert replay_policy enum to string
+inline std::string js_replay_policy_to_string(js_replay_policy policy) {
+    switch (policy) {
+        case js_replay_policy::instant: return "instant";
+        case js_replay_policy::original: return "original";
+    }
+    return "instant";
+}
+
+// Helper to convert deliver_policy enum to string
+inline std::string js_deliver_policy_to_string(js_deliver_policy policy) {
+    switch (policy) {
+        case js_deliver_policy::all: return "all";
+        case js_deliver_policy::last: return "last";
+        case js_deliver_policy::new_: return "new";
+        case js_deliver_policy::by_start_sequence: return "by_start_sequence";
+        case js_deliver_policy::by_start_time: return "by_start_time";
+        case js_deliver_policy::last_per_subject: return "last_per_subject";
+    }
+    return "all";
+}
 
 template <class SocketType>
 class connection : public iconnection, public parser_observer {
@@ -688,6 +836,32 @@ public:
         co_return std::pair<isubscription_sptr, status>{sub, status()};
     }
 
+    // Subscribe with headers callback (for JetStream HMSG messages)
+    virtual asio::awaitable<std::pair<isubscription_sptr, status>>
+    subscribe(string_view subject, on_message_with_headers_cb cb, subscribe_options opts = {}) override {
+        if (!m_is_connected) {
+            co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
+                                                            status("not connected")};
+        }
+
+        auto sid = next_sid();
+        std::string payload = opts.queue_group.has_value()
+                                  ? fmt::format(fmt::runtime(protocol::sub_fmt), subject, opts.queue_group.value(), sid)
+                                  : fmt::format(fmt::runtime(protocol::sub_fmt), subject, "", sid);
+
+        try {
+            co_await asio::async_write(m_socket, asio::buffer(payload), asio::use_awaitable);
+        } catch (const std::system_error& e) {
+            co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
+                                                            status(e.code().message())};
+        }
+
+        auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
+        m_subs.emplace(sid, sub);
+
+        co_return std::pair<isubscription_sptr, status>{sub, status()};
+    }
+
     // Publish with headers (HPUB)
     virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                             const headers_t& headers,
@@ -753,6 +927,31 @@ public:
         string_view subject, std::span<const char> payload, const headers_t& headers,
         std::chrono::milliseconds timeout) override {
         co_return co_await js_publish_impl(subject, payload, headers, timeout);
+    }
+
+    // JetStream subscribe (push consumer)
+    virtual asio::awaitable<std::pair<ijs_subscription_sptr, status>>
+    js_subscribe(const js_consumer_config& config, on_js_message_cb cb) override {
+        co_return co_await js_subscribe_impl(config, std::move(cb));
+    }
+
+    // JetStream fetch (pull consumer)
+    virtual asio::awaitable<std::pair<std::vector<js_message>, status>>
+    js_fetch(string_view stream, string_view consumer, uint32_t batch,
+             std::chrono::milliseconds timeout) override {
+        co_return co_await js_fetch_impl(stream, consumer, batch, timeout);
+    }
+
+    // Get consumer info
+    virtual asio::awaitable<std::pair<nats_asio::js_consumer_info, status>>
+    js_get_consumer_info(string_view stream, string_view consumer) override {
+        co_return co_await js_consumer_info_impl(stream, consumer);
+    }
+
+    // Delete a consumer
+    virtual asio::awaitable<status>
+    js_delete_consumer(string_view stream, string_view consumer) override {
+        co_return co_await js_delete_consumer_impl(stream, consumer);
     }
 
 private:
@@ -874,6 +1073,348 @@ private:
         co_return std::pair<js_pub_ack, status>{std::move(ack), status()};
     }
 
+    // Create consumer via JetStream API
+    asio::awaitable<std::pair<nats_asio::js_consumer_info, status>> create_consumer(
+        const js_consumer_config& config, const std::string& deliver_subject) {
+
+        using nlohmann::json;
+
+        // Build consumer config JSON
+        json consumer_config;
+        consumer_config["deliver_subject"] = deliver_subject;
+        consumer_config["ack_policy"] = js_ack_policy_to_string(config.ack);
+        consumer_config["replay_policy"] = js_replay_policy_to_string(config.replay);
+        consumer_config["deliver_policy"] = js_deliver_policy_to_string(config.deliver);
+        consumer_config["ack_wait"] = config.ack_wait.count() * 1000000000LL;  // nanoseconds
+        consumer_config["max_ack_pending"] = static_cast<int64_t>(config.max_ack_pending);
+
+        if (config.durable_name) {
+            consumer_config["durable_name"] = *config.durable_name;
+        }
+        if (config.filter_subject) {
+            consumer_config["filter_subject"] = *config.filter_subject;
+        }
+        if (config.deliver_group) {
+            consumer_config["deliver_group"] = *config.deliver_group;
+        }
+        if (config.max_deliver > 0) {
+            consumer_config["max_deliver"] = static_cast<int64_t>(config.max_deliver);
+        }
+        if (config.opt_start_seq) {
+            consumer_config["opt_start_seq"] = static_cast<int64_t>(*config.opt_start_seq);
+        }
+        if (config.flow_control) {
+            consumer_config["flow_control"] = true;
+        }
+        if (config.idle_heartbeat.count() > 0) {
+            consumer_config["idle_heartbeat"] = config.idle_heartbeat.count() * 1000000LL;  // nanoseconds
+        }
+
+        json req;
+        req["stream_name"] = config.stream;
+        req["config"] = consumer_config;
+
+        auto payload_str = req.dump();
+        std::span<const char> payload(payload_str.data(), payload_str.size());
+
+        // API subject depends on whether it's durable or ephemeral
+        std::string api_subject;
+        if (config.durable_name) {
+            api_subject = fmt::format("$JS.API.CONSUMER.DURABLE.CREATE.{}.{}",
+                                      config.stream, *config.durable_name);
+        } else {
+            api_subject = fmt::format("$JS.API.CONSUMER.CREATE.{}", config.stream);
+        }
+
+        auto [response, req_status] = co_await request_impl(api_subject, payload, {},
+                                                            std::chrono::seconds(5));
+
+        if (req_status.failed()) {
+            co_return std::pair<nats_asio::js_consumer_info, status>{{}, req_status};
+        }
+
+        // Parse response
+        nats_asio::js_consumer_info info;
+        try {
+            std::string resp_str(response.payload.begin(), response.payload.end());
+            auto j = json::parse(resp_str);
+
+            if (j.contains("error")) {
+                auto err_msg = j["error"].value("description", "unknown JetStream error");
+                auto err_code = j["error"].value("err_code", 0);
+                co_return std::pair<nats_asio::js_consumer_info, status>{
+                    {}, status(fmt::format("{} (code: {})", err_msg, err_code))};
+            }
+
+            info.stream = j.value("stream_name", config.stream);
+            info.name = j.value("name", config.durable_name.value_or(""));
+            if (j.contains("config")) {
+                info.deliver_subject = j["config"].value("deliver_subject", deliver_subject);
+            }
+            if (j.contains("delivered")) {
+                info.delivered_stream_seq = j["delivered"].value("stream_seq", 0);
+                info.delivered_consumer_seq = j["delivered"].value("consumer_seq", 0);
+            }
+            if (j.contains("num_pending")) {
+                info.num_pending = j["num_pending"].get<uint64_t>();
+            }
+            if (j.contains("num_ack_pending")) {
+                info.num_ack_pending = j["num_ack_pending"].get<uint64_t>();
+            }
+            if (j.contains("num_redelivered")) {
+                info.num_redelivered = j["num_redelivered"].get<uint64_t>();
+            }
+        } catch (const std::exception& e) {
+            co_return std::pair<nats_asio::js_consumer_info, status>{
+                {}, status(fmt::format("failed to parse consumer info: {}", e.what()))};
+        }
+
+        co_return std::pair<nats_asio::js_consumer_info, status>{std::move(info), status()};
+    }
+
+    // JetStream subscribe implementation (push consumer)
+    asio::awaitable<std::pair<ijs_subscription_sptr, status>> js_subscribe_impl(
+        const js_consumer_config& config, on_js_message_cb cb) {
+
+        if (!m_is_connected) {
+            co_return std::pair<ijs_subscription_sptr, status>{nullptr, status("not connected")};
+        }
+
+        // Generate delivery subject if not provided
+        std::string deliver_subject;
+        if (config.deliver_subject) {
+            deliver_subject = *config.deliver_subject;
+        } else {
+            deliver_subject = generate_inbox();
+        }
+
+        // Create or bind to consumer
+        auto [consumer_info, create_status] = co_await create_consumer(config, deliver_subject);
+        if (create_status.failed()) {
+            co_return std::pair<ijs_subscription_sptr, status>{nullptr, create_status};
+        }
+
+        // Create the JetStream subscription that will hold state
+        auto js_sub = std::make_shared<js_subscription<SocketType>>(this, consumer_info, nullptr);
+
+        // Subscribe to delivery subject using headers callback for HMSG
+        on_message_with_headers_cb headers_callback =
+            [js_sub, cb = std::move(cb)](const message& msg) -> asio::awaitable<void> {
+                if (!js_sub->is_active()) {
+                    co_return;
+                }
+
+                // Parse JetStream metadata from headers
+                auto js_msg = parse_js_message_metadata(msg);
+
+                // Call user callback
+                co_await cb(*js_sub, js_msg);
+            };
+
+        auto [underlying_sub, sub_status] = co_await subscribe(
+            deliver_subject,
+            std::move(headers_callback),
+            subscribe_options{
+                .queue_group = config.deliver_group
+                    ? optional<string_view>(*config.deliver_group)
+                    : std::nullopt
+            });
+
+        if (sub_status.failed()) {
+            co_return std::pair<ijs_subscription_sptr, status>{nullptr, sub_status};
+        }
+
+        // Update js_subscription with the underlying subscription
+        js_sub = std::make_shared<js_subscription<SocketType>>(this, consumer_info, underlying_sub);
+
+        co_return std::pair<ijs_subscription_sptr, status>{js_sub, status()};
+    }
+
+    // JetStream fetch implementation (pull consumer)
+    asio::awaitable<std::pair<std::vector<js_message>, status>> js_fetch_impl(
+        string_view stream, string_view consumer, uint32_t batch,
+        std::chrono::milliseconds timeout) {
+
+        if (!m_is_connected) {
+            co_return std::pair<std::vector<js_message>, status>{{}, status("not connected")};
+        }
+
+        using nlohmann::json;
+
+        // Build fetch request
+        json req;
+        req["batch"] = batch;
+        req["expires"] = timeout.count() * 1000000LL;  // nanoseconds
+
+        auto payload_str = req.dump();
+        std::span<const char> payload(payload_str.data(), payload_str.size());
+
+        // Generate inbox for responses
+        auto inbox = generate_inbox();
+
+        // Shared state for collecting messages
+        struct fetch_state {
+            std::atomic<uint32_t> received{0};
+            std::atomic<bool> done{false};
+            std::vector<js_message> messages;
+            std::mutex mutex;
+        };
+        auto state = std::make_shared<fetch_state>();
+
+        // Subscribe to inbox using headers callback for HMSG
+        on_message_with_headers_cb headers_callback =
+            [state, batch](const message& msg) -> asio::awaitable<void> {
+                // Check for end of batch marker (status header indicates no messages or timeout)
+                // JetStream sends Status: 408 Request Timeout or Status: 404 No Messages
+                for (const auto& [key, value] : msg.headers) {
+                    if (key == "Status") {
+                        if (value == "408" || value == "404") {
+                            state->done.store(true);
+                            co_return;
+                        }
+                    }
+                }
+
+                // Check for empty payload (also indicates end of batch)
+                if (msg.payload.empty()) {
+                    state->done.store(true);
+                    co_return;
+                }
+
+                auto js_msg = parse_js_message_metadata(msg);
+
+                {
+                    std::lock_guard<std::mutex> lock(state->mutex);
+                    state->messages.push_back(std::move(js_msg));
+                }
+
+                if (++state->received >= batch) {
+                    state->done.store(true);
+                }
+                co_return;
+            };
+
+        auto [sub, sub_status] = co_await subscribe(inbox, std::move(headers_callback));
+
+        if (sub_status.failed()) {
+            co_return std::pair<std::vector<js_message>, status>{{}, sub_status};
+        }
+
+        // Send fetch request
+        std::string api_subject = fmt::format("$JS.API.CONSUMER.MSG.NEXT.{}.{}", stream, consumer);
+        auto pub_status = co_await publish(api_subject, payload, inbox);
+
+        if (pub_status.failed()) {
+            co_await unsubscribe(sub);
+            co_return std::pair<std::vector<js_message>, status>{{}, pub_status};
+        }
+
+        // Wait for messages with timeout
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+
+        while (!state->done.load()) {
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;  // Timeout - return what we have
+            }
+
+            timer.expires_after(std::chrono::milliseconds(10));
+            co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        }
+
+        co_await unsubscribe(sub);
+
+        std::vector<js_message> result;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            result = std::move(state->messages);
+        }
+
+        co_return std::pair<std::vector<js_message>, status>{std::move(result), status()};
+    }
+
+    // Get consumer info implementation
+    asio::awaitable<std::pair<nats_asio::js_consumer_info, status>> js_consumer_info_impl(
+        string_view stream, string_view consumer) {
+
+        if (!m_is_connected) {
+            co_return std::pair<nats_asio::js_consumer_info, status>{{}, status("not connected")};
+        }
+
+        using nlohmann::json;
+
+        std::string api_subject = fmt::format("$JS.API.CONSUMER.INFO.{}.{}", stream, consumer);
+        auto [response, req_status] = co_await request_impl(api_subject, {}, {}, std::chrono::seconds(5));
+
+        if (req_status.failed()) {
+            co_return std::pair<nats_asio::js_consumer_info, status>{{}, req_status};
+        }
+
+        nats_asio::js_consumer_info info;
+        try {
+            std::string resp_str(response.payload.begin(), response.payload.end());
+            auto j = json::parse(resp_str);
+
+            if (j.contains("error")) {
+                auto err_msg = j["error"].value("description", "unknown JetStream error");
+                co_return std::pair<nats_asio::js_consumer_info, status>{{}, status(err_msg)};
+            }
+
+            info.stream = j.value("stream_name", std::string(stream));
+            info.name = j.value("name", std::string(consumer));
+            if (j.contains("config")) {
+                info.deliver_subject = j["config"].value("deliver_subject", "");
+            }
+            if (j.contains("delivered")) {
+                info.delivered_stream_seq = j["delivered"].value("stream_seq", 0);
+                info.delivered_consumer_seq = j["delivered"].value("consumer_seq", 0);
+            }
+            info.num_pending = j.value("num_pending", 0);
+            info.num_ack_pending = j.value("num_ack_pending", 0);
+            info.num_redelivered = j.value("num_redelivered", 0);
+        } catch (const std::exception& e) {
+            co_return std::pair<nats_asio::js_consumer_info, status>{
+                {}, status(fmt::format("failed to parse consumer info: {}", e.what()))};
+        }
+
+        co_return std::pair<nats_asio::js_consumer_info, status>{std::move(info), status()};
+    }
+
+    // Delete consumer implementation
+    asio::awaitable<status> js_delete_consumer_impl(string_view stream, string_view consumer) {
+        if (!m_is_connected) {
+            co_return status("not connected");
+        }
+
+        using nlohmann::json;
+
+        std::string api_subject = fmt::format("$JS.API.CONSUMER.DELETE.{}.{}", stream, consumer);
+        auto [response, req_status] = co_await request_impl(api_subject, {}, {}, std::chrono::seconds(5));
+
+        if (req_status.failed()) {
+            co_return req_status;
+        }
+
+        try {
+            std::string resp_str(response.payload.begin(), response.payload.end());
+            auto j = json::parse(resp_str);
+
+            if (j.contains("error")) {
+                auto err_msg = j["error"].value("description", "unknown JetStream error");
+                co_return status(err_msg);
+            }
+
+            if (!j.value("success", false)) {
+                co_return status("consumer deletion failed");
+            }
+        } catch (const std::exception& e) {
+            co_return status(fmt::format("failed to parse delete response: {}", e.what()));
+        }
+
+        co_return status();
+    }
+
     awaitable<void> on_ping() override {
         co_await asio::async_write(m_socket, asio::buffer(protocol::pong.data(), protocol::pong.size()),
                                    use_awaitable);
@@ -987,12 +1528,29 @@ private:
         auto b = m_buf.data();
         const char* data_ptr = static_cast<const char*>(b.data());
 
-        // Parse headers (skip them for now, deliver payload to callback)
-        // Note: headers are from data_ptr[0] to data_ptr[header_len]
+        // Headers are from data_ptr[0] to data_ptr[header_len]
         // Payload is from data_ptr[header_len] to data_ptr[total_len]
+        std::span<const char> headers_span(data_ptr, header_len);
         std::span<const char> payload_span(data_ptr + header_len, payload_len);
 
-        co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+        // Check if subscription has a headers callback
+        if (it->second->has_headers_callback()) {
+            // Build full message with headers
+            message msg;
+            msg.subject = std::string(subject);
+            if (reply_to) {
+                msg.reply_to = std::string(*reply_to);
+            }
+            // Convert span to string_view for parse_headers
+            string_view headers_sv(headers_span.data(), headers_span.size());
+            msg.headers = parse_headers(headers_sv);
+            msg.payload.assign(payload_span.begin(), payload_span.end());
+
+            co_await it->second->headers_callback()(msg);
+        } else {
+            // Fall back to regular callback (without headers)
+            co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+        }
 
         // Check for auto-unsubscribe after delivering message
         if (it->second->increment_and_check()) {
@@ -1167,6 +1725,23 @@ private:
     std::shared_ptr<ssl::context> m_ssl_ctx;
     uni_socket<SocketType> m_socket;
 };
+
+// Implementation of js_subscription::send_ack (needs connection class to be complete)
+template <class SocketType>
+asio::awaitable<status> js_subscription<SocketType>::send_ack(
+    const js_message& msg, std::string_view ack_body) {
+
+    if (!m_active.load()) {
+        co_return status("subscription is not active");
+    }
+
+    if (!msg.msg.reply_to) {
+        co_return status("message has no reply subject for acknowledgment");
+    }
+
+    std::span<const char> payload(ack_body.data(), ack_body.size());
+    co_return co_await m_conn->publish(*msg.msg.reply_to, payload, std::nullopt);
+}
 
 inline void load_certificates(const ssl_config& conf, ssl::context& ctx) {
     ctx.set_options(ssl::context::tls_client);

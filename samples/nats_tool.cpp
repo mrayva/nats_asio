@@ -17,8 +17,10 @@
 const std::string grub_mode("grub");
 const std::string gen_mode("gen");
 const std::string pub_mode("pub");
+const std::string js_grub_mode("js_grub");
+const std::string js_fetch_mode("js_fetch");
 
-enum class mode { grubber, generator, publisher };
+enum class mode { grubber, generator, publisher, js_grubber, js_fetcher };
 
 class worker {
 public:
@@ -116,6 +118,109 @@ public:
 
 private:
     bool m_print_to_stdout;
+};
+
+// JetStream subscriber using push consumer
+class js_grubber : public worker {
+public:
+    js_grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
+               bool print_to_stdout, bool auto_ack)
+        : worker(ioc, console, stats_interval), m_print_to_stdout(print_to_stdout),
+          m_auto_ack(auto_ack) {}
+
+    asio::awaitable<void> on_js_message(nats_asio::ijs_subscription& sub,
+                                         const nats_asio::js_message& msg) {
+        m_counter++;
+
+        if (m_print_to_stdout) {
+            std::cout.write(msg.msg.payload.data(), msg.msg.payload.size()) << std::endl;
+            if (!msg.stream.empty()) {
+                m_log->debug("stream={} consumer={} seq={}/{} delivered={}",
+                            msg.stream, msg.consumer, msg.stream_sequence,
+                            msg.consumer_sequence, msg.num_delivered);
+            }
+        }
+
+        // Auto-acknowledge if enabled
+        if (m_auto_ack) {
+            auto s = co_await sub.ack(msg);
+            if (s.failed()) {
+                m_log->error("ack failed: {}", s.error());
+            }
+        }
+
+        co_return;
+    }
+
+private:
+    bool m_print_to_stdout;
+    bool m_auto_ack;
+};
+
+// JetStream fetcher using pull consumer
+class js_fetcher : public worker {
+public:
+    js_fetcher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
+               const nats_asio::iconnection_sptr& conn, const std::string& stream,
+               const std::string& consumer, int stats_interval, bool print_to_stdout,
+               int batch_size, int fetch_interval_ms)
+        : worker(ioc, console, stats_interval), m_conn(conn), m_stream(stream),
+          m_consumer(consumer), m_print_to_stdout(print_to_stdout),
+          m_batch_size(batch_size), m_fetch_interval_ms(fetch_interval_ms) {
+        asio::co_spawn(ioc, fetch_loop(), asio::detached);
+    }
+
+    asio::awaitable<void> fetch_loop() {
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+
+        while (true) {
+            if (!m_conn->is_connected()) {
+                timer.expires_after(std::chrono::milliseconds(100));
+                co_await timer.async_wait(asio::use_awaitable);
+                continue;
+            }
+
+            auto [messages, s] = co_await m_conn->js_fetch(
+                m_stream, m_consumer, m_batch_size, std::chrono::milliseconds(5000));
+
+            if (s.failed()) {
+                m_log->error("js_fetch failed: {}", s.error());
+            } else {
+                for (const auto& msg : messages) {
+                    m_counter++;
+                    if (m_print_to_stdout) {
+                        std::cout.write(msg.msg.payload.data(), msg.msg.payload.size()) << std::endl;
+                    }
+
+                    // Acknowledge the message
+                    if (msg.msg.reply_to) {
+                        auto ack_status = co_await m_conn->publish(
+                            *msg.msg.reply_to, std::span<const char>("+ACK", 4), std::nullopt);
+                        if (ack_status.failed()) {
+                            m_log->error("ack failed: {}", ack_status.error());
+                        }
+                    }
+                }
+
+                if (messages.empty()) {
+                    m_log->debug("No messages available");
+                }
+            }
+
+            if (m_fetch_interval_ms > 0) {
+                timer.expires_after(std::chrono::milliseconds(m_fetch_interval_ms));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+        }
+    }
+
+private:
+    nats_asio::iconnection_sptr m_conn;
+    std::string m_stream;
+    std::string m_consumer;
+    bool m_print_to_stdout;
+    int m_batch_size;
+    int m_fetch_interval_ms;
 };
 
 class publisher : public worker {
@@ -300,6 +405,12 @@ int main(int argc, char* argv[]) {
         ("max_in_flight", "Max in-flight publishes for pub mode (default: 1000)", cxxopts::value<int>(max_in_flight))
         ("js,jetstream", "Use JetStream publish with acknowledgment (pub mode only)")
         ("js_timeout", "JetStream publish timeout in ms (default: 5000)", cxxopts::value<int>())
+        ("stream", "JetStream stream name (js_grub/js_fetch mode)", cxxopts::value<std::string>())
+        ("consumer", "JetStream consumer name (js_grub/js_fetch mode)", cxxopts::value<std::string>())
+        ("durable", "Durable consumer name (js_grub mode)", cxxopts::value<std::string>())
+        ("batch", "Batch size for js_fetch mode (default: 10)", cxxopts::value<int>())
+        ("fetch_interval", "Interval between fetches in ms (default: 100)", cxxopts::value<int>())
+        ("auto_ack", "Auto-acknowledge messages (js_grub mode)", cxxopts::value<bool>())
         ("print", "print messages to stdout", cxxopts::value<bool>(print_to_stdout))
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
@@ -342,8 +453,10 @@ int main(int argc, char* argv[]) {
 
         mode = result["mode"].as<std::string>();
 
-        if (mode != grub_mode && mode != gen_mode && mode != pub_mode) {
-            console->error("Invalid mode. Could be `{}`, `{}`, or `{}`", grub_mode, gen_mode, pub_mode);
+        if (mode != grub_mode && mode != gen_mode && mode != pub_mode &&
+            mode != js_grub_mode && mode != js_fetch_mode) {
+            console->error("Invalid mode. Could be `{}`, `{}`, `{}`, `{}`, or `{}`",
+                          grub_mode, gen_mode, pub_mode, js_grub_mode, js_fetch_mode);
             return 1;
         }
 
@@ -357,9 +470,47 @@ int main(int argc, char* argv[]) {
             if (num_connections < 1) {
                 num_connections = 1;
             }
+        } else if (mode == js_grub_mode) {
+            m = mode::js_grubber;
+            publish_interval = -1;
+        } else if (mode == js_fetch_mode) {
+            m = mode::js_fetcher;
+            publish_interval = -1;
         } else {
             if (publish_interval < 0) {
                 publish_interval = 1000;
+            }
+        }
+
+        // Validate JetStream mode requirements
+        std::string js_stream, js_consumer, js_durable;
+        int batch_size = 10;
+        int fetch_interval_ms = 100;
+        bool auto_ack = result.count("auto_ack") > 0;
+
+        if (m == mode::js_grubber || m == mode::js_fetcher) {
+            if (!result.count("stream")) {
+                console->error("JetStream mode requires --stream");
+                return 1;
+            }
+            js_stream = result["stream"].as<std::string>();
+
+            if (m == mode::js_fetcher) {
+                if (!result.count("consumer")) {
+                    console->error("js_fetch mode requires --consumer");
+                    return 1;
+                }
+                js_consumer = result["consumer"].as<std::string>();
+            }
+
+            if (result.count("durable")) {
+                js_durable = result["durable"].as<std::string>();
+            }
+            if (result.count("batch")) {
+                batch_size = result["batch"].as<int>();
+            }
+            if (result.count("fetch_interval")) {
+                fetch_interval_ms = result["fetch_interval"].as<int>();
             }
         }
 
@@ -367,11 +518,15 @@ int main(int argc, char* argv[]) {
         std::shared_ptr<grubber> grub_ptr;
         std::shared_ptr<generator> gen_ptr;
         std::shared_ptr<publisher> pub_ptr;
+        std::shared_ptr<js_grubber> js_grub_ptr;
+        std::shared_ptr<js_fetcher> js_fetch_ptr;
         nats_asio::iconnection_sptr conn;
         std::vector<nats_asio::iconnection_sptr> pub_connections;
 
         if (m == mode::grubber) {
             grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, print_to_stdout);
+        } else if (m == mode::js_grubber) {
+            js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, print_to_stdout, auto_ack);
         }
 
         // Helper to create a connection
@@ -394,6 +549,29 @@ int main(int argc, char* argv[]) {
 
                         if (r.second.failed()) {
                             console->error("failed to subscribe with error: {}", r.second.error());
+                        }
+                    } else if (m == mode::js_grubber) {
+                        // Setup JetStream push consumer
+                        nats_asio::js_consumer_config config;
+                        config.stream = js_stream;
+                        config.filter_subject = topic.empty() ? std::nullopt : std::optional<std::string>(topic);
+                        if (!js_durable.empty()) {
+                            config.durable_name = js_durable;
+                        }
+                        config.ack = nats_asio::js_ack_policy::explicit_;
+
+                        auto [sub, s] = co_await conn->js_subscribe(
+                            config,
+                            [js_grub_ptr](nats_asio::ijs_subscription& sub,
+                                         const nats_asio::js_message& msg) -> asio::awaitable<void> {
+                                return js_grub_ptr->on_js_message(sub, msg);
+                            });
+
+                        if (s.failed()) {
+                            console->error("js_subscribe failed: {}", s.error());
+                        } else {
+                            console->info("JetStream subscription active: stream={} consumer={}",
+                                        sub->info().stream, sub->info().name);
                         }
                     }
                     co_return;
@@ -436,6 +614,10 @@ int main(int argc, char* argv[]) {
             if (m == mode::generator) {
                 gen_ptr = std::make_shared<generator>(ioc, console, conn, topic, stats_interval,
                                                       publish_interval);
+            } else if (m == mode::js_fetcher) {
+                js_fetch_ptr = std::make_shared<js_fetcher>(ioc, console, conn, js_stream,
+                                                            js_consumer, stats_interval, print_to_stdout,
+                                                            batch_size, fetch_interval_ms);
             }
         }
 
