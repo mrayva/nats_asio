@@ -1033,15 +1033,15 @@ public:
     // JetStream publish
     virtual asio::awaitable<std::pair<js_pub_ack, status>> js_publish(
         string_view subject, std::span<const char> payload,
-        std::chrono::milliseconds timeout) override {
-        co_return co_await js_publish_impl(subject, payload, {}, timeout);
+        std::chrono::milliseconds timeout, bool wait_for_ack) override {
+        co_return co_await js_publish_impl(subject, payload, {}, timeout, wait_for_ack);
     }
 
     // JetStream publish with headers
     virtual asio::awaitable<std::pair<js_pub_ack, status>> js_publish(
         string_view subject, std::span<const char> payload, const headers_t& headers,
-        std::chrono::milliseconds timeout) override {
-        co_return co_await js_publish_impl(subject, payload, headers, timeout);
+        std::chrono::milliseconds timeout, bool wait_for_ack) override {
+        co_return co_await js_publish_impl(subject, payload, headers, timeout, wait_for_ack);
     }
 
     // JetStream subscribe (push consumer)
@@ -1215,9 +1215,20 @@ private:
     // JetStream publish implementation
     asio::awaitable<std::pair<js_pub_ack, status>> js_publish_impl(
         string_view subject, std::span<const char> payload,
-        const headers_t& headers, std::chrono::milliseconds timeout) {
+        const headers_t& headers, std::chrono::milliseconds timeout, bool wait_for_ack) {
 
-        // Use request-reply pattern
+        // Fire-and-forget mode: just publish without waiting for reply
+        if (!wait_for_ack) {
+            status pub_status;
+            if (headers.empty()) {
+                pub_status = co_await publish(subject, payload, optional<string_view>{});
+            } else {
+                pub_status = co_await publish(subject, payload, headers, optional<string_view>{});
+            }
+            co_return std::pair<js_pub_ack, status>{{}, pub_status};
+        }
+
+        // Use request-reply pattern for acknowledged publish
         auto [response, req_status] = co_await request_impl(subject, payload, headers, timeout);
 
         if (req_status.failed()) {
@@ -1618,7 +1629,7 @@ private:
         std::string subject = fmt::format("$KV.{}.{}", bucket, key);
 
         // Use JetStream publish to get acknowledgment with sequence number
-        auto [ack, pub_status] = co_await js_publish_impl(subject, value, {}, timeout);
+        auto [ack, pub_status] = co_await js_publish_impl(subject, value, {}, timeout, true);
 
         if (pub_status.failed()) {
             co_return std::pair<uint64_t, status>{0, pub_status};
@@ -1733,7 +1744,7 @@ private:
         headers_t headers = {{"KV-Operation", "DEL"}};
         std::span<const char> empty_payload;
 
-        auto [ack, pub_status] = co_await js_publish_impl(subject, empty_payload, headers, timeout);
+        auto [ack, pub_status] = co_await js_publish_impl(subject, empty_payload, headers, timeout, true);
 
         if (pub_status.failed()) {
             co_return std::pair<uint64_t, status>{0, pub_status};
@@ -1770,7 +1781,7 @@ private:
         };
         std::span<const char> empty_payload;
 
-        auto [ack, pub_status] = co_await js_publish_impl(subject, empty_payload, headers, timeout);
+        auto [ack, pub_status] = co_await js_publish_impl(subject, empty_payload, headers, timeout, true);
 
         if (pub_status.failed()) {
             co_return std::pair<uint64_t, status>{0, pub_status};
@@ -1802,7 +1813,7 @@ private:
         // Use Nats-Expected-Last-Subject-Sequence: 0 to ensure key doesn't exist
         headers_t headers = {{"Nats-Expected-Last-Subject-Sequence", "0"}};
 
-        auto [ack, pub_status] = co_await js_publish_impl(subject, value, headers, timeout);
+        auto [ack, pub_status] = co_await js_publish_impl(subject, value, headers, timeout, true);
 
         if (pub_status.failed()) {
             // Check if it's a sequence mismatch error (key already exists)
@@ -1842,7 +1853,7 @@ private:
         // Use Nats-Expected-Last-Subject-Sequence to ensure revision matches
         headers_t headers = {{"Nats-Expected-Last-Subject-Sequence", std::to_string(revision)}};
 
-        auto [ack, pub_status] = co_await js_publish_impl(subject, value, headers, timeout);
+        auto [ack, pub_status] = co_await js_publish_impl(subject, value, headers, timeout, true);
 
         if (pub_status.failed()) {
             // Check if it's a sequence mismatch error
@@ -2093,7 +2104,7 @@ private:
         std::string subject = fmt::format("$KV.{}.{}", bucket, key);
         std::span<const char> value_span(response.payload.data(), response.payload.size());
 
-        auto [ack, pub_status] = co_await js_publish_impl(subject, value_span, {}, timeout);
+        auto [ack, pub_status] = co_await js_publish_impl(subject, value_span, {}, timeout, true);
 
         if (pub_status.failed()) {
             co_return std::pair<uint64_t, status>{0, pub_status};

@@ -402,11 +402,11 @@ public:
     publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
               std::vector<nats_asio::iconnection_sptr> connections, const std::string& topic,
               int stats_interval, int max_in_flight = 1000, bool jetstream = false,
-              int js_timeout_ms = 5000)
+              int js_timeout_ms = 5000, bool wait_for_ack = true)
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
           m_topic(topic), m_next_conn(0), m_in_flight(0), m_max_in_flight(max_in_flight),
           m_jetstream(jetstream), m_js_timeout(std::chrono::milliseconds(js_timeout_ms)),
-          m_stdin(ioc, ::dup(STDIN_FILENO)) {
+          m_wait_for_ack(wait_for_ack), m_stdin(ioc, ::dup(STDIN_FILENO)) {
         asio::co_spawn(ioc, read_and_publish(), asio::detached);
     }
 
@@ -460,7 +460,7 @@ public:
                     std::span<const char> payload_span(msg->data(), msg->size());
 
                     if (m_jetstream) {
-                        auto [ack, s] = co_await conn->js_publish(m_topic, payload_span, m_js_timeout);
+                        auto [ack, s] = co_await conn->js_publish(m_topic, payload_span, m_js_timeout, m_wait_for_ack);
                         if (s.failed()) {
                             m_log->error("js_publish failed: {}", s.error());
                         } else {
@@ -524,6 +524,7 @@ private:
     int m_max_in_flight;
     bool m_jetstream;
     std::chrono::milliseconds m_js_timeout;
+    bool m_wait_for_ack;
     asio::posix::stream_descriptor m_stdin;
 };
 
@@ -577,7 +578,8 @@ int main(int argc, char* argv[]) {
         ("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
         ("n,connections", "Number of connections for pub mode (default: 1)", cxxopts::value<int>(num_connections))
         ("max_in_flight", "Max in-flight publishes for pub mode (default: 1000)", cxxopts::value<int>(max_in_flight))
-        ("js,jetstream", "Use JetStream publish with acknowledgment (pub mode only)")
+        ("js,jetstream", "Use JetStream publish (pub mode only)")
+        ("no_ack", "Fire-and-forget JetStream publish, don't wait for ack (with --js)")
         ("js_timeout", "JetStream publish timeout in ms (default: 5000)", cxxopts::value<int>())
         ("stream", "JetStream stream name (js_grub/js_fetch mode)", cxxopts::value<std::string>())
         ("consumer", "JetStream consumer name (js_grub/js_fetch mode)", cxxopts::value<std::string>())
@@ -993,8 +995,9 @@ int main(int argc, char* argv[]) {
             }
             bool use_jetstream = result.count("jetstream") > 0;
             int js_timeout_ms = result.count("js_timeout") ? result["js_timeout"].as<int>() : 5000;
+            bool wait_for_ack = result.count("no_ack") == 0;  // default: wait for ack
             pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
-                                                   max_in_flight, use_jetstream, js_timeout_ms);
+                                                   max_in_flight, use_jetstream, js_timeout_ms, wait_for_ack);
         } else {
             conn = make_connection();
             conn->start(conf);
