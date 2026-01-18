@@ -676,6 +676,82 @@ private:
 template <class SocketType>
 using js_subscription_sptr = std::shared_ptr<js_subscription<SocketType>>;
 
+// KV watcher implementation
+template <class SocketType>
+class kv_watcher : public ikv_watcher {
+public:
+    kv_watcher(const std::string& bucket, const std::string& key_filter,
+               isubscription_sptr underlying_sub)
+        : m_bucket(bucket), m_key_filter(key_filter),
+          m_underlying_sub(std::move(underlying_sub)), m_active(true) {}
+
+    kv_watcher(const kv_watcher&) = delete;
+    kv_watcher& operator=(const kv_watcher&) = delete;
+
+    void stop() noexcept override {
+        m_active = false;
+        if (m_underlying_sub) {
+            m_underlying_sub->cancel();
+        }
+    }
+
+    [[nodiscard]] bool is_active() const noexcept override {
+        return m_active.load();
+    }
+
+    [[nodiscard]] const std::string& bucket() const noexcept override {
+        return m_bucket;
+    }
+
+    [[nodiscard]] const std::string& key_filter() const noexcept override {
+        return m_key_filter;
+    }
+
+private:
+    std::string m_bucket;
+    std::string m_key_filter;
+    isubscription_sptr m_underlying_sub;
+    std::atomic<bool> m_active;
+};
+
+template <class SocketType>
+using kv_watcher_sptr = std::shared_ptr<kv_watcher<SocketType>>;
+
+// Helper to parse KV entry from a message
+inline kv_entry parse_kv_entry_from_message(const message& msg, string_view bucket) {
+    kv_entry entry;
+    entry.bucket = std::string(bucket);
+    entry.value.assign(msg.payload.begin(), msg.payload.end());
+    entry.op = kv_entry::operation::put;
+
+    // Extract key from subject: $KV.{bucket}.{key}
+    // Subject format: $KV.bucket.key or $KV.bucket.key.with.dots
+    std::string prefix = fmt::format("$KV.{}.", bucket);
+    if (msg.subject.size() > prefix.size() && msg.subject.substr(0, prefix.size()) == prefix) {
+        entry.key = msg.subject.substr(prefix.size());
+    }
+
+    // Parse metadata from headers
+    for (const auto& [key, value] : msg.headers) {
+        if (key == "Nats-Sequence") {
+            entry.revision = std::stoull(value);
+        } else if (key == "Nats-Time-Stamp") {
+            std::tm tm = {};
+            std::istringstream ss(value);
+            ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+            entry.created = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+        } else if (key == "KV-Operation") {
+            if (value == "DEL") {
+                entry.op = kv_entry::operation::del;
+            } else if (value == "PURGE") {
+                entry.op = kv_entry::operation::purge;
+            }
+        }
+    }
+
+    return entry;
+}
+
 // Helper to parse JetStream message metadata from headers
 inline js_message parse_js_message_metadata(const message& msg) {
     js_message js_msg;
@@ -973,6 +1049,12 @@ public:
     kv_delete(string_view bucket, string_view key,
               std::chrono::milliseconds timeout) override {
         co_return co_await kv_delete_impl(bucket, key, timeout);
+    }
+
+    // KV watch
+    virtual asio::awaitable<std::pair<ikv_watcher_sptr, status>>
+    kv_watch(string_view bucket, on_kv_entry_cb cb, string_view key) override {
+        co_return co_await kv_watch_impl(bucket, std::move(cb), key);
     }
 
 private:
@@ -1555,6 +1637,71 @@ private:
         }
 
         co_return std::pair<uint64_t, status>{ack.sequence, status()};
+    }
+
+    // KV watch implementation
+    asio::awaitable<std::pair<ikv_watcher_sptr, status>> kv_watch_impl(
+        string_view bucket, on_kv_entry_cb cb, string_view key) {
+
+        if (!m_is_connected) {
+            co_return std::pair<ikv_watcher_sptr, status>{nullptr, status("not connected")};
+        }
+
+        std::string bucket_str(bucket);
+        std::string key_filter_str(key);
+
+        // Build filter subject: $KV.{bucket}.{key} or $KV.{bucket}.> for all keys
+        std::string filter_subject;
+        if (key.empty()) {
+            filter_subject = fmt::format("$KV.{}.>", bucket);
+        } else {
+            filter_subject = fmt::format("$KV.{}.{}", bucket, key);
+        }
+
+        // KV stream name is KV_{bucket}
+        std::string stream_name = fmt::format("KV_{}", bucket);
+
+        // Generate delivery subject for push consumer
+        std::string deliver_subject = generate_inbox();
+
+        // Create ephemeral push consumer for watching
+        js_consumer_config config;
+        config.stream = stream_name;
+        config.filter_subject = filter_subject;
+        config.deliver_subject = deliver_subject;
+        config.ack = js_ack_policy::none;  // No ack needed for watch
+        config.deliver = js_deliver_policy::last_per_subject;  // Start from current state
+        config.replay = js_replay_policy::instant;
+
+        // Create the consumer
+        auto [consumer_info, create_status] = co_await create_consumer(config, deliver_subject);
+        if (create_status.failed()) {
+            co_return std::pair<ikv_watcher_sptr, status>{nullptr, create_status};
+        }
+
+        // Subscribe to delivery subject using headers callback
+        on_message_with_headers_cb headers_callback =
+            [bucket_str, cb = std::move(cb)](const message& msg) -> asio::awaitable<void> {
+                // Parse KV entry from message
+                auto entry = parse_kv_entry_from_message(msg, bucket_str);
+                // Call user callback
+                co_await cb(entry);
+            };
+
+        auto [underlying_sub, sub_status] = co_await subscribe(
+            deliver_subject,
+            std::move(headers_callback),
+            subscribe_options{});
+
+        if (sub_status.failed()) {
+            co_return std::pair<ikv_watcher_sptr, status>{nullptr, sub_status};
+        }
+
+        // Create the watcher
+        auto watcher = std::make_shared<kv_watcher<SocketType>>(
+            bucket_str, key_filter_str, underlying_sub);
+
+        co_return std::pair<ikv_watcher_sptr, status>{watcher, status()};
     }
 
     awaitable<void> on_ping() override {

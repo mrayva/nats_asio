@@ -20,8 +20,9 @@ const std::string pub_mode("pub");
 const std::string js_grub_mode("js_grub");
 const std::string js_fetch_mode("js_fetch");
 const std::string pubkv_mode("pubkv");
+const std::string kvwatch_mode("kvwatch");
 
-enum class mode { grubber, generator, publisher, js_grubber, js_fetcher, kv_publisher };
+enum class mode { grubber, generator, publisher, js_grubber, js_fetcher, kv_publisher, kv_watcher };
 
 class worker {
 public:
@@ -357,6 +358,39 @@ private:
     asio::posix::stream_descriptor m_stdin;
 };
 
+// KV watcher for watching bucket changes
+class kv_watcher_handler : public worker {
+public:
+    kv_watcher_handler(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
+                       int stats_interval, bool print_to_stdout)
+        : worker(ioc, console, stats_interval), m_print_to_stdout(print_to_stdout) {}
+
+    asio::awaitable<void> on_kv_entry(const nats_asio::kv_entry& entry) {
+        m_counter++;
+
+        if (m_print_to_stdout) {
+            std::string op_str;
+            switch (entry.op) {
+                case nats_asio::kv_entry::operation::put: op_str = "PUT"; break;
+                case nats_asio::kv_entry::operation::del: op_str = "DEL"; break;
+                case nats_asio::kv_entry::operation::purge: op_str = "PURGE"; break;
+            }
+            std::cout << "[" << op_str << "] " << entry.bucket << "/" << entry.key
+                      << " rev=" << entry.revision;
+            if (entry.op == nats_asio::kv_entry::operation::put && !entry.value.empty()) {
+                std::cout << " value=";
+                std::cout.write(entry.value.data(), entry.value.size());
+            }
+            std::cout << std::endl;
+        }
+
+        co_return;
+    }
+
+private:
+    bool m_print_to_stdout;
+};
+
 class publisher : public worker {
 public:
     publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
@@ -545,7 +579,8 @@ int main(int argc, char* argv[]) {
         ("batch", "Batch size for js_fetch mode (default: 10)", cxxopts::value<int>())
         ("fetch_interval", "Interval between fetches in ms (default: 100)", cxxopts::value<int>())
         ("auto_ack", "Auto-acknowledge messages (js_grub mode)", cxxopts::value<bool>())
-        ("bucket", "KV bucket name (pubkv mode)", cxxopts::value<std::string>())
+        ("bucket", "KV bucket name (pubkv/kvwatch mode)", cxxopts::value<std::string>())
+        ("key", "KV key filter for kvwatch mode (optional, watches all keys if not specified)", cxxopts::value<std::string>())
         ("separator", "Key-value separator for pubkv mode (default: |)", cxxopts::value<std::string>())
         ("kv_timeout", "KV operation timeout in ms (default: 5000)", cxxopts::value<int>())
         ("print", "print messages to stdout", cxxopts::value<bool>(print_to_stdout))
@@ -592,9 +627,10 @@ int main(int argc, char* argv[]) {
         }
 
         if (mode != grub_mode && mode != gen_mode && mode != pub_mode &&
-            mode != js_grub_mode && mode != js_fetch_mode && mode != pubkv_mode) {
-            console->error("Invalid mode. Could be `{}`, `{}`, `{}`, `{}`, `{}`, or `{}`",
-                          grub_mode, gen_mode, pub_mode, js_grub_mode, js_fetch_mode, pubkv_mode);
+            mode != js_grub_mode && mode != js_fetch_mode && mode != pubkv_mode &&
+            mode != kvwatch_mode) {
+            console->error("Invalid mode. Could be `{}`, `{}`, `{}`, `{}`, `{}`, `{}`, or `{}`",
+                          grub_mode, gen_mode, pub_mode, js_grub_mode, js_fetch_mode, pubkv_mode, kvwatch_mode);
             return 1;
         }
 
@@ -616,6 +652,9 @@ int main(int argc, char* argv[]) {
             publish_interval = -1;
         } else if (mode == pubkv_mode) {
             m = mode::kv_publisher;
+            publish_interval = -1;
+        } else if (mode == kvwatch_mode) {
+            m = mode::kv_watcher;
             publish_interval = -1;
         } else {
             if (publish_interval < 0) {
@@ -657,12 +696,13 @@ int main(int argc, char* argv[]) {
 
         // Validate KV mode requirements
         std::string kv_bucket;
+        std::string kv_key;
         std::string kv_separator = "|";
         int kv_timeout_ms = 5000;
 
-        if (m == mode::kv_publisher) {
+        if (m == mode::kv_publisher || m == mode::kv_watcher) {
             if (!result.count("bucket")) {
-                console->error("pubkv mode requires --bucket");
+                console->error("{} mode requires --bucket", mode);
                 return 1;
             }
             kv_bucket = result["bucket"].as<std::string>();
@@ -673,6 +713,9 @@ int main(int argc, char* argv[]) {
             if (result.count("kv_timeout")) {
                 kv_timeout_ms = result["kv_timeout"].as<int>();
             }
+            if (result.count("key")) {
+                kv_key = result["key"].as<std::string>();
+            }
         }
 
         asio::io_context ioc;
@@ -682,6 +725,7 @@ int main(int argc, char* argv[]) {
         std::shared_ptr<js_grubber> js_grub_ptr;
         std::shared_ptr<js_fetcher> js_fetch_ptr;
         std::shared_ptr<kv_publisher> kv_pub_ptr;
+        std::shared_ptr<kv_watcher_handler> kv_watch_ptr;
         nats_asio::iconnection_sptr conn;
         std::vector<nats_asio::iconnection_sptr> pub_connections;
 
@@ -689,6 +733,8 @@ int main(int argc, char* argv[]) {
             grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, print_to_stdout);
         } else if (m == mode::js_grubber) {
             js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, print_to_stdout, auto_ack);
+        } else if (m == mode::kv_watcher) {
+            kv_watch_ptr = std::make_shared<kv_watcher_handler>(ioc, console, stats_interval, print_to_stdout);
         }
 
         // Helper to create a connection
@@ -734,6 +780,24 @@ int main(int argc, char* argv[]) {
                         } else {
                             console->info("JetStream subscription active: stream={} consumer={}",
                                         sub->info().stream, sub->info().name);
+                        }
+                    } else if (m == mode::kv_watcher) {
+                        // Setup KV watcher
+                        auto [watcher, s] = co_await conn->kv_watch(
+                            kv_bucket,
+                            [kv_watch_ptr](const nats_asio::kv_entry& entry) -> asio::awaitable<void> {
+                                return kv_watch_ptr->on_kv_entry(entry);
+                            },
+                            kv_key);
+
+                        if (s.failed()) {
+                            console->error("kv_watch failed: {}", s.error());
+                        } else {
+                            if (kv_key.empty()) {
+                                console->info("Watching KV bucket: {}", kv_bucket);
+                            } else {
+                                console->info("Watching KV bucket: {} key: {}", kv_bucket, kv_key);
+                            }
                         }
                     }
                     co_return;

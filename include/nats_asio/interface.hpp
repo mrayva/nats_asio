@@ -132,6 +132,13 @@ struct kv_entry {
     enum class operation { put, del, purge } op = operation::put;
 };
 
+// Forward declaration for KV watcher
+struct ikv_watcher;
+using ikv_watcher_sptr = std::shared_ptr<ikv_watcher>;
+
+// Callback for KV watch events
+using on_kv_entry_cb = std::function<asio::awaitable<void>(const kv_entry& entry)>;
+
 // Status class for error handling - must be defined before ijs_subscription
 class status {
 public:
@@ -154,6 +161,23 @@ public:
 
 private:
     optional<std::string> m_error;
+};
+
+// KV watcher interface
+struct ikv_watcher {
+    virtual ~ikv_watcher() = default;
+
+    // Stop watching
+    virtual void stop() noexcept = 0;
+
+    // Check if watcher is active
+    [[nodiscard]] virtual bool is_active() const noexcept = 0;
+
+    // Get the bucket being watched
+    [[nodiscard]] virtual const std::string& bucket() const noexcept = 0;
+
+    // Get the key filter (empty if watching all keys)
+    [[nodiscard]] virtual const std::string& key_filter() const noexcept = 0;
 };
 
 // Callback for messages without headers (legacy)
@@ -309,6 +333,11 @@ struct iconnection {
     [[nodiscard]] virtual asio::awaitable<std::pair<uint64_t, status>>
     kv_delete(string_view bucket, string_view key,
               std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Watch a KV bucket for changes (optionally filter by key)
+    // If key is empty, watches all keys in the bucket
+    [[nodiscard]] virtual asio::awaitable<std::pair<ikv_watcher_sptr, status>>
+    kv_watch(string_view bucket, on_kv_entry_cb cb, string_view key = {}) = 0;
 
     [[nodiscard]] virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) = 0;
 
