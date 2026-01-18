@@ -334,6 +334,43 @@ struct iconnection {
     kv_delete(string_view bucket, string_view key,
               std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
 
+    // Purge a key from KV bucket (clears all history, then creates purge marker)
+    // Unlike delete, purge removes all previous revisions of the key
+    [[nodiscard]] virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_purge(string_view bucket, string_view key,
+             std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Create a key only if it doesn't exist or was deleted (returns revision number)
+    // Fails if the key already exists with a value
+    [[nodiscard]] virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_create(string_view bucket, string_view key, std::span<const char> value,
+              std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Update a key only if the current revision matches (optimistic concurrency)
+    // Returns new revision number on success
+    [[nodiscard]] virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_update(string_view bucket, string_view key, std::span<const char> value,
+              uint64_t revision,
+              std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // List all keys in a KV bucket
+    // Returns vector of key names (without the $KV.bucket. prefix)
+    [[nodiscard]] virtual asio::awaitable<std::pair<std::vector<std::string>, status>>
+    kv_keys(string_view bucket,
+            std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Get full history for a key (all revisions)
+    // Returns vector of kv_entry in chronological order (oldest first)
+    [[nodiscard]] virtual asio::awaitable<std::pair<std::vector<kv_entry>, status>>
+    kv_history(string_view bucket, string_view key,
+               std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Revert a key to a previous revision (gets value at revision, puts it as new value)
+    // Returns new revision number on success
+    [[nodiscard]] virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_revert(string_view bucket, string_view key, uint64_t revision,
+              std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
     // Watch a KV bucket for changes (optionally filter by key)
     // If key is empty, watches all keys in the bucket
     [[nodiscard]] virtual asio::awaitable<std::pair<ikv_watcher_sptr, status>>

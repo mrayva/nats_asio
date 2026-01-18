@@ -717,6 +717,45 @@ private:
 template <class SocketType>
 using kv_watcher_sptr = std::shared_ptr<kv_watcher<SocketType>>;
 
+// Validate KV key - returns error message if invalid, empty string if valid
+inline std::string validate_kv_key(string_view key) {
+    if (key.empty()) {
+        return "key cannot be empty";
+    }
+
+    for (char c : key) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            return fmt::format("key contains invalid whitespace character: '{}'", key);
+        }
+        if (c == '*') {
+            return fmt::format("key contains invalid wildcard '*': '{}'", key);
+        }
+        if (c == '>') {
+            return fmt::format("key contains invalid wildcard '>': '{}'", key);
+        }
+    }
+
+    return {};  // Valid
+}
+
+// Validate KV bucket name
+inline std::string validate_kv_bucket(string_view bucket) {
+    if (bucket.empty()) {
+        return "bucket name cannot be empty";
+    }
+
+    for (char c : bucket) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            return fmt::format("bucket name contains invalid whitespace: '{}'", bucket);
+        }
+        if (c == '.' || c == '*' || c == '>') {
+            return fmt::format("bucket name contains invalid character '{}': '{}'", c, bucket);
+        }
+    }
+
+    return {};  // Valid
+}
+
 // Helper to parse KV entry from a message
 inline kv_entry parse_kv_entry_from_message(const message& msg, string_view bucket) {
     kv_entry entry;
@@ -1049,6 +1088,46 @@ public:
     kv_delete(string_view bucket, string_view key,
               std::chrono::milliseconds timeout) override {
         co_return co_await kv_delete_impl(bucket, key, timeout);
+    }
+
+    // KV purge (delete and clear history)
+    virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_purge(string_view bucket, string_view key,
+             std::chrono::milliseconds timeout) override {
+        co_return co_await kv_purge_impl(bucket, key, timeout);
+    }
+
+    // KV create (only if key doesn't exist or was deleted)
+    virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_create(string_view bucket, string_view key, std::span<const char> value,
+              std::chrono::milliseconds timeout) override {
+        co_return co_await kv_create_impl(bucket, key, value, timeout);
+    }
+
+    // KV update (only if revision matches)
+    virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_update(string_view bucket, string_view key, std::span<const char> value,
+              uint64_t revision, std::chrono::milliseconds timeout) override {
+        co_return co_await kv_update_impl(bucket, key, value, revision, timeout);
+    }
+
+    // KV keys (list all keys in bucket)
+    virtual asio::awaitable<std::pair<std::vector<std::string>, status>>
+    kv_keys(string_view bucket, std::chrono::milliseconds timeout) override {
+        co_return co_await kv_keys_impl(bucket, timeout);
+    }
+
+    // KV history (get all revisions of a key)
+    virtual asio::awaitable<std::pair<std::vector<kv_entry>, status>>
+    kv_history(string_view bucket, string_view key, std::chrono::milliseconds timeout) override {
+        co_return co_await kv_history_impl(bucket, key, timeout);
+    }
+
+    // KV revert (restore key to a previous revision)
+    virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_revert(string_view bucket, string_view key, uint64_t revision,
+              std::chrono::milliseconds timeout) override {
+        co_return co_await kv_revert_impl(bucket, key, revision, timeout);
     }
 
     // KV watch
@@ -1523,6 +1602,14 @@ private:
         string_view bucket, string_view key, std::span<const char> value,
         std::chrono::milliseconds timeout) {
 
+        // Validate bucket and key
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+        if (auto err = validate_kv_key(key); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+
         if (!m_is_connected) {
             co_return std::pair<uint64_t, status>{0, status("not connected")};
         }
@@ -1544,6 +1631,14 @@ private:
     asio::awaitable<std::pair<kv_entry, status>> kv_get_impl(
         string_view bucket, string_view key,
         std::chrono::milliseconds timeout) {
+
+        // Validate bucket and key
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<kv_entry, status>{{}, status(err)};
+        }
+        if (auto err = validate_kv_key(key); !err.empty()) {
+            co_return std::pair<kv_entry, status>{{}, status(err)};
+        }
 
         if (!m_is_connected) {
             co_return std::pair<kv_entry, status>{{}, status("not connected")};
@@ -1619,6 +1714,14 @@ private:
         string_view bucket, string_view key,
         std::chrono::milliseconds timeout) {
 
+        // Validate bucket and key
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+        if (auto err = validate_kv_key(key); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+
         if (!m_is_connected) {
             co_return std::pair<uint64_t, status>{0, status("not connected")};
         }
@@ -1639,9 +1742,380 @@ private:
         co_return std::pair<uint64_t, status>{ack.sequence, status()};
     }
 
+    // KV purge implementation - deletes key and clears all history
+    asio::awaitable<std::pair<uint64_t, status>> kv_purge_impl(
+        string_view bucket, string_view key,
+        std::chrono::milliseconds timeout) {
+
+        // Validate bucket and key
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+        if (auto err = validate_kv_key(key); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+
+        if (!m_is_connected) {
+            co_return std::pair<uint64_t, status>{0, status("not connected")};
+        }
+
+        // KV subject format: $KV.{bucket}.{key}
+        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+
+        // Publish empty payload with KV-Operation: PURGE and Nats-Rollup: sub headers
+        // Nats-Rollup: sub tells the server to remove all previous messages for this subject
+        headers_t headers = {
+            {"KV-Operation", "PURGE"},
+            {"Nats-Rollup", "sub"}
+        };
+        std::span<const char> empty_payload;
+
+        auto [ack, pub_status] = co_await js_publish_impl(subject, empty_payload, headers, timeout);
+
+        if (pub_status.failed()) {
+            co_return std::pair<uint64_t, status>{0, pub_status};
+        }
+
+        co_return std::pair<uint64_t, status>{ack.sequence, status()};
+    }
+
+    // KV create implementation - creates only if key doesn't exist or was deleted
+    asio::awaitable<std::pair<uint64_t, status>> kv_create_impl(
+        string_view bucket, string_view key, std::span<const char> value,
+        std::chrono::milliseconds timeout) {
+
+        // Validate bucket and key
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+        if (auto err = validate_kv_key(key); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+
+        if (!m_is_connected) {
+            co_return std::pair<uint64_t, status>{0, status("not connected")};
+        }
+
+        // KV subject format: $KV.{bucket}.{key}
+        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+
+        // Use Nats-Expected-Last-Subject-Sequence: 0 to ensure key doesn't exist
+        headers_t headers = {{"Nats-Expected-Last-Subject-Sequence", "0"}};
+
+        auto [ack, pub_status] = co_await js_publish_impl(subject, value, headers, timeout);
+
+        if (pub_status.failed()) {
+            // Check if it's a sequence mismatch error (key already exists)
+            if (pub_status.error().find("wrong last sequence") != std::string::npos) {
+                co_return std::pair<uint64_t, status>{0, status("key already exists")};
+            }
+            co_return std::pair<uint64_t, status>{0, pub_status};
+        }
+
+        co_return std::pair<uint64_t, status>{ack.sequence, status()};
+    }
+
+    // KV update implementation - updates only if revision matches
+    asio::awaitable<std::pair<uint64_t, status>> kv_update_impl(
+        string_view bucket, string_view key, std::span<const char> value,
+        uint64_t revision, std::chrono::milliseconds timeout) {
+
+        // Validate bucket and key
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+        if (auto err = validate_kv_key(key); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+
+        if (revision == 0) {
+            co_return std::pair<uint64_t, status>{0, status("revision must be > 0 for update, use create for new keys")};
+        }
+
+        if (!m_is_connected) {
+            co_return std::pair<uint64_t, status>{0, status("not connected")};
+        }
+
+        // KV subject format: $KV.{bucket}.{key}
+        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+
+        // Use Nats-Expected-Last-Subject-Sequence to ensure revision matches
+        headers_t headers = {{"Nats-Expected-Last-Subject-Sequence", std::to_string(revision)}};
+
+        auto [ack, pub_status] = co_await js_publish_impl(subject, value, headers, timeout);
+
+        if (pub_status.failed()) {
+            // Check if it's a sequence mismatch error
+            if (pub_status.error().find("wrong last sequence") != std::string::npos) {
+                co_return std::pair<uint64_t, status>{0, status("revision mismatch")};
+            }
+            co_return std::pair<uint64_t, status>{0, pub_status};
+        }
+
+        co_return std::pair<uint64_t, status>{ack.sequence, status()};
+    }
+
+    // KV keys implementation - list all keys in a bucket
+    asio::awaitable<std::pair<std::vector<std::string>, status>> kv_keys_impl(
+        string_view bucket, std::chrono::milliseconds timeout) {
+
+        // Validate bucket
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<std::vector<std::string>, status>{{}, status(err)};
+        }
+
+        if (!m_is_connected) {
+            co_return std::pair<std::vector<std::string>, status>{{}, status("not connected")};
+        }
+
+        using nlohmann::json;
+
+        // Stream name for KV bucket: KV_{bucket}
+        std::string stream_name = fmt::format("KV_{}", bucket);
+
+        // Use stream info API with subjects filter: $JS.API.STREAM.INFO.{stream}
+        std::string api_subject = fmt::format("$JS.API.STREAM.INFO.{}", stream_name);
+
+        // Request body with subjects filter to get all subjects
+        json req;
+        req["subjects_filter"] = fmt::format("$KV.{}.>", bucket);
+
+        auto payload_str = req.dump();
+        std::span<const char> payload(payload_str.data(), payload_str.size());
+
+        auto [response, req_status] = co_await request_impl(api_subject, payload, {}, timeout);
+
+        if (req_status.failed()) {
+            co_return std::pair<std::vector<std::string>, status>{{}, req_status};
+        }
+
+        // Parse response
+        std::vector<std::string> keys;
+        try {
+            std::string response_str(response.payload.begin(), response.payload.end());
+            auto j = json::parse(response_str);
+
+            // Check for error
+            if (j.contains("error")) {
+                std::string err_msg = "stream info failed";
+                if (j["error"].contains("description")) {
+                    err_msg = j["error"]["description"].get<std::string>();
+                }
+                co_return std::pair<std::vector<std::string>, status>{{}, status(err_msg)};
+            }
+
+            // Extract keys from state.subjects map
+            // Format: { "state": { "subjects": { "$KV.bucket.key1": 1, "$KV.bucket.key2": 1, ... } } }
+            if (j.contains("state") && j["state"].contains("subjects")) {
+                std::string prefix = fmt::format("$KV.{}.", bucket);
+                for (auto& [subject, count] : j["state"]["subjects"].items()) {
+                    // Strip the $KV.bucket. prefix to get the key name
+                    if (subject.size() > prefix.size() && subject.substr(0, prefix.size()) == prefix) {
+                        keys.push_back(subject.substr(prefix.size()));
+                    }
+                }
+            }
+
+        } catch (const json::exception& e) {
+            co_return std::pair<std::vector<std::string>, status>{{}, status(fmt::format("failed to parse response: {}", e.what()))};
+        }
+
+        co_return std::pair<std::vector<std::string>, status>{std::move(keys), status()};
+    }
+
+    // KV history implementation - get all revisions of a key
+    asio::awaitable<std::pair<std::vector<kv_entry>, status>> kv_history_impl(
+        string_view bucket, string_view key, std::chrono::milliseconds timeout) {
+
+        // Validate bucket and key
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<std::vector<kv_entry>, status>{{}, status(err)};
+        }
+        if (auto err = validate_kv_key(key); !err.empty()) {
+            co_return std::pair<std::vector<kv_entry>, status>{{}, status(err)};
+        }
+
+        if (!m_is_connected) {
+            co_return std::pair<std::vector<kv_entry>, status>{{}, status("not connected")};
+        }
+
+        using nlohmann::json;
+
+        // Stream name for KV bucket: KV_{bucket}
+        std::string stream_name = fmt::format("KV_{}", bucket);
+        std::string kv_subject = fmt::format("$KV.{}.{}", bucket, key);
+
+        // Use direct get API: $JS.API.DIRECT.GET.{stream}
+        std::string api_subject = fmt::format("$JS.API.DIRECT.GET.{}", stream_name);
+
+        std::vector<kv_entry> history;
+        uint64_t last_seq = 0;
+
+        // Iterate through all messages for this subject
+        while (true) {
+            json req;
+            if (last_seq == 0) {
+                // Get first message by subject
+                req["next_by_subj"] = kv_subject;
+            } else {
+                // Get next message after last_seq
+                req["seq"] = last_seq + 1;
+                req["next_by_subj"] = kv_subject;
+            }
+
+            auto payload_str = req.dump();
+            std::span<const char> payload(payload_str.data(), payload_str.size());
+
+            auto [response, req_status] = co_await request_impl(api_subject, payload, {}, timeout);
+
+            if (req_status.failed()) {
+                // Check if it's "no message found" - that means we've reached the end
+                if (req_status.error().find("no message") != std::string::npos) {
+                    break;
+                }
+                co_return std::pair<std::vector<kv_entry>, status>{{}, req_status};
+            }
+
+            // Check for error in response headers (404 means no more messages)
+            bool is_error = false;
+            for (const auto& [hdr_key, hdr_val] : response.headers) {
+                if (hdr_key == "Status" && hdr_val.find("404") != std::string::npos) {
+                    is_error = true;
+                    break;
+                }
+            }
+            if (is_error) {
+                break;  // No more messages
+            }
+
+            // Parse the response as a KV entry
+            kv_entry entry;
+            entry.bucket = std::string(bucket);
+            entry.key = std::string(key);
+            entry.value.assign(response.payload.begin(), response.payload.end());
+            entry.op = kv_entry::operation::put;
+
+            // Parse metadata from headers
+            for (const auto& [hdr_key, hdr_val] : response.headers) {
+                if (hdr_key == "Nats-Sequence") {
+                    entry.revision = std::stoull(hdr_val);
+                    last_seq = entry.revision;
+                } else if (hdr_key == "Nats-Time-Stamp") {
+                    std::tm tm = {};
+                    std::istringstream ss(hdr_val);
+                    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+                    entry.created = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+                } else if (hdr_key == "KV-Operation") {
+                    if (hdr_val == "DEL") {
+                        entry.op = kv_entry::operation::del;
+                    } else if (hdr_val == "PURGE") {
+                        entry.op = kv_entry::operation::purge;
+                    }
+                }
+            }
+
+            history.push_back(std::move(entry));
+
+            // Safety check to avoid infinite loop
+            if (history.size() > 10000) {
+                break;
+            }
+        }
+
+        co_return std::pair<std::vector<kv_entry>, status>{std::move(history), status()};
+    }
+
+    // KV revert implementation - restore key to a previous revision
+    asio::awaitable<std::pair<uint64_t, status>> kv_revert_impl(
+        string_view bucket, string_view key, uint64_t revision,
+        std::chrono::milliseconds timeout) {
+
+        // Validate bucket and key
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+        if (auto err = validate_kv_key(key); !err.empty()) {
+            co_return std::pair<uint64_t, status>{0, status(err)};
+        }
+
+        if (revision == 0) {
+            co_return std::pair<uint64_t, status>{0, status("revision must be > 0")};
+        }
+
+        if (!m_is_connected) {
+            co_return std::pair<uint64_t, status>{0, status("not connected")};
+        }
+
+        using nlohmann::json;
+
+        // Stream name for KV bucket: KV_{bucket}
+        std::string stream_name = fmt::format("KV_{}", bucket);
+
+        // Use direct get API to fetch the value at the specific revision
+        std::string api_subject = fmt::format("$JS.API.DIRECT.GET.{}", stream_name);
+
+        // Request the message at the specific sequence number
+        json req;
+        req["seq"] = revision;
+
+        auto payload_str = req.dump();
+        std::span<const char> payload(payload_str.data(), payload_str.size());
+
+        auto [response, req_status] = co_await request_impl(api_subject, payload, {}, timeout);
+
+        if (req_status.failed()) {
+            co_return std::pair<uint64_t, status>{0, status(fmt::format("failed to get revision {}: {}", revision, req_status.error()))};
+        }
+
+        // Check for error in response headers (404 means revision not found)
+        for (const auto& [hdr_key, hdr_val] : response.headers) {
+            if (hdr_key == "Status" && hdr_val.find("404") != std::string::npos) {
+                co_return std::pair<uint64_t, status>{0, status(fmt::format("revision {} not found", revision))};
+            }
+        }
+
+        // Verify this message is for the correct key by checking subject
+        std::string expected_subject = fmt::format("$KV.{}.{}", bucket, key);
+        if (response.subject != expected_subject) {
+            co_return std::pair<uint64_t, status>{0, status(fmt::format("revision {} is not for key '{}'", revision, key))};
+        }
+
+        // Check if the revision was a delete/purge operation
+        for (const auto& [hdr_key, hdr_val] : response.headers) {
+            if (hdr_key == "KV-Operation") {
+                if (hdr_val == "DEL" || hdr_val == "PURGE") {
+                    co_return std::pair<uint64_t, status>{0, status(fmt::format("revision {} is a {} marker, cannot revert to it", revision, hdr_val))};
+                }
+            }
+        }
+
+        // Now put the value back as a new revision
+        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+        std::span<const char> value_span(response.payload.data(), response.payload.size());
+
+        auto [ack, pub_status] = co_await js_publish_impl(subject, value_span, {}, timeout);
+
+        if (pub_status.failed()) {
+            co_return std::pair<uint64_t, status>{0, pub_status};
+        }
+
+        co_return std::pair<uint64_t, status>{ack.sequence, status()};
+    }
+
     // KV watch implementation
     asio::awaitable<std::pair<ikv_watcher_sptr, status>> kv_watch_impl(
         string_view bucket, on_kv_entry_cb cb, string_view key) {
+
+        // Validate bucket
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<ikv_watcher_sptr, status>{nullptr, status(err)};
+        }
+        // Validate key if provided (empty key means watch all)
+        if (!key.empty()) {
+            if (auto err = validate_kv_key(key); !err.empty()) {
+                co_return std::pair<ikv_watcher_sptr, status>{nullptr, status(err)};
+            }
+        }
 
         if (!m_is_connected) {
             co_return std::pair<ikv_watcher_sptr, status>{nullptr, status("not connected")};

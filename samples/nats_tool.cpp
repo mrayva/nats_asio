@@ -21,8 +21,14 @@ const std::string js_grub_mode("js_grub");
 const std::string js_fetch_mode("js_fetch");
 const std::string pubkv_mode("pubkv");
 const std::string kvwatch_mode("kvwatch");
+const std::string kvcreate_mode("kvcreate");
+const std::string kvupdate_mode("kvupdate");
+const std::string kvkeys_mode("kvkeys");
+const std::string kvhistory_mode("kvhistory");
+const std::string kvpurge_mode("kvpurge");
+const std::string kvrevert_mode("kvrevert");
 
-enum class mode { grubber, generator, publisher, js_grubber, js_fetcher, kv_publisher, kv_watcher };
+enum class mode { grubber, generator, publisher, js_grubber, js_fetcher, kv_publisher, kv_watcher, kv_creator, kv_updater, kv_keys_lister, kv_history_viewer, kv_purger, kv_reverter };
 
 class worker {
 public:
@@ -579,8 +585,10 @@ int main(int argc, char* argv[]) {
         ("batch", "Batch size for js_fetch mode (default: 10)", cxxopts::value<int>())
         ("fetch_interval", "Interval between fetches in ms (default: 100)", cxxopts::value<int>())
         ("auto_ack", "Auto-acknowledge messages (js_grub mode)", cxxopts::value<bool>())
-        ("bucket", "KV bucket name (pubkv/kvwatch mode)", cxxopts::value<std::string>())
-        ("key", "KV key filter for kvwatch mode (optional, watches all keys if not specified)", cxxopts::value<std::string>())
+        ("bucket", "KV bucket name (pubkv/kvwatch/kvcreate/kvupdate mode)", cxxopts::value<std::string>())
+        ("key", "KV key (required for kvcreate/kvupdate, optional filter for kvwatch)", cxxopts::value<std::string>())
+        ("value", "KV value for kvcreate/kvupdate mode", cxxopts::value<std::string>())
+        ("revision", "Expected revision for kvupdate mode", cxxopts::value<uint64_t>())
         ("separator", "Key-value separator for pubkv mode (default: |)", cxxopts::value<std::string>())
         ("kv_timeout", "KV operation timeout in ms (default: 5000)", cxxopts::value<int>())
         ("print", "print messages to stdout", cxxopts::value<bool>(print_to_stdout))
@@ -628,9 +636,10 @@ int main(int argc, char* argv[]) {
 
         if (mode != grub_mode && mode != gen_mode && mode != pub_mode &&
             mode != js_grub_mode && mode != js_fetch_mode && mode != pubkv_mode &&
-            mode != kvwatch_mode) {
-            console->error("Invalid mode. Could be `{}`, `{}`, `{}`, `{}`, `{}`, `{}`, or `{}`",
-                          grub_mode, gen_mode, pub_mode, js_grub_mode, js_fetch_mode, pubkv_mode, kvwatch_mode);
+            mode != kvwatch_mode && mode != kvcreate_mode && mode != kvupdate_mode &&
+            mode != kvkeys_mode && mode != kvhistory_mode && mode != kvpurge_mode &&
+            mode != kvrevert_mode) {
+            console->error("Invalid mode. Use --help to see available modes");
             return 1;
         }
 
@@ -655,6 +664,24 @@ int main(int argc, char* argv[]) {
             publish_interval = -1;
         } else if (mode == kvwatch_mode) {
             m = mode::kv_watcher;
+            publish_interval = -1;
+        } else if (mode == kvcreate_mode) {
+            m = mode::kv_creator;
+            publish_interval = -1;
+        } else if (mode == kvupdate_mode) {
+            m = mode::kv_updater;
+            publish_interval = -1;
+        } else if (mode == kvkeys_mode) {
+            m = mode::kv_keys_lister;
+            publish_interval = -1;
+        } else if (mode == kvhistory_mode) {
+            m = mode::kv_history_viewer;
+            publish_interval = -1;
+        } else if (mode == kvpurge_mode) {
+            m = mode::kv_purger;
+            publish_interval = -1;
+        } else if (mode == kvrevert_mode) {
+            m = mode::kv_reverter;
             publish_interval = -1;
         } else {
             if (publish_interval < 0) {
@@ -697,10 +724,14 @@ int main(int argc, char* argv[]) {
         // Validate KV mode requirements
         std::string kv_bucket;
         std::string kv_key;
+        std::string kv_value;
+        uint64_t kv_revision = 0;
         std::string kv_separator = "|";
         int kv_timeout_ms = 5000;
 
-        if (m == mode::kv_publisher || m == mode::kv_watcher) {
+        if (m == mode::kv_publisher || m == mode::kv_watcher ||
+            m == mode::kv_creator || m == mode::kv_updater || m == mode::kv_keys_lister ||
+            m == mode::kv_history_viewer || m == mode::kv_purger || m == mode::kv_reverter) {
             if (!result.count("bucket")) {
                 console->error("{} mode requires --bucket", mode);
                 return 1;
@@ -715,6 +746,48 @@ int main(int argc, char* argv[]) {
             }
             if (result.count("key")) {
                 kv_key = result["key"].as<std::string>();
+            }
+            if (result.count("value")) {
+                kv_value = result["value"].as<std::string>();
+            }
+            if (result.count("revision")) {
+                kv_revision = result["revision"].as<uint64_t>();
+            }
+
+            // kvcreate and kvupdate require key and value
+            if (m == mode::kv_creator || m == mode::kv_updater) {
+                if (kv_key.empty()) {
+                    console->error("{} mode requires --key", mode);
+                    return 1;
+                }
+                if (kv_value.empty()) {
+                    console->error("{} mode requires --value", mode);
+                    return 1;
+                }
+            }
+
+            // kvhistory, kvpurge, and kvrevert require key
+            if (m == mode::kv_history_viewer || m == mode::kv_purger || m == mode::kv_reverter) {
+                if (kv_key.empty()) {
+                    console->error("{} mode requires --key", mode);
+                    return 1;
+                }
+            }
+
+            // kvrevert requires revision
+            if (m == mode::kv_reverter) {
+                if (kv_revision == 0) {
+                    console->error("kvrevert mode requires --revision > 0");
+                    return 1;
+                }
+            }
+
+            // kvupdate requires revision
+            if (m == mode::kv_updater) {
+                if (kv_revision == 0) {
+                    console->error("kvupdate mode requires --revision > 0");
+                    return 1;
+                }
             }
         }
 
@@ -799,6 +872,95 @@ int main(int argc, char* argv[]) {
                                 console->info("Watching KV bucket: {} key: {}", kv_bucket, kv_key);
                             }
                         }
+                    } else if (m == mode::kv_creator) {
+                        // Create key (only if doesn't exist)
+                        std::span<const char> value_span(kv_value.data(), kv_value.size());
+                        auto [rev, s] = co_await conn->kv_create(
+                            kv_bucket, kv_key, value_span,
+                            std::chrono::milliseconds(kv_timeout_ms));
+
+                        if (s.failed()) {
+                            console->error("kv_create failed: {}", s.error());
+                        } else {
+                            console->info("Created {}/{} revision={}", kv_bucket, kv_key, rev);
+                        }
+                        ioc.stop();
+                    } else if (m == mode::kv_updater) {
+                        // Update key (only if revision matches)
+                        std::span<const char> value_span(kv_value.data(), kv_value.size());
+                        auto [rev, s] = co_await conn->kv_update(
+                            kv_bucket, kv_key, value_span, kv_revision,
+                            std::chrono::milliseconds(kv_timeout_ms));
+
+                        if (s.failed()) {
+                            console->error("kv_update failed: {}", s.error());
+                        } else {
+                            console->info("Updated {}/{} revision={} (was {})", kv_bucket, kv_key, rev, kv_revision);
+                        }
+                        ioc.stop();
+                    } else if (m == mode::kv_keys_lister) {
+                        // List all keys in bucket
+                        auto [keys, s] = co_await conn->kv_keys(
+                            kv_bucket, std::chrono::milliseconds(kv_timeout_ms));
+
+                        if (s.failed()) {
+                            console->error("kv_keys failed: {}", s.error());
+                        } else {
+                            console->info("Keys in bucket '{}' ({} keys):", kv_bucket, keys.size());
+                            for (const auto& key : keys) {
+                                std::cout << key << std::endl;
+                            }
+                        }
+                        ioc.stop();
+                    } else if (m == mode::kv_history_viewer) {
+                        // Show full history for a key
+                        auto [history, s] = co_await conn->kv_history(
+                            kv_bucket, kv_key, std::chrono::milliseconds(kv_timeout_ms));
+
+                        if (s.failed()) {
+                            console->error("kv_history failed: {}", s.error());
+                        } else {
+                            console->info("History for {}/{} ({} revisions):", kv_bucket, kv_key, history.size());
+                            for (const auto& entry : history) {
+                                std::string op_str;
+                                switch (entry.op) {
+                                    case nats_asio::kv_entry::operation::put: op_str = "PUT"; break;
+                                    case nats_asio::kv_entry::operation::del: op_str = "DEL"; break;
+                                    case nats_asio::kv_entry::operation::purge: op_str = "PURGE"; break;
+                                }
+                                std::cout << "rev=" << entry.revision << " [" << op_str << "]";
+                                if (entry.op == nats_asio::kv_entry::operation::put && !entry.value.empty()) {
+                                    std::cout << " value=";
+                                    std::cout.write(entry.value.data(), entry.value.size());
+                                }
+                                std::cout << std::endl;
+                            }
+                        }
+                        ioc.stop();
+                    } else if (m == mode::kv_purger) {
+                        // Purge key (delete and clear history)
+                        auto [rev, s] = co_await conn->kv_purge(
+                            kv_bucket, kv_key, std::chrono::milliseconds(kv_timeout_ms));
+
+                        if (s.failed()) {
+                            console->error("kv_purge failed: {}", s.error());
+                        } else {
+                            console->info("Purged {}/{} revision={}", kv_bucket, kv_key, rev);
+                        }
+                        ioc.stop();
+                    } else if (m == mode::kv_reverter) {
+                        // Revert key to a previous revision
+                        auto [rev, s] = co_await conn->kv_revert(
+                            kv_bucket, kv_key, kv_revision,
+                            std::chrono::milliseconds(kv_timeout_ms));
+
+                        if (s.failed()) {
+                            console->error("kv_revert failed: {}", s.error());
+                        } else {
+                            console->info("Reverted {}/{} to revision {} -> new revision={}",
+                                         kv_bucket, kv_key, kv_revision, rev);
+                        }
+                        ioc.stop();
                     }
                     co_return;
                 },
