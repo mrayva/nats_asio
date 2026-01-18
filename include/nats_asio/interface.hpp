@@ -122,6 +122,16 @@ struct js_consumer_info {
     uint64_t delivered_consumer_seq = 0;
 };
 
+// Key/Value entry returned from get operations
+struct kv_entry {
+    std::string bucket;                                // bucket name
+    std::string key;                                   // key name
+    std::vector<char> value;                           // value data
+    uint64_t revision = 0;                             // revision number (sequence)
+    std::chrono::system_clock::time_point created;     // creation timestamp
+    enum class operation { put, del, purge } op = operation::put;
+};
+
 // Status class for error handling - must be defined before ijs_subscription
 class status {
 public:
@@ -282,6 +292,23 @@ struct iconnection {
     // Delete a consumer
     [[nodiscard]] virtual asio::awaitable<status>
     js_delete_consumer(string_view stream, string_view consumer) = 0;
+
+    // Key/Value store operations
+
+    // Put a value into KV bucket (returns revision number)
+    [[nodiscard]] virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_put(string_view bucket, string_view key, std::span<const char> value,
+           std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Get a value from KV bucket
+    [[nodiscard]] virtual asio::awaitable<std::pair<kv_entry, status>>
+    kv_get(string_view bucket, string_view key,
+           std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Delete a key from KV bucket (returns revision number of delete marker)
+    [[nodiscard]] virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_delete(string_view bucket, string_view key,
+              std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
 
     [[nodiscard]] virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) = 0;
 

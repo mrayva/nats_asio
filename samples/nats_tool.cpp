@@ -19,8 +19,9 @@ const std::string gen_mode("gen");
 const std::string pub_mode("pub");
 const std::string js_grub_mode("js_grub");
 const std::string js_fetch_mode("js_fetch");
+const std::string pubkv_mode("pubkv");
 
-enum class mode { grubber, generator, publisher, js_grubber, js_fetcher };
+enum class mode { grubber, generator, publisher, js_grubber, js_fetcher, kv_publisher };
 
 class worker {
 public:
@@ -223,6 +224,139 @@ private:
     int m_fetch_interval_ms;
 };
 
+// KV publisher - reads key|value pairs from stdin and publishes to KV bucket
+class kv_publisher : public worker {
+public:
+    kv_publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
+                 nats_asio::iconnection_sptr conn, const std::string& bucket,
+                 int stats_interval, int max_in_flight, const std::string& separator,
+                 int kv_timeout_ms)
+        : worker(ioc, console, stats_interval), m_conn(std::move(conn)),
+          m_bucket(bucket), m_in_flight(0), m_max_in_flight(max_in_flight),
+          m_separator(separator), m_kv_timeout(std::chrono::milliseconds(kv_timeout_ms)),
+          m_stdin(ioc, ::dup(STDIN_FILENO)) {
+        asio::co_spawn(ioc, read_and_publish(), asio::detached);
+    }
+
+    asio::awaitable<void> read_and_publish() {
+        asio::streambuf buf;
+
+        for (;;) {
+            // Async read line from stdin
+            auto [ec, bytes_read] = co_await asio::async_read_until(
+                m_stdin, buf, '\n', asio::as_tuple(asio::use_awaitable));
+
+            if (ec) {
+                if (ec == asio::error::eof || ec == asio::error::not_found) {
+                    break;  // EOF or no more data
+                }
+                m_log->error("stdin read error: {}", ec.message());
+                break;
+            }
+
+            // Extract line from buffer (without newline)
+            std::string line;
+            std::istream is(&buf);
+            std::getline(is, line);
+
+            // Skip empty lines
+            if (line.empty()) {
+                continue;
+            }
+
+            // Parse key|value - find first separator
+            auto sep_pos = line.find(m_separator);
+            if (sep_pos == std::string::npos) {
+                m_log->error("invalid line format, missing separator '{}': {}", m_separator, line);
+                continue;
+            }
+
+            std::string key = line.substr(0, sep_pos);
+            std::string value_part = line.substr(sep_pos + m_separator.size());
+
+            if (key.empty()) {
+                m_log->error("empty key in line: {}", line);
+                continue;
+            }
+
+            // Check if this is a delete operation (value starts with separator)
+            bool is_delete = false;
+            if (value_part.size() >= m_separator.size() &&
+                value_part.substr(0, m_separator.size()) == m_separator) {
+                is_delete = true;
+            }
+
+            // Wait until connection is ready
+            while (!m_conn->is_connected()) {
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(100));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+
+            // Backpressure: wait if too many operations in flight
+            while (m_in_flight >= m_max_in_flight) {
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(5));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+
+            m_in_flight++;
+
+            // Capture data for async operation
+            auto key_copy = std::make_shared<std::string>(std::move(key));
+            auto value_copy = std::make_shared<std::string>(std::move(value_part));
+
+            // Fire-and-forget: dispatch KV operation without waiting
+            asio::co_spawn(
+                m_ioc,
+                [this, key_copy, value_copy, is_delete]() -> asio::awaitable<void> {
+                    if (is_delete) {
+                        auto [rev, s] = co_await m_conn->kv_delete(m_bucket, *key_copy, m_kv_timeout);
+                        if (s.failed()) {
+                            m_log->error("kv_delete failed for key '{}': {}", *key_copy, s.error());
+                        } else {
+                            m_counter++;
+                            m_log->debug("deleted key '{}' rev={}", *key_copy, rev);
+                        }
+                    } else {
+                        std::span<const char> value_span(value_copy->data(), value_copy->size());
+                        auto [rev, s] = co_await m_conn->kv_put(m_bucket, *key_copy, value_span, m_kv_timeout);
+                        if (s.failed()) {
+                            m_log->error("kv_put failed for key '{}': {}", *key_copy, s.error());
+                        } else {
+                            m_counter++;
+                            m_log->debug("put key '{}' rev={}", *key_copy, rev);
+                        }
+                    }
+                    m_in_flight--;
+                    co_return;
+                },
+                asio::detached);
+        }
+
+        // Wait for all in-flight operations to complete
+        m_log->info("EOF reached, waiting for {} in-flight KV operations", m_in_flight.load());
+        while (m_in_flight > 0) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(50));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        m_log->info("All KV operations complete, stopping");
+        m_ioc.stop();
+        co_return;
+    }
+
+private:
+    nats_asio::iconnection_sptr m_conn;
+    std::string m_bucket;
+    std::atomic<int> m_in_flight;
+    int m_max_in_flight;
+    std::string m_separator;
+    std::chrono::milliseconds m_kv_timeout;
+    asio::posix::stream_descriptor m_stdin;
+};
+
 class publisher : public worker {
 public:
     publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
@@ -411,6 +545,9 @@ int main(int argc, char* argv[]) {
         ("batch", "Batch size for js_fetch mode (default: 10)", cxxopts::value<int>())
         ("fetch_interval", "Interval between fetches in ms (default: 100)", cxxopts::value<int>())
         ("auto_ack", "Auto-acknowledge messages (js_grub mode)", cxxopts::value<bool>())
+        ("bucket", "KV bucket name (pubkv mode)", cxxopts::value<std::string>())
+        ("separator", "Key-value separator for pubkv mode (default: |)", cxxopts::value<std::string>())
+        ("kv_timeout", "KV operation timeout in ms (default: 5000)", cxxopts::value<int>())
         ("print", "print messages to stdout", cxxopts::value<bool>(print_to_stdout))
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
@@ -447,16 +584,17 @@ int main(int argc, char* argv[]) {
             opt_ssl_conf = std::nullopt;
         }
 
-        if (topic.empty()) {
+        mode = result["mode"].as<std::string>();
+
+        // Only require topic for modes that need it
+        if (topic.empty() && result.count("topic")) {
             topic = result["topic"].as<std::string>();
         }
 
-        mode = result["mode"].as<std::string>();
-
         if (mode != grub_mode && mode != gen_mode && mode != pub_mode &&
-            mode != js_grub_mode && mode != js_fetch_mode) {
-            console->error("Invalid mode. Could be `{}`, `{}`, `{}`, `{}`, or `{}`",
-                          grub_mode, gen_mode, pub_mode, js_grub_mode, js_fetch_mode);
+            mode != js_grub_mode && mode != js_fetch_mode && mode != pubkv_mode) {
+            console->error("Invalid mode. Could be `{}`, `{}`, `{}`, `{}`, `{}`, or `{}`",
+                          grub_mode, gen_mode, pub_mode, js_grub_mode, js_fetch_mode, pubkv_mode);
             return 1;
         }
 
@@ -475,6 +613,9 @@ int main(int argc, char* argv[]) {
             publish_interval = -1;
         } else if (mode == js_fetch_mode) {
             m = mode::js_fetcher;
+            publish_interval = -1;
+        } else if (mode == pubkv_mode) {
+            m = mode::kv_publisher;
             publish_interval = -1;
         } else {
             if (publish_interval < 0) {
@@ -514,12 +655,33 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Validate KV mode requirements
+        std::string kv_bucket;
+        std::string kv_separator = "|";
+        int kv_timeout_ms = 5000;
+
+        if (m == mode::kv_publisher) {
+            if (!result.count("bucket")) {
+                console->error("pubkv mode requires --bucket");
+                return 1;
+            }
+            kv_bucket = result["bucket"].as<std::string>();
+
+            if (result.count("separator")) {
+                kv_separator = result["separator"].as<std::string>();
+            }
+            if (result.count("kv_timeout")) {
+                kv_timeout_ms = result["kv_timeout"].as<int>();
+            }
+        }
+
         asio::io_context ioc;
         std::shared_ptr<grubber> grub_ptr;
         std::shared_ptr<generator> gen_ptr;
         std::shared_ptr<publisher> pub_ptr;
         std::shared_ptr<js_grubber> js_grub_ptr;
         std::shared_ptr<js_fetcher> js_fetch_ptr;
+        std::shared_ptr<kv_publisher> kv_pub_ptr;
         nats_asio::iconnection_sptr conn;
         std::vector<nats_asio::iconnection_sptr> pub_connections;
 
@@ -618,6 +780,10 @@ int main(int argc, char* argv[]) {
                 js_fetch_ptr = std::make_shared<js_fetcher>(ioc, console, conn, js_stream,
                                                             js_consumer, stats_interval, print_to_stdout,
                                                             batch_size, fetch_interval_ms);
+            } else if (m == mode::kv_publisher) {
+                kv_pub_ptr = std::make_shared<kv_publisher>(ioc, console, conn, kv_bucket,
+                                                            stats_interval, max_in_flight,
+                                                            kv_separator, kv_timeout_ms);
             }
         }
 
