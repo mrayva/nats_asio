@@ -308,6 +308,14 @@ struct iconnection {
         std::chrono::milliseconds timeout = std::chrono::milliseconds(5000),
         bool wait_for_ack = true) = 0;
 
+    // JetStream fire-and-forget publish (no ack, no timeout)
+    [[nodiscard]] virtual asio::awaitable<status> js_publish_async(
+        string_view subject, std::span<const char> payload) = 0;
+
+    // JetStream fire-and-forget publish with headers (no ack, no timeout)
+    [[nodiscard]] virtual asio::awaitable<status> js_publish_async(
+        string_view subject, std::span<const char> payload, const headers_t& headers) = 0;
+
     // JetStream subscribe (push consumer) - creates/binds consumer and subscribes to delivery subject
     [[nodiscard]] virtual asio::awaitable<std::pair<ijs_subscription_sptr, status>>
     js_subscribe(const js_consumer_config& config, on_js_message_cb cb) = 0;

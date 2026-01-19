@@ -1059,6 +1059,18 @@ public:
         co_return co_await js_publish_impl(subject, payload, headers, timeout, wait_for_ack);
     }
 
+    // JetStream fire-and-forget publish (no ack, no timeout)
+    virtual asio::awaitable<status> js_publish_async(
+        string_view subject, std::span<const char> payload) override {
+        co_return co_await publish(subject, payload, std::nullopt);
+    }
+
+    // JetStream fire-and-forget publish with headers (no ack, no timeout)
+    virtual asio::awaitable<status> js_publish_async(
+        string_view subject, std::span<const char> payload, const headers_t& headers) override {
+        co_return co_await publish(subject, payload, headers, std::nullopt);
+    }
+
     // JetStream subscribe (push consumer)
     virtual asio::awaitable<std::pair<ijs_subscription_sptr, status>>
     js_subscribe(const js_consumer_config& config, on_js_message_cb cb) override {

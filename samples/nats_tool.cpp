@@ -24,6 +24,8 @@
 const std::string grub_mode("grub");
 const std::string gen_mode("gen");
 const std::string pub_mode("pub");
+const std::string req_mode("req");
+const std::string reply_mode("reply");
 const std::string js_grub_mode("js_grub");
 const std::string js_fetch_mode("js_fetch");
 const std::string pubkv_mode("pubkv");
@@ -35,7 +37,7 @@ const std::string kvhistory_mode("kvhistory");
 const std::string kvpurge_mode("kvpurge");
 const std::string kvrevert_mode("kvrevert");
 
-enum class mode { grubber, generator, publisher, js_grubber, js_fetcher, kv_publisher, kv_watcher, kv_creator, kv_updater, kv_keys_lister, kv_history_viewer, kv_purger, kv_reverter };
+enum class mode { grubber, generator, publisher, requester, replier, js_grubber, js_fetcher, kv_publisher, kv_watcher, kv_creator, kv_updater, kv_keys_lister, kv_history_viewer, kv_purger, kv_reverter };
 
 class worker {
 public:
@@ -736,6 +738,284 @@ private:
     asio::posix::stream_descriptor m_stdin;
 };
 
+// Requester - sends requests and waits for replies
+class requester : public worker {
+public:
+    requester(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
+              nats_asio::iconnection_sptr conn, const std::string& topic,
+              int stats_interval, int timeout_ms, const std::string& data,
+              output_mode mode)
+        : worker(ioc, console, stats_interval), m_conn(std::move(conn)),
+          m_topic(topic), m_timeout(std::chrono::milliseconds(timeout_ms)),
+          m_data(data), m_output_mode(mode), m_stdin(ioc, ::dup(STDIN_FILENO)) {
+        asio::co_spawn(ioc, run(), asio::detached);
+    }
+
+    asio::awaitable<void> run() {
+        // Wait for connection
+        while (!m_conn->is_connected()) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(100));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        if (!m_data.empty()) {
+            // Single request with provided data
+            co_await send_request(m_data);
+        } else {
+            // Read requests from stdin
+            asio::streambuf buf;
+            for (;;) {
+                auto [ec, bytes_read] = co_await asio::async_read_until(
+                    m_stdin, buf, '\n', asio::as_tuple(asio::use_awaitable));
+
+                if (ec) {
+                    if (ec == asio::error::eof || ec == asio::error::not_found) {
+                        break;
+                    }
+                    m_log->error("stdin read error: {}", ec.message());
+                    break;
+                }
+
+                std::string line;
+                std::istream is(&buf);
+                std::getline(is, line);
+
+                if (!line.empty()) {
+                    co_await send_request(line);
+                }
+            }
+        }
+
+        m_log->info("Requester finished, {} requests sent", m_counter);
+        m_ioc.stop();
+        co_return;
+    }
+
+private:
+    asio::awaitable<void> send_request(const std::string& payload) {
+        std::span<const char> payload_span(payload.data(), payload.size());
+        auto [reply, status] = co_await m_conn->request(m_topic, payload_span, m_timeout);
+
+        if (status.failed()) {
+            m_log->error("request failed: {}", status.error());
+            co_return;
+        }
+
+        m_counter++;
+
+        switch (m_output_mode) {
+            case output_mode::raw:
+                std::cout.write(reply.payload.data(), reply.payload.size());
+                std::cout << std::endl;
+                break;
+            case output_mode::json: {
+                nlohmann::json j;
+                j["subject"] = reply.subject;
+                if (reply.reply_to) j["reply_to"] = *reply.reply_to;
+                j["payload"] = std::string(reply.payload.begin(), reply.payload.end());
+                std::cout << j.dump() << std::endl;
+                break;
+            }
+            case output_mode::normal:
+            default:
+                std::cout << "[" << reply.subject << "] ";
+                std::cout.write(reply.payload.data(), reply.payload.size());
+                std::cout << std::endl;
+                break;
+        }
+
+        co_return;
+    }
+
+    nats_asio::iconnection_sptr m_conn;
+    std::string m_topic;
+    std::chrono::milliseconds m_timeout;
+    std::string m_data;
+    output_mode m_output_mode;
+    asio::posix::stream_descriptor m_stdin;
+};
+
+// Replier - subscribes and replies to requests
+class replier : public worker {
+public:
+    replier(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
+            nats_asio::iconnection_sptr conn, const std::string& topic,
+            int stats_interval, const std::string& data, bool echo_mode,
+            const std::string& translate_cmd, const std::string& queue_group,
+            output_mode mode)
+        : worker(ioc, console, stats_interval), m_conn(std::move(conn)),
+          m_topic(topic), m_data(data), m_echo_mode(echo_mode),
+          m_translate_cmd(translate_cmd), m_queue_group(queue_group),
+          m_output_mode(mode) {}
+
+    asio::awaitable<void> start() {
+        // Wait for connection
+        while (!m_conn->is_connected()) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(100));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        nats_asio::subscribe_options sub_opts;
+        if (!m_queue_group.empty()) {
+            sub_opts.queue_group = m_queue_group;
+        }
+
+        auto [sub, status] = co_await m_conn->subscribe(
+            m_topic,
+            [this](const nats_asio::message& msg) -> asio::awaitable<void> {
+                co_await handle_message(msg);
+            },
+            sub_opts);
+
+        if (status.failed()) {
+            m_log->error("subscribe failed: {}", status.error());
+            m_ioc.stop();
+            co_return;
+        }
+
+        m_log->info("Replier listening on '{}'{}", m_topic,
+                   m_queue_group.empty() ? "" : " (queue: " + m_queue_group + ")");
+        co_return;
+    }
+
+private:
+    asio::awaitable<void> handle_message(const nats_asio::message& msg) {
+        m_counter++;
+
+        // Print received message based on output mode
+        switch (m_output_mode) {
+            case output_mode::raw:
+                std::cout.write(msg.payload.data(), msg.payload.size());
+                std::cout << std::endl;
+                break;
+            case output_mode::json: {
+                nlohmann::json j;
+                j["subject"] = msg.subject;
+                if (msg.reply_to) j["reply_to"] = *msg.reply_to;
+                j["payload"] = std::string(msg.payload.begin(), msg.payload.end());
+                std::cout << j.dump() << std::endl;
+                break;
+            }
+            case output_mode::normal:
+                std::cout << "[" << msg.subject << "] ";
+                std::cout.write(msg.payload.data(), msg.payload.size());
+                std::cout << std::endl;
+                break;
+            case output_mode::none:
+                break;
+        }
+
+        // Only reply if there's a reply_to subject
+        if (!msg.reply_to || msg.reply_to->empty()) {
+            co_return;
+        }
+
+        std::string reply_payload;
+
+        if (m_echo_mode) {
+            // Echo mode - reply with received payload
+            reply_payload = std::string(msg.payload.begin(), msg.payload.end());
+        } else if (!m_translate_cmd.empty()) {
+            // Transform through external command
+            std::string cmd = m_translate_cmd;
+            // Replace {{Subject}} placeholder if present
+            std::string subject_placeholder = "{{Subject}}";
+            size_t pos = cmd.find(subject_placeholder);
+            if (pos != std::string::npos) {
+                cmd.replace(pos, subject_placeholder.length(), msg.subject);
+            }
+
+            reply_payload = run_translate_command(cmd, msg.payload);
+            if (reply_payload.empty()) {
+                m_log->warn("translate command returned empty output");
+            }
+        } else if (!m_data.empty()) {
+            // Fixed reply data
+            reply_payload = m_data;
+        } else {
+            // Default empty reply
+            reply_payload = "";
+        }
+
+        std::span<const char> reply_span(reply_payload.data(), reply_payload.size());
+        auto status = co_await m_conn->publish(*msg.reply_to, reply_span, std::nullopt);
+
+        if (status.failed()) {
+            m_log->error("reply failed: {}", status.error());
+        }
+
+        co_return;
+    }
+
+    std::string run_translate_command(const std::string& cmd, std::span<const char> input) {
+        int pipe_in[2], pipe_out[2];
+        if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) {
+            m_log->error("pipe creation failed");
+            return "";
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            m_log->error("fork failed");
+            close(pipe_in[0]); close(pipe_in[1]);
+            close(pipe_out[0]); close(pipe_out[1]);
+            return "";
+        }
+
+        if (pid == 0) {
+            // Child process
+            close(pipe_in[1]);
+            close(pipe_out[0]);
+            dup2(pipe_in[0], STDIN_FILENO);
+            dup2(pipe_out[1], STDOUT_FILENO);
+            close(pipe_in[0]);
+            close(pipe_out[1]);
+            execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
+            _exit(1);
+        }
+
+        // Parent process
+        close(pipe_in[0]);
+        close(pipe_out[1]);
+
+        // Write input to child
+        if (!input.empty()) {
+            ::write(pipe_in[1], input.data(), input.size());
+        }
+        close(pipe_in[1]);
+
+        // Read output from child
+        std::string result;
+        char buf[4096];
+        ssize_t n;
+        while ((n = ::read(pipe_out[0], buf, sizeof(buf))) > 0) {
+            result.append(buf, n);
+        }
+        close(pipe_out[0]);
+
+        // Wait for child
+        int status;
+        waitpid(pid, &status, 0);
+
+        // Trim trailing newline
+        while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
+            result.pop_back();
+        }
+
+        return result;
+    }
+
+    nats_asio::iconnection_sptr m_conn;
+    std::string m_topic;
+    std::string m_data;
+    bool m_echo_mode;
+    std::string m_translate_cmd;
+    std::string m_queue_group;
+    output_mode m_output_mode;
+};
+
 // Thread-safe batch queue
 struct batch_item {
     std::string data;
@@ -1154,6 +1434,9 @@ int main(int argc, char* argv[]) {
         ("dump", "Dump messages to file (grub/js_grub mode)", cxxopts::value<std::string>())
         ("json", "Output messages as JSON (grub/js_grub mode)")
         ("translate", "Transform payload through external command (supports {{Subject}})", cxxopts::value<std::string>())
+        ("data", "Payload data for req/reply mode (if not provided, reads from stdin)", cxxopts::value<std::string>())
+        ("timeout", "Request timeout in ms for req mode (default: 5000)", cxxopts::value<int>())
+        ("echo", "Echo mode for reply - reply with received payload")
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
         ("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
@@ -1215,6 +1498,12 @@ int main(int argc, char* argv[]) {
             if (num_connections < 1) {
                 num_connections = 1;
             }
+        } else if (mode == req_mode) {
+            m = mode::requester;
+            publish_interval = -1;
+        } else if (mode == reply_mode) {
+            m = mode::replier;
+            publish_interval = -1;
         } else if (mode == js_grub_mode) {
             m = mode::js_grubber;
             publish_interval = -1;
@@ -1392,6 +1681,8 @@ int main(int argc, char* argv[]) {
         std::shared_ptr<grubber> grub_ptr;
         std::shared_ptr<generator> gen_ptr;
         std::shared_ptr<publisher> pub_ptr;
+        std::shared_ptr<requester> req_ptr;
+        std::shared_ptr<replier> reply_ptr;
         std::shared_ptr<batch_publisher> batch_pub_ptr;
         std::shared_ptr<js_grubber> js_grub_ptr;
         std::shared_ptr<js_fetcher> js_fetch_ptr;
@@ -1642,6 +1933,17 @@ int main(int argc, char* argv[]) {
                 kv_pub_ptr = std::make_shared<kv_publisher>(ioc, console, conn, kv_bucket,
                                                             stats_interval, max_in_flight,
                                                             kv_separator, kv_timeout_ms);
+            } else if (m == mode::requester) {
+                int req_timeout = result.count("timeout") ? result["timeout"].as<int>() : 5000;
+                std::string req_data = result.count("data") ? result["data"].as<std::string>() : "";
+                req_ptr = std::make_shared<requester>(ioc, console, conn, topic, stats_interval,
+                                                      req_timeout, req_data, out_mode);
+            } else if (m == mode::replier) {
+                std::string reply_data = result.count("data") ? result["data"].as<std::string>() : "";
+                bool echo_mode = result.count("echo") > 0;
+                reply_ptr = std::make_shared<replier>(ioc, console, conn, topic, stats_interval,
+                                                      reply_data, echo_mode, translate_cmd, queue_group, out_mode);
+                asio::co_spawn(ioc, reply_ptr->start(), asio::detached);
             }
         }
 
