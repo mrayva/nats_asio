@@ -111,47 +111,147 @@ private:
     nats_asio::iconnection_sptr m_conn;
 };
 
+enum class output_mode { none, normal, raw, json };
+
 class grubber : public worker {
 public:
     grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
-            bool print_to_stdout)
-        : worker(ioc, console, stats_interval), m_print_to_stdout(print_to_stdout) {}
+            output_mode mode, const std::string& dump_file = {})
+        : worker(ioc, console, stats_interval), m_output_mode(mode) {
+        if (!dump_file.empty()) {
+            m_dump_file = std::make_unique<std::ofstream>(dump_file, std::ios::binary);
+            if (!m_dump_file->is_open()) {
+                console->error("Failed to open dump file: {}", dump_file);
+                m_dump_file.reset();
+            }
+        }
+    }
 
-    asio::awaitable<void> on_message(nats_asio::string_view,
-                                     nats_asio::optional<nats_asio::string_view>,
+    asio::awaitable<void> on_message(nats_asio::string_view subject,
+                                     nats_asio::optional<nats_asio::string_view> reply_to,
                                      std::span<const char> payload) {
         m_counter++;
 
-        if (m_print_to_stdout) {
-            std::cout.write(payload.data(), payload.size()) << std::endl;
+        std::ostream* out = m_dump_file ? m_dump_file.get() : &std::cout;
+
+        switch (m_output_mode) {
+            case output_mode::raw:
+                out->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                *out << '\n';
+                break;
+            case output_mode::json: {
+                // Escape payload for JSON
+                std::string escaped;
+                escaped.reserve(payload.size());
+                for (char c : payload) {
+                    switch (c) {
+                        case '"': escaped += "\\\""; break;
+                        case '\\': escaped += "\\\\"; break;
+                        case '\n': escaped += "\\n"; break;
+                        case '\r': escaped += "\\r"; break;
+                        case '\t': escaped += "\\t"; break;
+                        default:
+                            if (static_cast<unsigned char>(c) < 32) {
+                                escaped += fmt::format("\\u{:04x}", static_cast<unsigned char>(c));
+                            } else {
+                                escaped += c;
+                            }
+                    }
+                }
+                *out << "{\"subject\":\"" << subject << "\"";
+                if (reply_to) {
+                    *out << ",\"reply_to\":\"" << *reply_to << "\"";
+                }
+                *out << ",\"payload\":\"" << escaped << "\"}\n";
+                break;
+            }
+            case output_mode::normal:
+                *out << "[" << subject << "] ";
+                out->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                *out << '\n';
+                break;
+            case output_mode::none:
+                break;
+        }
+
+        if (m_dump_file) {
+            m_dump_file->flush();
         }
 
         co_return;
     }
 
 private:
-    bool m_print_to_stdout;
+    output_mode m_output_mode;
+    std::unique_ptr<std::ofstream> m_dump_file;
 };
 
 // JetStream subscriber using push consumer
 class js_grubber : public worker {
 public:
     js_grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
-               bool print_to_stdout, bool auto_ack)
-        : worker(ioc, console, stats_interval), m_print_to_stdout(print_to_stdout),
-          m_auto_ack(auto_ack) {}
+               output_mode mode, bool auto_ack, const std::string& dump_file = {})
+        : worker(ioc, console, stats_interval), m_output_mode(mode), m_auto_ack(auto_ack) {
+        if (!dump_file.empty()) {
+            m_dump_file = std::make_unique<std::ofstream>(dump_file, std::ios::binary);
+            if (!m_dump_file->is_open()) {
+                console->error("Failed to open dump file: {}", dump_file);
+                m_dump_file.reset();
+            }
+        }
+    }
 
     asio::awaitable<void> on_js_message(nats_asio::ijs_subscription& sub,
                                          const nats_asio::js_message& msg) {
         m_counter++;
 
-        if (m_print_to_stdout) {
-            std::cout.write(msg.msg.payload.data(), msg.msg.payload.size()) << std::endl;
-            if (!msg.stream.empty()) {
+        std::ostream* out = m_dump_file ? m_dump_file.get() : &std::cout;
+        const auto& payload = msg.msg.payload;
+        const auto& subject = msg.msg.subject;
+
+        switch (m_output_mode) {
+            case output_mode::raw:
+                out->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                *out << '\n';
+                break;
+            case output_mode::json: {
+                std::string escaped;
+                escaped.reserve(payload.size());
+                for (char c : payload) {
+                    switch (c) {
+                        case '"': escaped += "\\\""; break;
+                        case '\\': escaped += "\\\\"; break;
+                        case '\n': escaped += "\\n"; break;
+                        case '\r': escaped += "\\r"; break;
+                        case '\t': escaped += "\\t"; break;
+                        default:
+                            if (static_cast<unsigned char>(c) < 32) {
+                                escaped += fmt::format("\\u{:04x}", static_cast<unsigned char>(c));
+                            } else {
+                                escaped += c;
+                            }
+                    }
+                }
+                *out << "{\"subject\":\"" << subject << "\""
+                     << ",\"stream\":\"" << msg.stream << "\""
+                     << ",\"seq\":" << msg.stream_sequence
+                     << ",\"payload\":\"" << escaped << "\"}\n";
+                break;
+            }
+            case output_mode::normal:
+                *out << "[" << subject << "] ";
+                out->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                *out << '\n';
                 m_log->debug("stream={} consumer={} seq={}/{} delivered={}",
                             msg.stream, msg.consumer, msg.stream_sequence,
                             msg.consumer_sequence, msg.num_delivered);
-            }
+                break;
+            case output_mode::none:
+                break;
+        }
+
+        if (m_dump_file) {
+            m_dump_file->flush();
         }
 
         // Auto-acknowledge if enabled
@@ -166,8 +266,9 @@ public:
     }
 
 private:
-    bool m_print_to_stdout;
+    output_mode m_output_mode;
     bool m_auto_ack;
+    std::unique_ptr<std::ofstream> m_dump_file;
 };
 
 // JetStream fetcher using pull consumer
@@ -904,6 +1005,11 @@ int main(int argc, char* argv[]) {
         ("separator", "Key-value separator for pubkv mode (default: |)", cxxopts::value<std::string>())
         ("kv_timeout", "KV operation timeout in ms (default: 5000)", cxxopts::value<int>())
         ("print", "print messages to stdout", cxxopts::value<bool>(print_to_stdout))
+        ("queue", "Queue group for subscribe (grub/js_grub mode)", cxxopts::value<std::string>())
+        ("max_msgs", "Auto-unsubscribe after N messages (grub mode)", cxxopts::value<uint32_t>())
+        ("raw", "Output raw payload only (grub/js_grub mode)")
+        ("dump", "Dump messages to file (grub/js_grub mode)", cxxopts::value<std::string>())
+        ("json", "Output messages as JSON (grub/js_grub mode)")
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
         ("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
@@ -998,6 +1104,32 @@ int main(int argc, char* argv[]) {
         } else {
             if (publish_interval < 0) {
                 publish_interval = 1000;
+            }
+        }
+
+        // Subscribe options for grub mode
+        std::string queue_group;
+        uint32_t max_msgs = 0;
+        output_mode out_mode = print_to_stdout ? output_mode::normal : output_mode::none;
+        std::string dump_file;
+
+        if (result.count("queue")) {
+            queue_group = result["queue"].as<std::string>();
+        }
+        if (result.count("max_msgs")) {
+            max_msgs = result["max_msgs"].as<uint32_t>();
+        }
+        if (result.count("raw")) {
+            out_mode = output_mode::raw;
+        }
+        if (result.count("json")) {
+            out_mode = output_mode::json;
+        }
+        if (result.count("dump")) {
+            dump_file = result["dump"].as<std::string>();
+            // If dump is specified but no output mode, default to normal
+            if (out_mode == output_mode::none) {
+                out_mode = output_mode::normal;
             }
         }
 
@@ -1116,9 +1248,9 @@ int main(int argc, char* argv[]) {
         std::vector<nats_asio::iconnection_sptr> pub_connections;
 
         if (m == mode::grubber) {
-            grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, print_to_stdout);
+            grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file);
         } else if (m == mode::js_grubber) {
-            js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, print_to_stdout, auto_ack);
+            js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, out_mode, auto_ack, dump_file);
         } else if (m == mode::kv_watcher) {
             kv_watch_ptr = std::make_shared<kv_watcher_handler>(ioc, console, stats_interval, print_to_stdout);
         }
@@ -1135,14 +1267,23 @@ int main(int argc, char* argv[]) {
                     }
 
                     if (m == mode::grubber) {
+                        nats_asio::subscribe_options sub_opts;
+                        if (!queue_group.empty()) {
+                            sub_opts.queue_group = queue_group;
+                        }
+                        sub_opts.max_messages = max_msgs;
+
                         auto r = co_await conn->subscribe(
                             topic,
                             [grub_ptr](auto v1, auto v2, auto v3) -> asio::awaitable<void> {
                                 return grub_ptr->on_message(v1, v2, v3);
-                            });
+                            },
+                            sub_opts);
 
                         if (r.second.failed()) {
                             console->error("failed to subscribe with error: {}", r.second.error());
+                        } else if (max_msgs > 0) {
+                            console->info("subscribed to {} (will auto-unsubscribe after {} messages)", topic, max_msgs);
                         }
                     } else if (m == mode::js_grubber) {
                         // Setup JetStream push consumer
