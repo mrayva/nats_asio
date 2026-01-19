@@ -6,9 +6,14 @@
 #include <asio/detached.hpp>
 #include <asio/posix/stream_descriptor.hpp>
 #include <asio/read_until.hpp>
+#include <condition_variable>
 #include <fstream>
+#include <future>
 #include <iostream>
+#include <mutex>
 #include <nats_asio/nats_asio.hpp>
+#include <queue>
+#include <thread>
 #include <tuple>
 #include <unistd.h>
 
@@ -528,6 +533,308 @@ private:
     asio::posix::stream_descriptor m_stdin;
 };
 
+// Thread-safe batch queue
+struct batch_item {
+    std::string data;
+    std::size_t msg_count;
+};
+
+class batch_queue {
+public:
+    void set_max_size(std::size_t max_size) {
+        m_max_size = max_size;
+    }
+
+    // Returns true if pushed, false if queue is full (when max_size set)
+    bool push(batch_item item, std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+
+        // Wait if queue is full
+        if (m_max_size > 0) {
+            if (!m_cv_full.wait_for(lock, timeout, [this] { return m_queue.size() < m_max_size || m_done; })) {
+                return false;  // timeout, queue full
+            }
+        }
+
+        m_queue.push(std::move(item));
+        lock.unlock();
+        m_cv.notify_one();
+        return true;
+    }
+
+    bool pop(batch_item& item, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (!m_cv.wait_for(lock, timeout, [this] { return !m_queue.empty() || m_done; })) {
+            return false;  // timeout
+        }
+        if (m_queue.empty()) {
+            return false;  // done signal
+        }
+        item = std::move(m_queue.front());
+        m_queue.pop();
+
+        // Notify producer that space is available
+        lock.unlock();
+        m_cv_full.notify_one();
+        return true;
+    }
+
+    void set_done() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_done = true;
+        }
+        m_cv.notify_all();
+        m_cv_full.notify_all();
+    }
+
+    bool is_done() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_done && m_queue.empty();
+    }
+
+    std::size_t size() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.size();
+    }
+
+private:
+    std::queue<batch_item> m_queue;
+    mutable std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::condition_variable m_cv_full;
+    bool m_done = false;
+    std::size_t m_max_size = 0;  // 0 = unlimited
+};
+
+// Multi-threaded batch publisher
+// - Reader thread: reads stdin, formats batches, pushes to queue
+// - Writer threads: each with own io_context + connection, pulls from queue
+class batch_publisher {
+public:
+    batch_publisher(std::shared_ptr<spdlog::logger> console,
+                    const nats_asio::connect_config& conf,
+                    std::optional<nats_asio::ssl_config> ssl_conf,
+                    const std::string& topic,
+                    int num_writers, int stats_interval,
+                    std::size_t batch_size = 65536,
+                    std::size_t max_queue_size = 100)
+        : m_console(std::move(console)), m_conf(conf), m_ssl_conf(std::move(ssl_conf)),
+          m_topic(topic), m_num_writers(num_writers), m_stats_interval(stats_interval),
+          m_batch_size(batch_size), m_counter(0), m_pending_writes(0), m_running(true) {
+        m_queue.set_max_size(max_queue_size);
+    }
+
+    void run() {
+        // Start writer threads
+        for (int i = 0; i < m_num_writers; i++) {
+            m_writer_threads.emplace_back([this, i] { writer_thread(i); });
+        }
+
+        // Start stats thread
+        if (m_stats_interval > 0) {
+            m_stats_thread = std::thread([this] { stats_thread(); });
+        }
+
+        // Reader runs in main thread
+        reader_thread();
+
+        // Signal done and wait for writers
+        m_queue.set_done();
+        for (auto& t : m_writer_threads) {
+            if (t.joinable()) t.join();
+        }
+
+        m_running = false;
+        if (m_stats_thread.joinable()) {
+            m_stats_thread.join();
+        }
+
+        m_console->info("Batch publisher finished, total messages: {}", m_counter.load());
+    }
+
+private:
+    void reader_thread() {
+        m_console->info("Reader thread started, batch_size={}", m_batch_size);
+
+        std::vector<char> read_buf(m_batch_size);
+        std::string leftover;
+        std::string batch_buf;
+        batch_buf.reserve(m_batch_size * 2);
+
+        while (m_running) {
+            auto read_start = std::chrono::steady_clock::now();
+            ssize_t bytes_read = ::read(STDIN_FILENO, read_buf.data(), read_buf.size());
+            auto read_end = std::chrono::steady_clock::now();
+
+            if (bytes_read <= 0) {
+                break;  // EOF or error
+            }
+
+            m_bytes_read += static_cast<std::size_t>(bytes_read);
+            auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(read_end - read_start).count();
+            if (read_us > 10000) {  // Log if read took > 10ms
+                m_console->warn("Slow stdin read: {}ms for {} bytes", read_us / 1000, bytes_read);
+            }
+
+            std::string_view chunk(read_buf.data(), static_cast<std::size_t>(bytes_read));
+
+            batch_buf.clear();
+            std::size_t msg_count = 0;
+            std::size_t start = 0;
+            std::size_t pos = 0;
+
+            // Combine with leftover
+            std::string combined;
+            if (!leftover.empty()) {
+                combined = leftover + std::string(chunk);
+                chunk = combined;
+                leftover.clear();
+            }
+
+            while ((pos = chunk.find('\n', start)) != std::string_view::npos) {
+                std::string_view line = chunk.substr(start, pos - start);
+                start = pos + 1;
+
+                if (line.empty()) continue;
+                if (!line.empty() && line.back() == '\r') {
+                    line = line.substr(0, line.size() - 1);
+                }
+                if (line.empty()) continue;
+
+                // Format PUB command
+                fmt::format_to(std::back_inserter(batch_buf),
+                    "PUB {} {}\r\n", m_topic, line.size());
+                batch_buf.append(line.data(), line.size());
+                batch_buf.append("\r\n");
+                msg_count++;
+            }
+
+            if (start < chunk.size()) {
+                leftover = std::string(chunk.substr(start));
+            }
+
+            if (msg_count > 0) {
+                m_queue.push({std::move(batch_buf), msg_count});
+                batch_buf = std::string();
+                batch_buf.reserve(m_batch_size * 2);
+            }
+        }
+
+        // Handle final leftover
+        if (!leftover.empty()) {
+            batch_buf.clear();
+            fmt::format_to(std::back_inserter(batch_buf),
+                "PUB {} {}\r\n", m_topic, leftover.size());
+            batch_buf.append(leftover);
+            batch_buf.append("\r\n");
+            m_queue.push({std::move(batch_buf), 1});
+        }
+
+        m_console->info("Reader thread finished");
+    }
+
+    void writer_thread(int id) {
+        // Each writer has its own io_context and connection
+        asio::io_context ioc;
+
+        auto conn = m_ssl_conf
+            ? nats_asio::create_connection(ioc,
+                [](nats_asio::iconnection&) -> asio::awaitable<void> { co_return; },
+                [](nats_asio::iconnection&) -> asio::awaitable<void> { co_return; },
+                [this](nats_asio::iconnection&, std::string_view err) -> asio::awaitable<void> {
+                    m_console->error("connection error: {}", err);
+                    co_return;
+                }, m_ssl_conf)
+            : nats_asio::create_connection(ioc,
+                [](nats_asio::iconnection&) -> asio::awaitable<void> { co_return; },
+                [](nats_asio::iconnection&) -> asio::awaitable<void> { co_return; },
+                [this](nats_asio::iconnection&, std::string_view err) -> asio::awaitable<void> {
+                    m_console->error("connection error: {}", err);
+                    co_return;
+                }, std::nullopt);
+
+        conn->start(m_conf);
+
+        // Run io_context in background to establish connection
+        std::thread io_thread([&ioc] { ioc.run(); });
+
+        // Wait for connection
+        while (!conn->is_connected() && m_running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        m_console->info("Writer {} connected", id);
+
+        // Process batches
+        while (m_running || !m_queue.is_done()) {
+            batch_item item;
+            if (!m_queue.pop(item, std::chrono::milliseconds(100))) {
+                if (m_queue.is_done()) break;
+                continue;
+            }
+
+            m_pending_writes++;
+
+            // Post write to io_context
+            std::promise<bool> write_done;
+            auto write_future = write_done.get_future();
+
+            asio::co_spawn(ioc,
+                [this, &conn, data = std::move(item.data), count = item.msg_count,
+                 &write_done]() mutable -> asio::awaitable<void> {
+                    std::span<const char> batch_span(data.data(), data.size());
+                    auto s = co_await conn->write_raw(batch_span);
+                    if (s.failed()) {
+                        m_console->error("batch write failed: {}", s.error());
+                    } else {
+                        m_counter += count;
+                    }
+                    write_done.set_value(true);
+                }, asio::detached);
+
+            // Wait for write to complete
+            write_future.wait();
+            m_pending_writes--;
+        }
+
+        conn->stop();
+        ioc.stop();
+        if (io_thread.joinable()) io_thread.join();
+
+        m_console->info("Writer {} finished", id);
+    }
+
+    void stats_thread() {
+        while (m_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(m_stats_interval));
+            auto count = m_counter.exchange(0);
+            auto bytes = m_bytes_read.exchange(0);
+            auto queue_size = m_queue.size();
+            auto pending = m_pending_writes.load();
+            m_console->info("Stats: {} events/sec, {} MB/sec read, queue={}, pending={}",
+                           count / m_stats_interval,
+                           bytes / m_stats_interval / 1024 / 1024,
+                           queue_size, pending);
+        }
+    }
+
+    std::shared_ptr<spdlog::logger> m_console;
+    nats_asio::connect_config m_conf;
+    std::optional<nats_asio::ssl_config> m_ssl_conf;
+    std::string m_topic;
+    int m_num_writers;
+    int m_stats_interval;
+    std::size_t m_batch_size;
+    std::atomic<std::size_t> m_counter;
+    std::atomic<std::size_t> m_bytes_read{0};
+    std::atomic<std::size_t> m_pending_writes;
+    std::atomic<bool> m_running;
+    batch_queue m_queue;
+    std::vector<std::thread> m_writer_threads;
+    std::thread m_stats_thread;
+};
+
 std::string read_file(const std::shared_ptr<spdlog::logger>& console, const std::string& path) {
     try {
         if (path.empty()) {
@@ -578,6 +885,9 @@ int main(int argc, char* argv[]) {
         ("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
         ("n,connections", "Number of connections for pub mode (default: 1)", cxxopts::value<int>(num_connections))
         ("max_in_flight", "Max in-flight publishes for pub mode (default: 1000)", cxxopts::value<int>(max_in_flight))
+        ("batch_pub", "Use high-performance batch publishing (pub mode, non-JS only)")
+        ("batch_size", "Batch read size in bytes for batch_pub mode (default: 65536)", cxxopts::value<int>())
+        ("max_queue", "Max batches in queue for batch_pub mode (default: 100)", cxxopts::value<int>())
         ("js,jetstream", "Use JetStream publish (pub mode only)")
         ("no_ack", "Fire-and-forget JetStream publish, don't wait for ack (with --js)")
         ("js_timeout", "JetStream publish timeout in ms (default: 5000)", cxxopts::value<int>())
@@ -797,6 +1107,7 @@ int main(int argc, char* argv[]) {
         std::shared_ptr<grubber> grub_ptr;
         std::shared_ptr<generator> gen_ptr;
         std::shared_ptr<publisher> pub_ptr;
+        std::shared_ptr<batch_publisher> batch_pub_ptr;
         std::shared_ptr<js_grubber> js_grub_ptr;
         std::shared_ptr<js_fetcher> js_fetch_ptr;
         std::shared_ptr<kv_publisher> kv_pub_ptr;
@@ -986,18 +1297,40 @@ int main(int argc, char* argv[]) {
         };
 
         if (m == mode::publisher) {
-            // Create multiple connections for publisher mode
-            console->info("Creating {} connections for pub mode", num_connections);
-            for (int i = 0; i < num_connections; i++) {
-                auto c = make_connection(i);
-                c->start(conf);
-                pub_connections.push_back(c);
-            }
+            bool use_batch_pub = result.count("batch_pub") > 0;
             bool use_jetstream = result.count("jetstream") > 0;
-            int js_timeout_ms = result.count("js_timeout") ? result["js_timeout"].as<int>() : 5000;
-            bool wait_for_ack = result.count("no_ack") == 0;  // default: wait for ack
-            pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
-                                                   max_in_flight, use_jetstream, js_timeout_ms, wait_for_ack);
+
+            if (use_batch_pub && use_jetstream) {
+                console->error("--batch_pub cannot be used with --jetstream");
+                return 1;
+            }
+
+            if (use_batch_pub) {
+                // Multi-threaded batch publishing mode
+                int batch_size_val = result.count("batch_size") ? result["batch_size"].as<int>() : 65536;
+                int max_queue_val = result.count("max_queue") ? result["max_queue"].as<int>() : 100;
+                console->info("Using multi-threaded batch publisher: {} writers, batch_size={}, max_queue={}",
+                             num_connections, batch_size_val, max_queue_val);
+                batch_pub_ptr = std::make_shared<batch_publisher>(console, conf, opt_ssl_conf, topic,
+                                                                   num_connections, stats_interval,
+                                                                   static_cast<std::size_t>(batch_size_val),
+                                                                   static_cast<std::size_t>(max_queue_val));
+                // Run batch publisher (blocks until done)
+                batch_pub_ptr->run();
+                return 0;
+            } else {
+                // Standard publisher mode - multiple connections supported
+                console->info("Creating {} connections for pub mode", num_connections);
+                for (int i = 0; i < num_connections; i++) {
+                    auto c = make_connection(i);
+                    c->start(conf);
+                    pub_connections.push_back(c);
+                }
+                int js_timeout_ms = result.count("js_timeout") ? result["js_timeout"].as<int>() : 5000;
+                bool wait_for_ack = result.count("no_ack") == 0;  // default: wait for ack
+                pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
+                                                       max_in_flight, use_jetstream, js_timeout_ms, wait_for_ack);
+            }
         } else {
             conn = make_connection();
             conn->start(conf);

@@ -922,6 +922,21 @@ public:
         co_return status();
     }
 
+    // Write pre-formatted NATS protocol data directly
+    virtual asio::awaitable<status> write_raw(std::span<const char> data) override {
+        if (!m_is_connected) {
+            co_return status("not connected");
+        }
+
+        try {
+            co_await asio::async_write(m_socket, asio::buffer(data.data(), data.size()), asio::use_awaitable);
+        } catch (const std::system_error& e) {
+            co_return status(e.code().message());
+        }
+
+        co_return status();
+    }
+
     virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) override {
         co_return co_await unsubscribe_impl(p);
     }

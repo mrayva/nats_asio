@@ -280,6 +280,10 @@ struct iconnection {
                                                           const headers_t& headers,
                                                           optional<string_view> reply_to = {}) = 0;
 
+    // Write pre-formatted NATS protocol data directly (for high-performance batched publishing)
+    // The data must be valid NATS protocol (e.g., multiple PUB commands)
+    [[nodiscard]] virtual asio::awaitable<status> write_raw(std::span<const char> data) = 0;
+
     // Request-reply pattern with timeout
     [[nodiscard]] virtual asio::awaitable<std::pair<message, status>> request(
         string_view subject, std::span<const char> payload,
