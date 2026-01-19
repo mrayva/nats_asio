@@ -17,6 +17,7 @@
 #include <tuple>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <poll.h>
 
 #include "cxxopts.hpp"
 
@@ -820,10 +821,12 @@ public:
                     const std::string& topic,
                     int num_writers, int stats_interval,
                     std::size_t batch_size = 65536,
-                    std::size_t max_queue_size = 100)
+                    std::size_t max_queue_size = 100,
+                    int flush_timeout_ms = 0)
         : m_console(std::move(console)), m_conf(conf), m_ssl_conf(std::move(ssl_conf)),
           m_topic(topic), m_num_writers(num_writers), m_stats_interval(stats_interval),
-          m_batch_size(batch_size), m_counter(0), m_pending_writes(0), m_running(true) {
+          m_batch_size(batch_size), m_flush_timeout_ms(flush_timeout_ms),
+          m_counter(0), m_pending_writes(0), m_running(true) {
         m_queue.set_max_size(max_queue_size);
     }
 
@@ -857,14 +860,51 @@ public:
 
 private:
     void reader_thread() {
-        m_console->info("Reader thread started, batch_size={}", m_batch_size);
+        if (m_flush_timeout_ms > 0) {
+            m_console->info("Reader thread started, batch_size={}, flush_timeout={}ms",
+                           m_batch_size, m_flush_timeout_ms);
+        } else {
+            m_console->info("Reader thread started, batch_size={}", m_batch_size);
+        }
 
         std::vector<char> read_buf(m_batch_size);
         std::string leftover;
         std::string batch_buf;
         batch_buf.reserve(m_batch_size * 2);
 
+        struct pollfd pfd;
+        pfd.fd = STDIN_FILENO;
+        pfd.events = POLLIN;
+
         while (m_running) {
+            // Use poll() if flush_timeout is enabled to avoid blocking indefinitely
+            if (m_flush_timeout_ms > 0) {
+                int poll_result = poll(&pfd, 1, m_flush_timeout_ms);
+                if (poll_result == 0) {
+                    // Timeout - no data available within flush_timeout
+                    // Flush leftover as a complete message if present
+                    if (!leftover.empty()) {
+                        auto leftover_size = leftover.size();
+                        batch_buf.clear();
+                        fmt::format_to(std::back_inserter(batch_buf),
+                            "PUB {} {}\r\n", m_topic, leftover_size);
+                        batch_buf.append(leftover);
+                        batch_buf.append("\r\n");
+                        m_queue.push({std::move(batch_buf), 1});
+                        batch_buf = std::string();
+                        batch_buf.reserve(m_batch_size * 2);
+                        leftover.clear();
+                        m_console->debug("Flush timeout: flushed partial line ({} bytes)", leftover_size);
+                    }
+                    continue;
+                } else if (poll_result < 0) {
+                    if (errno == EINTR) continue;
+                    m_console->error("poll error: {}", strerror(errno));
+                    break;
+                }
+                // poll_result > 0: data available, proceed to read
+            }
+
             auto read_start = std::chrono::steady_clock::now();
             ssize_t bytes_read = ::read(STDIN_FILENO, read_buf.data(), read_buf.size());
             auto read_end = std::chrono::steady_clock::now();
@@ -1028,6 +1068,7 @@ private:
     int m_num_writers;
     int m_stats_interval;
     std::size_t m_batch_size;
+    int m_flush_timeout_ms;
     std::atomic<std::size_t> m_counter;
     std::atomic<std::size_t> m_bytes_read{0};
     std::atomic<std::size_t> m_pending_writes;
@@ -1087,9 +1128,10 @@ int main(int argc, char* argv[]) {
         ("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
         ("n,connections", "Number of connections for pub mode (default: 1)", cxxopts::value<int>(num_connections))
         ("max_in_flight", "Max in-flight publishes for pub mode (default: 1000)", cxxopts::value<int>(max_in_flight))
-        ("batch_pub", "Use high-performance batch publishing (pub mode, non-JS only)")
+        ("batch_pub", "Use high-performance batch publishing (pub mode)")
         ("batch_size", "Batch read size in bytes for batch_pub mode (default: 65536)", cxxopts::value<int>())
         ("max_queue", "Max batches in queue for batch_pub mode (default: 100)", cxxopts::value<int>())
+        ("flush_timeout", "Flush timeout in ms for batch_pub mode - flush partial batch if no data arrives within timeout (default: 0 = disabled)", cxxopts::value<int>())
         ("js,jetstream", "Use JetStream publish (pub mode only)")
         ("no_ack", "Fire-and-forget JetStream publish, don't wait for ack (with --js)")
         ("js_timeout", "JetStream publish timeout in ms (default: 5000)", cxxopts::value<int>())
@@ -1552,8 +1594,8 @@ int main(int argc, char* argv[]) {
             bool use_batch_pub = result.count("batch_pub") > 0;
             bool use_jetstream = result.count("jetstream") > 0;
 
-            if (use_batch_pub && use_jetstream) {
-                console->error("--batch_pub cannot be used with --jetstream");
+            if (use_batch_pub && use_jetstream && result.count("no_ack") == 0) {
+                console->error("--batch_pub with --jetstream requires --no_ack (fire-and-forget mode)");
                 return 1;
             }
 
@@ -1561,12 +1603,14 @@ int main(int argc, char* argv[]) {
                 // Multi-threaded batch publishing mode
                 int batch_size_val = result.count("batch_size") ? result["batch_size"].as<int>() : 65536;
                 int max_queue_val = result.count("max_queue") ? result["max_queue"].as<int>() : 100;
+                int flush_timeout_val = result.count("flush_timeout") ? result["flush_timeout"].as<int>() : 0;
                 console->info("Using multi-threaded batch publisher: {} writers, batch_size={}, max_queue={}",
                              num_connections, batch_size_val, max_queue_val);
                 batch_pub_ptr = std::make_shared<batch_publisher>(console, conf, opt_ssl_conf, topic,
                                                                    num_connections, stats_interval,
                                                                    static_cast<std::size_t>(batch_size_val),
-                                                                   static_cast<std::size_t>(max_queue_val));
+                                                                   static_cast<std::size_t>(max_queue_val),
+                                                                   flush_timeout_val);
                 // Run batch publisher (blocks until done)
                 batch_pub_ptr->run();
                 return 0;
