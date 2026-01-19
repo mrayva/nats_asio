@@ -2,6 +2,8 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <regex>
+#include <sstream>
 #include <asio/as_tuple.hpp>
 #include <asio/detached.hpp>
 #include <asio/posix/stream_descriptor.hpp>
@@ -117,6 +119,100 @@ private:
 };
 
 enum class output_mode { none, normal, raw, json };
+
+enum class input_format { line, json, csv };
+
+struct input_config {
+    input_format format = input_format::line;
+    std::string subject_template;  // Template with {{field}} placeholders
+    std::vector<std::string> payload_fields;  // Fields to include in payload (empty = all)
+    std::vector<std::string> csv_headers;  // Header names for CSV input
+};
+
+// Helper to split string by delimiter
+inline std::vector<std::string> split_string(const std::string& s, char delim) {
+    std::vector<std::string> result;
+    std::istringstream iss(s);
+    std::string item;
+    while (std::getline(iss, item, delim)) {
+        // Trim whitespace
+        while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.erase(0, 1);
+        while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.pop_back();
+        if (!item.empty()) result.push_back(item);
+    }
+    return result;
+}
+
+// Apply template substitution: replace {{field}} with values from JSON object
+inline std::string apply_template(const std::string& tpl, const nlohmann::json& obj) {
+    std::string result = tpl;
+    std::regex field_regex(R"(\{\{(\w+)\}\})");
+    std::smatch match;
+    std::string::const_iterator search_start(result.cbegin());
+
+    std::string output;
+    size_t last_pos = 0;
+
+    auto it = std::sregex_iterator(result.begin(), result.end(), field_regex);
+    auto end = std::sregex_iterator();
+
+    for (; it != end; ++it) {
+        match = *it;
+        output += result.substr(last_pos, match.position() - last_pos);
+        std::string field_name = match[1].str();
+
+        if (obj.contains(field_name)) {
+            const auto& val = obj[field_name];
+            if (val.is_string()) {
+                output += val.get<std::string>();
+            } else {
+                output += val.dump();
+            }
+        } else {
+            output += match[0].str();  // Keep original if field not found
+        }
+        last_pos = match.position() + match.length();
+    }
+    output += result.substr(last_pos);
+    return output;
+}
+
+// Build payload from selected fields
+inline std::string build_payload(const nlohmann::json& obj, const std::vector<std::string>& fields) {
+    if (fields.empty()) {
+        return obj.dump();
+    }
+
+    nlohmann::json result;
+    for (const auto& field : fields) {
+        if (obj.contains(field)) {
+            result[field] = obj[field];
+        }
+    }
+    return result.dump();
+}
+
+// Parse CSV line into JSON object using headers
+inline nlohmann::json parse_csv_line(const std::string& line, const std::vector<std::string>& headers) {
+    nlohmann::json obj;
+    std::vector<std::string> values;
+
+    // Simple CSV parsing (doesn't handle quoted fields with commas)
+    std::istringstream iss(line);
+    std::string value;
+    while (std::getline(iss, value, ',')) {
+        // Trim whitespace
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.erase(0, 1);
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.pop_back();
+        values.push_back(value);
+    }
+
+    for (size_t i = 0; i < headers.size() && i < values.size(); i++) {
+        obj[headers[i]] = values[i];
+    }
+
+    return obj;
+}
 
 // Translate payload through external command
 // Supports {{Subject}} placeholder in command string
@@ -642,12 +738,13 @@ public:
               int stats_interval, int max_in_flight = 1000, bool jetstream = false,
               int js_timeout_ms = 5000, bool wait_for_ack = true,
               const nats_asio::headers_t& headers = {}, const std::string& reply_to = {},
-              int count = 0, int sleep_ms = 0, const std::string& data = {})
+              int count = 0, int sleep_ms = 0, const std::string& data = {},
+              const input_config& in_cfg = {})
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
           m_topic(topic), m_next_conn(0), m_in_flight(0), m_max_in_flight(max_in_flight),
           m_jetstream(jetstream), m_js_timeout(std::chrono::milliseconds(js_timeout_ms)),
           m_wait_for_ack(wait_for_ack), m_headers(headers), m_reply_to(reply_to),
-          m_count(count), m_sleep_ms(sleep_ms), m_data(data),
+          m_count(count), m_sleep_ms(sleep_ms), m_data(data), m_input_cfg(in_cfg),
           m_stdin(ioc, ::dup(STDIN_FILENO)) {
         asio::co_spawn(ioc, read_and_publish(), asio::detached);
     }
@@ -689,7 +786,9 @@ public:
                 std::istream is(&buf);
                 std::getline(is, line);
 
-                co_await publish_message(line);
+                if (line.empty()) continue;
+
+                co_await process_and_publish(line);
 
                 if (m_sleep_ms > 0) {
                     asio::steady_timer timer(co_await asio::this_coro::executor);
@@ -713,7 +812,51 @@ public:
     }
 
 private:
+    asio::awaitable<void> process_and_publish(const std::string& line) {
+        std::string subject = m_topic;
+        std::string payload = line;
+
+        if (m_input_cfg.format == input_format::json) {
+            try {
+                auto obj = nlohmann::json::parse(line);
+
+                // Apply subject template if provided
+                if (!m_input_cfg.subject_template.empty()) {
+                    subject = apply_template(m_input_cfg.subject_template, obj);
+                }
+
+                // Build payload from selected fields
+                payload = build_payload(obj, m_input_cfg.payload_fields);
+            } catch (const nlohmann::json::exception& e) {
+                m_log->warn("JSON parse error: {} - line: {}", e.what(), line.substr(0, 50));
+                co_return;
+            }
+        } else if (m_input_cfg.format == input_format::csv) {
+            if (m_input_cfg.csv_headers.empty()) {
+                m_log->error("CSV format requires --csv_headers");
+                co_return;
+            }
+
+            auto obj = parse_csv_line(line, m_input_cfg.csv_headers);
+
+            // Apply subject template if provided
+            if (!m_input_cfg.subject_template.empty()) {
+                subject = apply_template(m_input_cfg.subject_template, obj);
+            }
+
+            // Build payload from selected fields
+            payload = build_payload(obj, m_input_cfg.payload_fields);
+        }
+        // else: line format - use line as-is with m_topic
+
+        co_await publish_message(subject, payload);
+    }
+
     asio::awaitable<void> publish_message(const std::string& payload) {
+        co_await publish_message(m_topic, payload);
+    }
+
+    asio::awaitable<void> publish_message(const std::string& subject, const std::string& payload) {
         // Backpressure: wait if too many publishes in flight
         while (m_in_flight >= m_max_in_flight) {
             asio::steady_timer timer(co_await asio::this_coro::executor);
@@ -723,21 +866,22 @@ private:
 
         auto conn = get_next_connection();
         auto msg = std::make_shared<std::string>(payload);
+        auto subj = std::make_shared<std::string>(subject);
 
         m_in_flight++;
 
         asio::co_spawn(
             m_ioc,
-            [this, conn, msg]() -> asio::awaitable<void> {
+            [this, conn, subj, msg]() -> asio::awaitable<void> {
                 std::span<const char> payload_span(msg->data(), msg->size());
                 nats_asio::status s;
 
                 if (m_jetstream) {
                     if (m_headers.empty()) {
-                        auto [ack, status] = co_await conn->js_publish(m_topic, payload_span, m_js_timeout, m_wait_for_ack);
+                        auto [ack, status] = co_await conn->js_publish(*subj, payload_span, m_js_timeout, m_wait_for_ack);
                         s = status;
                     } else {
-                        auto [ack, status] = co_await conn->js_publish(m_topic, payload_span, m_headers, m_js_timeout, m_wait_for_ack);
+                        auto [ack, status] = co_await conn->js_publish(*subj, payload_span, m_headers, m_js_timeout, m_wait_for_ack);
                         s = status;
                     }
                 } else {
@@ -745,9 +889,9 @@ private:
                         ? std::nullopt
                         : std::optional<nats_asio::string_view>(m_reply_to);
                     if (m_headers.empty()) {
-                        s = co_await conn->publish(m_topic, payload_span, reply_opt);
+                        s = co_await conn->publish(*subj, payload_span, reply_opt);
                     } else {
-                        s = co_await conn->publish(m_topic, payload_span, m_headers, reply_opt);
+                        s = co_await conn->publish(*subj, payload_span, m_headers, reply_opt);
                     }
                 }
 
@@ -801,6 +945,7 @@ private:
     int m_count;
     int m_sleep_ms;
     std::string m_data;
+    input_config m_input_cfg;
     asio::posix::stream_descriptor m_stdin;
 };
 
@@ -1583,6 +1728,10 @@ int main(int argc, char* argv[]) {
         ("count", "Number of messages to publish (pub mode, default: 1)", cxxopts::value<int>())
         ("sleep", "Sleep interval between publishes in ms (pub mode)", cxxopts::value<int>())
         ("pub_size", "Message size in bytes for bench mode (default: 128)", cxxopts::value<int>())
+        ("input_format", "Input format: line (default), json, csv", cxxopts::value<std::string>())
+        ("subject_template", "Subject template with {{field}} placeholders (requires json/csv input)", cxxopts::value<std::string>())
+        ("payload_fields", "Comma-separated fields to include in payload (default: all)", cxxopts::value<std::string>())
+        ("csv_headers", "Comma-separated header names for CSV input", cxxopts::value<std::string>())
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
         ("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
@@ -1882,6 +2031,28 @@ int main(int argc, char* argv[]) {
             pub_data = result["data"].as<std::string>();
         }
 
+        // Parse input format options for publisher
+        input_config in_cfg;
+        if (result.count("input_format")) {
+            std::string fmt = result["input_format"].as<std::string>();
+            if (fmt == "json") {
+                in_cfg.format = input_format::json;
+            } else if (fmt == "csv") {
+                in_cfg.format = input_format::csv;
+            } else if (fmt != "line") {
+                console->warn("Unknown input format '{}', using 'line'", fmt);
+            }
+        }
+        if (result.count("subject_template")) {
+            in_cfg.subject_template = result["subject_template"].as<std::string>();
+        }
+        if (result.count("payload_fields")) {
+            in_cfg.payload_fields = split_string(result["payload_fields"].as<std::string>(), ',');
+        }
+        if (result.count("csv_headers")) {
+            in_cfg.csv_headers = split_string(result["csv_headers"].as<std::string>(), ',');
+        }
+
         if (m == mode::grubber) {
             grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file, translate_cmd, show_timestamp);
         } else if (m == mode::js_grubber) {
@@ -2108,7 +2279,8 @@ int main(int argc, char* argv[]) {
                 bool wait_for_ack = result.count("no_ack") == 0;  // default: wait for ack
                 pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
                                                        max_in_flight, use_jetstream, js_timeout_ms, wait_for_ack,
-                                                       headers, custom_reply_to, pub_count, pub_sleep_ms, pub_data);
+                                                       headers, custom_reply_to, pub_count, pub_sleep_ms, pub_data,
+                                                       in_cfg);
             }
         } else if (m == mode::benchmarker) {
             conn = make_connection();
