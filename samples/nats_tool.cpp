@@ -810,10 +810,11 @@ public:
     requester(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
               nats_asio::iconnection_sptr conn, const std::string& topic,
               int stats_interval, int timeout_ms, const std::string& data,
-              output_mode mode)
+              output_mode mode, const nats_asio::headers_t& headers = {})
         : worker(ioc, console, stats_interval), m_conn(std::move(conn)),
           m_topic(topic), m_timeout(std::chrono::milliseconds(timeout_ms)),
-          m_data(data), m_output_mode(mode), m_stdin(ioc, ::dup(STDIN_FILENO)) {
+          m_data(data), m_output_mode(mode), m_headers(headers),
+          m_stdin(ioc, ::dup(STDIN_FILENO)) {
         asio::co_spawn(ioc, run(), asio::detached);
     }
 
@@ -861,7 +862,9 @@ public:
 private:
     asio::awaitable<void> send_request(const std::string& payload) {
         std::span<const char> payload_span(payload.data(), payload.size());
-        auto [reply, status] = co_await m_conn->request(m_topic, payload_span, m_timeout);
+        auto [reply, status] = m_headers.empty()
+            ? co_await m_conn->request(m_topic, payload_span, m_timeout)
+            : co_await m_conn->request(m_topic, payload_span, m_headers, m_timeout);
 
         if (status.failed()) {
             m_log->error("request failed: {}", status.error());
@@ -899,6 +902,7 @@ private:
     std::chrono::milliseconds m_timeout;
     std::string m_data;
     output_mode m_output_mode;
+    nats_asio::headers_t m_headers;
     asio::posix::stream_descriptor m_stdin;
 };
 
@@ -2134,7 +2138,7 @@ int main(int argc, char* argv[]) {
                 int req_timeout = result.count("timeout") ? result["timeout"].as<int>() : 5000;
                 std::string req_data = result.count("data") ? result["data"].as<std::string>() : "";
                 req_ptr = std::make_shared<requester>(ioc, console, conn, topic, stats_interval,
-                                                      req_timeout, req_data, out_mode);
+                                                      req_timeout, req_data, out_mode, headers);
             } else if (m == mode::replier) {
                 std::string reply_data = result.count("data") ? result["data"].as<std::string>() : "";
                 bool echo_mode = result.count("echo") > 0;
