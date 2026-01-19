@@ -78,6 +78,135 @@ namespace protocol {
     constexpr string_view delim = " ";
 }
 
+// ============================================================================
+// Buffer Pool - Reduces allocations in hot paths
+// ============================================================================
+
+// Thread-safe buffer pool for reusing string and vector buffers
+template<typename T>
+class buffer_pool {
+public:
+    explicit buffer_pool(size_t initial_capacity = 32, size_t default_buffer_size = 256)
+        : m_default_size(default_buffer_size) {
+        m_pool.reserve(initial_capacity);
+    }
+
+    ~buffer_pool() = default;
+
+    // Non-copyable, non-movable (pools are typically singletons or connection-owned)
+    buffer_pool(const buffer_pool&) = delete;
+    buffer_pool& operator=(const buffer_pool&) = delete;
+
+    // Acquire a buffer from the pool (or create new if empty)
+    T acquire() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_pool.empty()) {
+            T buf;
+            if constexpr (requires { buf.reserve(m_default_size); }) {
+                buf.reserve(m_default_size);
+            }
+            return buf;
+        }
+        T buf = std::move(m_pool.back());
+        m_pool.pop_back();
+        return buf;
+    }
+
+    // Return a buffer to the pool for reuse
+    void release(T&& buf) {
+        // Clear but keep capacity
+        if constexpr (requires { buf.clear(); }) {
+            buf.clear();
+        }
+        std::lock_guard<std::mutex> lock(m_mutex);
+        // Limit pool growth to prevent unbounded memory
+        if (m_pool.size() < m_max_pool_size) {
+            m_pool.push_back(std::move(buf));
+        }
+    }
+
+    // Get current pool size (for diagnostics)
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_pool.size();
+    }
+
+    void set_max_pool_size(size_t max_size) {
+        m_max_pool_size = max_size;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::vector<T> m_pool;
+    size_t m_default_size;
+    size_t m_max_pool_size = 1024;  // Limit to prevent unbounded growth
+};
+
+// RAII handle that automatically returns buffer to pool
+template<typename T>
+class pooled_buffer {
+public:
+    pooled_buffer(buffer_pool<T>& pool) : m_pool(&pool), m_buffer(pool.acquire()) {}
+
+    ~pooled_buffer() {
+        if (m_pool) {
+            m_pool->release(std::move(m_buffer));
+        }
+    }
+
+    // Move-only
+    pooled_buffer(pooled_buffer&& other) noexcept
+        : m_pool(other.m_pool), m_buffer(std::move(other.m_buffer)) {
+        other.m_pool = nullptr;
+    }
+
+    pooled_buffer& operator=(pooled_buffer&& other) noexcept {
+        if (this != &other) {
+            if (m_pool) {
+                m_pool->release(std::move(m_buffer));
+            }
+            m_pool = other.m_pool;
+            m_buffer = std::move(other.m_buffer);
+            other.m_pool = nullptr;
+        }
+        return *this;
+    }
+
+    pooled_buffer(const pooled_buffer&) = delete;
+    pooled_buffer& operator=(const pooled_buffer&) = delete;
+
+    // Access the underlying buffer
+    T& get() { return m_buffer; }
+    const T& get() const { return m_buffer; }
+    T* operator->() { return &m_buffer; }
+    const T* operator->() const { return &m_buffer; }
+    T& operator*() { return m_buffer; }
+    const T& operator*() const { return m_buffer; }
+
+private:
+    buffer_pool<T>* m_pool;
+    T m_buffer;
+};
+
+// Convenience type aliases
+using string_pool = buffer_pool<std::string>;
+using char_vector_pool = buffer_pool<std::vector<char>>;
+using const_buffer_vector_pool = buffer_pool<std::vector<asio::const_buffer>>;
+
+using pooled_string = pooled_buffer<std::string>;
+using pooled_char_vector = pooled_buffer<std::vector<char>>;
+using pooled_const_buffer_vector = pooled_buffer<std::vector<asio::const_buffer>>;
+
+// Shared buffer pools (can be used globally or per-connection)
+struct buffer_pools {
+    string_pool strings{64, 256};           // For command strings, subjects
+    string_pool large_strings{32, 4096};    // For header serialization
+    char_vector_pool payloads{32, 1024};    // For message payloads
+    const_buffer_vector_pool buffer_vectors{64, 4};  // For async_write buffers
+};
+
+// ============================================================================
+
 // Generate unique inbox for request-reply
 inline std::string generate_inbox() {
     static std::atomic<uint64_t> counter{0};
@@ -96,6 +225,19 @@ inline std::string serialize_headers(const headers_t& headers) {
     }
     result += "\r\n";  // Empty line terminates headers
     return result;
+}
+
+// Serialize headers into existing buffer (avoids allocation)
+inline void serialize_headers_to(std::string& out, const headers_t& headers) {
+    out.clear();
+    out += protocol::nats_hdr_line;
+    for (const auto& [key, value] : headers) {
+        out += key;
+        out += ": ";
+        out += value;
+        out += "\r\n";
+    }
+    out += "\r\n";
 }
 
 // Parse headers from NATS format
@@ -900,21 +1042,22 @@ public:
             co_return status("message size exceeds server limit");
         }
 
-        std::vector<asio::const_buffer> buffers;
-        std::string header;
+        // Use pooled buffers to reduce allocations
+        pooled_const_buffer_vector buffers(m_pools.buffer_vectors);
+        pooled_string header(m_pools.strings);
 
         if (reply_to.has_value()) {
-            header = fmt::format(fmt::runtime(protocol::pub_fmt), subject, reply_to.value(), payload.size());
+            *header = fmt::format(fmt::runtime(protocol::pub_fmt), subject, reply_to.value(), payload.size());
         } else {
-            header = fmt::format(fmt::runtime(protocol::pub_fmt), subject, "", payload.size());
+            *header = fmt::format(fmt::runtime(protocol::pub_fmt), subject, "", payload.size());
         }
 
-        buffers.emplace_back(asio::buffer(header.data(), header.size()));
-        buffers.emplace_back(asio::buffer(payload.data(), payload.size()));
-        buffers.emplace_back(asio::buffer(protocol::crlf.data(), protocol::crlf.size()));
+        buffers->emplace_back(asio::buffer(header->data(), header->size()));
+        buffers->emplace_back(asio::buffer(payload.data(), payload.size()));
+        buffers->emplace_back(asio::buffer(protocol::crlf.data(), protocol::crlf.size()));
 
         try {
-            co_await asio::async_write(m_socket, buffers, asio::use_awaitable);
+            co_await asio::async_write(m_socket, *buffers, asio::use_awaitable);
         } catch (const std::system_error& e) {
             co_return status(e.code().message());
         }
@@ -1000,30 +1143,32 @@ public:
             co_return status("not connected");
         }
 
-        auto hdr_data = serialize_headers(headers);
-        std::size_t hdr_len = hdr_data.size();
+        // Use pooled buffers
+        pooled_string hdr_data(m_pools.large_strings);
+        serialize_headers_to(*hdr_data, headers);
+        std::size_t hdr_len = hdr_data->size();
         std::size_t total_len = hdr_len + payload.size();
 
         if (m_max_payload > 0 && total_len > m_max_payload) {
             co_return status("message size exceeds server limit");
         }
 
-        std::vector<asio::const_buffer> buffers;
-        std::string cmd;
+        pooled_const_buffer_vector buffers(m_pools.buffer_vectors);
+        pooled_string cmd(m_pools.strings);
 
         if (reply_to.has_value()) {
-            cmd = fmt::format(fmt::runtime(protocol::hpub_fmt), subject, reply_to.value(), hdr_len, total_len);
+            *cmd = fmt::format(fmt::runtime(protocol::hpub_fmt), subject, reply_to.value(), hdr_len, total_len);
         } else {
-            cmd = fmt::format(fmt::runtime(protocol::hpub_no_reply_fmt), subject, hdr_len, total_len);
+            *cmd = fmt::format(fmt::runtime(protocol::hpub_no_reply_fmt), subject, hdr_len, total_len);
         }
 
-        buffers.emplace_back(asio::buffer(cmd.data(), cmd.size()));
-        buffers.emplace_back(asio::buffer(hdr_data.data(), hdr_data.size()));
-        buffers.emplace_back(asio::buffer(payload.data(), payload.size()));
-        buffers.emplace_back(asio::buffer(protocol::crlf.data(), protocol::crlf.size()));
+        buffers->emplace_back(asio::buffer(cmd->data(), cmd->size()));
+        buffers->emplace_back(asio::buffer(hdr_data->data(), hdr_data->size()));
+        buffers->emplace_back(asio::buffer(payload.data(), payload.size()));
+        buffers->emplace_back(asio::buffer(protocol::crlf.data(), protocol::crlf.size()));
 
         try {
-            co_await asio::async_write(m_socket, buffers, asio::use_awaitable);
+            co_await asio::async_write(m_socket, *buffers, asio::use_awaitable);
         } catch (const std::system_error& e) {
             co_return status(e.code().message());
         }
@@ -2525,6 +2670,9 @@ private:
     on_error_cb m_error_cb;
 
     asio::streambuf m_buf;
+
+    // Buffer pools for reduced allocations in hot paths
+    mutable buffer_pools m_pools;
 
     std::shared_ptr<ssl::context> m_ssl_ctx;
     uni_socket<SocketType> m_socket;
