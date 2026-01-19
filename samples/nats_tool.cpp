@@ -16,6 +16,7 @@
 #include <thread>
 #include <tuple>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #include "cxxopts.hpp"
 
@@ -113,11 +114,90 @@ private:
 
 enum class output_mode { none, normal, raw, json };
 
+// Translate payload through external command
+// Supports {{Subject}} placeholder in command string
+std::string translate_payload(const std::string& cmd, std::string_view subject,
+                              std::span<const char> payload,
+                              std::shared_ptr<spdlog::logger>& log) {
+    // Replace {{Subject}} placeholder with actual subject
+    std::string actual_cmd = cmd;
+    const std::string placeholder = "{{Subject}}";
+    std::size_t pos = 0;
+    while ((pos = actual_cmd.find(placeholder, pos)) != std::string::npos) {
+        actual_cmd.replace(pos, placeholder.length(), subject);
+        pos += subject.length();
+    }
+
+    // Create pipes for stdin/stdout
+    int stdin_pipe[2];
+    int stdout_pipe[2];
+
+    if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0) {
+        log->error("translate: failed to create pipes");
+        return std::string(payload.data(), payload.size());
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        log->error("translate: fork failed");
+        close(stdin_pipe[0]); close(stdin_pipe[1]);
+        close(stdout_pipe[0]); close(stdout_pipe[1]);
+        return std::string(payload.data(), payload.size());
+    }
+
+    if (pid == 0) {
+        // Child process
+        close(stdin_pipe[1]);   // Close write end of stdin pipe
+        close(stdout_pipe[0]);  // Close read end of stdout pipe
+
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+
+        // Execute command via shell
+        execl("/bin/sh", "sh", "-c", actual_cmd.c_str(), nullptr);
+        _exit(127);  // exec failed
+    }
+
+    // Parent process
+    close(stdin_pipe[0]);   // Close read end of stdin pipe
+    close(stdout_pipe[1]);  // Close write end of stdout pipe
+
+    // Write payload to child's stdin
+    ssize_t written = write(stdin_pipe[1], payload.data(), payload.size());
+    close(stdin_pipe[1]);  // Signal EOF to child
+
+    if (written < 0) {
+        log->error("translate: write to child failed");
+    }
+
+    // Read output from child's stdout
+    std::string result;
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(stdout_pipe[0], buf, sizeof(buf))) > 0) {
+        result.append(buf, static_cast<std::size_t>(n));
+    }
+    close(stdout_pipe[0]);
+
+    // Wait for child to finish
+    int status;
+    waitpid(pid, &status, 0);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        log->warn("translate: command exited with status {}", WEXITSTATUS(status));
+    }
+
+    return result;
+}
+
 class grubber : public worker {
 public:
     grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
-            output_mode mode, const std::string& dump_file = {})
-        : worker(ioc, console, stats_interval), m_output_mode(mode) {
+            output_mode mode, const std::string& dump_file = {}, const std::string& translate_cmd = {})
+        : worker(ioc, console, stats_interval), m_output_mode(mode), m_translate_cmd(translate_cmd) {
         if (!dump_file.empty()) {
             m_dump_file = std::make_unique<std::ofstream>(dump_file, std::ios::binary);
             if (!m_dump_file->is_open()) {
@@ -134,16 +214,24 @@ public:
 
         std::ostream* out = m_dump_file ? m_dump_file.get() : &std::cout;
 
+        // Apply translation if configured
+        std::string translated;
+        std::span<const char> output_payload = payload;
+        if (!m_translate_cmd.empty()) {
+            translated = translate_payload(m_translate_cmd, subject, payload, m_log);
+            output_payload = std::span<const char>(translated.data(), translated.size());
+        }
+
         switch (m_output_mode) {
             case output_mode::raw:
-                out->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
                 *out << '\n';
                 break;
             case output_mode::json: {
                 // Escape payload for JSON
                 std::string escaped;
-                escaped.reserve(payload.size());
-                for (char c : payload) {
+                escaped.reserve(output_payload.size());
+                for (char c : output_payload) {
                     switch (c) {
                         case '"': escaped += "\\\""; break;
                         case '\\': escaped += "\\\\"; break;
@@ -167,7 +255,7 @@ public:
             }
             case output_mode::normal:
                 *out << "[" << subject << "] ";
-                out->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
                 *out << '\n';
                 break;
             case output_mode::none:
@@ -183,6 +271,7 @@ public:
 
 private:
     output_mode m_output_mode;
+    std::string m_translate_cmd;
     std::unique_ptr<std::ofstream> m_dump_file;
 };
 
@@ -190,8 +279,10 @@ private:
 class js_grubber : public worker {
 public:
     js_grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
-               output_mode mode, bool auto_ack, const std::string& dump_file = {})
-        : worker(ioc, console, stats_interval), m_output_mode(mode), m_auto_ack(auto_ack) {
+               output_mode mode, bool auto_ack, const std::string& dump_file = {},
+               const std::string& translate_cmd = {})
+        : worker(ioc, console, stats_interval), m_output_mode(mode), m_auto_ack(auto_ack),
+          m_translate_cmd(translate_cmd) {
         if (!dump_file.empty()) {
             m_dump_file = std::make_unique<std::ofstream>(dump_file, std::ios::binary);
             if (!m_dump_file->is_open()) {
@@ -209,15 +300,24 @@ public:
         const auto& payload = msg.msg.payload;
         const auto& subject = msg.msg.subject;
 
+        // Apply translation if configured
+        std::string translated;
+        std::span<const char> output_payload(payload.data(), payload.size());
+        if (!m_translate_cmd.empty()) {
+            translated = translate_payload(m_translate_cmd, subject,
+                                           std::span<const char>(payload.data(), payload.size()), m_log);
+            output_payload = std::span<const char>(translated.data(), translated.size());
+        }
+
         switch (m_output_mode) {
             case output_mode::raw:
-                out->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
                 *out << '\n';
                 break;
             case output_mode::json: {
                 std::string escaped;
-                escaped.reserve(payload.size());
-                for (char c : payload) {
+                escaped.reserve(output_payload.size());
+                for (char c : output_payload) {
                     switch (c) {
                         case '"': escaped += "\\\""; break;
                         case '\\': escaped += "\\\\"; break;
@@ -240,7 +340,7 @@ public:
             }
             case output_mode::normal:
                 *out << "[" << subject << "] ";
-                out->write(payload.data(), static_cast<std::streamsize>(payload.size()));
+                out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
                 *out << '\n';
                 m_log->debug("stream={} consumer={} seq={}/{} delivered={}",
                             msg.stream, msg.consumer, msg.stream_sequence,
@@ -268,6 +368,7 @@ public:
 private:
     output_mode m_output_mode;
     bool m_auto_ack;
+    std::string m_translate_cmd;
     std::unique_ptr<std::ofstream> m_dump_file;
 };
 
@@ -1010,6 +1111,7 @@ int main(int argc, char* argv[]) {
         ("raw", "Output raw payload only (grub/js_grub mode)")
         ("dump", "Dump messages to file (grub/js_grub mode)", cxxopts::value<std::string>())
         ("json", "Output messages as JSON (grub/js_grub mode)")
+        ("translate", "Transform payload through external command (supports {{Subject}})", cxxopts::value<std::string>())
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
         ("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
@@ -1133,6 +1235,15 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        std::string translate_cmd;
+        if (result.count("translate")) {
+            translate_cmd = result["translate"].as<std::string>();
+            // If translate is specified but no output mode, default to raw
+            if (out_mode == output_mode::none) {
+                out_mode = output_mode::raw;
+            }
+        }
+
         // Validate JetStream mode requirements
         std::string js_stream, js_consumer, js_durable;
         int batch_size = 10;
@@ -1248,9 +1359,9 @@ int main(int argc, char* argv[]) {
         std::vector<nats_asio::iconnection_sptr> pub_connections;
 
         if (m == mode::grubber) {
-            grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file);
+            grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file, translate_cmd);
         } else if (m == mode::js_grubber) {
-            js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, out_mode, auto_ack, dump_file);
+            js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, out_mode, auto_ack, dump_file, translate_cmd);
         } else if (m == mode::kv_watcher) {
             kv_watch_ptr = std::make_shared<kv_watcher_handler>(ioc, console, stats_interval, print_to_stdout);
         }
