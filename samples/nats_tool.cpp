@@ -26,6 +26,7 @@ const std::string gen_mode("gen");
 const std::string pub_mode("pub");
 const std::string req_mode("req");
 const std::string reply_mode("reply");
+const std::string bench_mode("bench");
 const std::string js_grub_mode("js_grub");
 const std::string js_fetch_mode("js_fetch");
 const std::string pubkv_mode("pubkv");
@@ -37,7 +38,7 @@ const std::string kvhistory_mode("kvhistory");
 const std::string kvpurge_mode("kvpurge");
 const std::string kvrevert_mode("kvrevert");
 
-enum class mode { grubber, generator, publisher, requester, replier, js_grubber, js_fetcher, kv_publisher, kv_watcher, kv_creator, kv_updater, kv_keys_lister, kv_history_viewer, kv_purger, kv_reverter };
+enum class mode { grubber, generator, publisher, requester, replier, benchmarker, js_grubber, js_fetcher, kv_publisher, kv_watcher, kv_creator, kv_updater, kv_keys_lister, kv_history_viewer, kv_purger, kv_reverter };
 
 class worker {
 public:
@@ -199,8 +200,10 @@ std::string translate_payload(const std::string& cmd, std::string_view subject,
 class grubber : public worker {
 public:
     grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
-            output_mode mode, const std::string& dump_file = {}, const std::string& translate_cmd = {})
-        : worker(ioc, console, stats_interval), m_output_mode(mode), m_translate_cmd(translate_cmd) {
+            output_mode mode, const std::string& dump_file = {}, const std::string& translate_cmd = {},
+            bool show_timestamp = false)
+        : worker(ioc, console, stats_interval), m_output_mode(mode), m_translate_cmd(translate_cmd),
+          m_show_timestamp(show_timestamp) {
         if (!dump_file.empty()) {
             m_dump_file = std::make_unique<std::ofstream>(dump_file, std::ios::binary);
             if (!m_dump_file->is_open()) {
@@ -225,8 +228,25 @@ public:
             output_payload = std::span<const char>(translated.data(), translated.size());
         }
 
+        // Get timestamp if needed
+        std::string timestamp_str;
+        if (m_show_timestamp && m_output_mode != output_mode::none) {
+            auto now = std::chrono::system_clock::now();
+            auto time_t_now = std::chrono::system_clock::to_time_t(now);
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) % 1000;
+            std::tm tm_now{};
+            localtime_r(&time_t_now, &tm_now);
+            timestamp_str = fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}.{:03d}",
+                tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
+                tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec, static_cast<int>(ms.count()));
+        }
+
         switch (m_output_mode) {
             case output_mode::raw:
+                if (m_show_timestamp) {
+                    *out << "[" << timestamp_str << "] ";
+                }
                 out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
                 *out << '\n';
                 break;
@@ -249,7 +269,11 @@ public:
                             }
                     }
                 }
-                *out << "{\"subject\":\"" << subject << "\"";
+                *out << "{";
+                if (m_show_timestamp) {
+                    *out << "\"timestamp\":\"" << timestamp_str << "\",";
+                }
+                *out << "\"subject\":\"" << subject << "\"";
                 if (reply_to) {
                     *out << ",\"reply_to\":\"" << *reply_to << "\"";
                 }
@@ -257,6 +281,9 @@ public:
                 break;
             }
             case output_mode::normal:
+                if (m_show_timestamp) {
+                    *out << "[" << timestamp_str << "] ";
+                }
                 *out << "[" << subject << "] ";
                 out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
                 *out << '\n';
@@ -275,6 +302,7 @@ public:
 private:
     output_mode m_output_mode;
     std::string m_translate_cmd;
+    bool m_show_timestamp;
     std::unique_ptr<std::ofstream> m_dump_file;
 };
 
@@ -612,82 +640,63 @@ public:
     publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
               std::vector<nats_asio::iconnection_sptr> connections, const std::string& topic,
               int stats_interval, int max_in_flight = 1000, bool jetstream = false,
-              int js_timeout_ms = 5000, bool wait_for_ack = true)
+              int js_timeout_ms = 5000, bool wait_for_ack = true,
+              const nats_asio::headers_t& headers = {}, const std::string& reply_to = {},
+              int count = 0, int sleep_ms = 0, const std::string& data = {})
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
           m_topic(topic), m_next_conn(0), m_in_flight(0), m_max_in_flight(max_in_flight),
           m_jetstream(jetstream), m_js_timeout(std::chrono::milliseconds(js_timeout_ms)),
-          m_wait_for_ack(wait_for_ack), m_stdin(ioc, ::dup(STDIN_FILENO)) {
+          m_wait_for_ack(wait_for_ack), m_headers(headers), m_reply_to(reply_to),
+          m_count(count), m_sleep_ms(sleep_ms), m_data(data),
+          m_stdin(ioc, ::dup(STDIN_FILENO)) {
         asio::co_spawn(ioc, read_and_publish(), asio::detached);
     }
 
     asio::awaitable<void> read_and_publish() {
-        asio::streambuf buf;
+        // Wait until at least one connection is ready
+        while (!has_connected_connection()) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(100));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
 
-        for (;;) {
-            // Async read line from stdin
-            auto [ec, bytes_read] = co_await asio::async_read_until(
-                m_stdin, buf, '\n', asio::as_tuple(asio::use_awaitable));
-
-            if (ec) {
-                if (ec == asio::error::eof || ec == asio::error::not_found) {
-                    break;  // EOF or no more data
+        if (m_count > 0 && !m_data.empty()) {
+            // Publish fixed message m_count times
+            for (int i = 0; i < m_count && !m_ioc.stopped(); i++) {
+                co_await publish_message(m_data);
+                if (m_sleep_ms > 0 && i < m_count - 1) {
+                    asio::steady_timer timer(co_await asio::this_coro::executor);
+                    timer.expires_after(std::chrono::milliseconds(m_sleep_ms));
+                    co_await timer.async_wait(asio::use_awaitable);
                 }
-                m_log->error("stdin read error: {}", ec.message());
-                break;
             }
+        } else {
+            // Read from stdin
+            asio::streambuf buf;
+            for (;;) {
+                auto [ec, bytes_read] = co_await asio::async_read_until(
+                    m_stdin, buf, '\n', asio::as_tuple(asio::use_awaitable));
 
-            // Extract line from buffer (without newline)
-            std::string line;
-            std::istream is(&buf);
-            std::getline(is, line);
-
-            // Wait until at least one connection is ready
-            while (!has_connected_connection()) {
-                asio::steady_timer timer(co_await asio::this_coro::executor);
-                timer.expires_after(std::chrono::milliseconds(100));
-                co_await timer.async_wait(asio::use_awaitable);
-            }
-
-            // Backpressure: wait if too many publishes in flight
-            while (m_in_flight >= m_max_in_flight) {
-                asio::steady_timer timer(co_await asio::this_coro::executor);
-                timer.expires_after(std::chrono::milliseconds(5));
-                co_await timer.async_wait(asio::use_awaitable);
-            }
-
-            // Round-robin connection selection
-            auto conn = get_next_connection();
-
-            // Capture message in shared_ptr for async lifetime
-            auto msg = std::make_shared<std::string>(std::move(line));
-
-            m_in_flight++;
-
-            // Fire-and-forget: dispatch publish without waiting
-            asio::co_spawn(
-                m_ioc,
-                [this, conn, msg]() -> asio::awaitable<void> {
-                    std::span<const char> payload_span(msg->data(), msg->size());
-
-                    if (m_jetstream) {
-                        auto [ack, s] = co_await conn->js_publish(m_topic, payload_span, m_js_timeout, m_wait_for_ack);
-                        if (s.failed()) {
-                            m_log->error("js_publish failed: {}", s.error());
-                        } else {
-                            m_counter++;
-                        }
-                    } else {
-                        auto s = co_await conn->publish(m_topic, payload_span, std::nullopt);
-                        if (s.failed()) {
-                            m_log->error("publish failed: {}", s.error());
-                        } else {
-                            m_counter++;
-                        }
+                if (ec) {
+                    if (ec == asio::error::eof || ec == asio::error::not_found) {
+                        break;
                     }
-                    m_in_flight--;
-                    co_return;
-                },
-                asio::detached);
+                    m_log->error("stdin read error: {}", ec.message());
+                    break;
+                }
+
+                std::string line;
+                std::istream is(&buf);
+                std::getline(is, line);
+
+                co_await publish_message(line);
+
+                if (m_sleep_ms > 0) {
+                    asio::steady_timer timer(co_await asio::this_coro::executor);
+                    timer.expires_after(std::chrono::milliseconds(m_sleep_ms));
+                    co_await timer.async_wait(asio::use_awaitable);
+                }
+            }
         }
 
         // Wait for all in-flight publishes to complete
@@ -700,6 +709,58 @@ public:
 
         m_log->info("All publishes complete, stopping");
         m_ioc.stop();
+        co_return;
+    }
+
+private:
+    asio::awaitable<void> publish_message(const std::string& payload) {
+        // Backpressure: wait if too many publishes in flight
+        while (m_in_flight >= m_max_in_flight) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(5));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        auto conn = get_next_connection();
+        auto msg = std::make_shared<std::string>(payload);
+
+        m_in_flight++;
+
+        asio::co_spawn(
+            m_ioc,
+            [this, conn, msg]() -> asio::awaitable<void> {
+                std::span<const char> payload_span(msg->data(), msg->size());
+                nats_asio::status s;
+
+                if (m_jetstream) {
+                    if (m_headers.empty()) {
+                        auto [ack, status] = co_await conn->js_publish(m_topic, payload_span, m_js_timeout, m_wait_for_ack);
+                        s = status;
+                    } else {
+                        auto [ack, status] = co_await conn->js_publish(m_topic, payload_span, m_headers, m_js_timeout, m_wait_for_ack);
+                        s = status;
+                    }
+                } else {
+                    std::optional<nats_asio::string_view> reply_opt = m_reply_to.empty()
+                        ? std::nullopt
+                        : std::optional<nats_asio::string_view>(m_reply_to);
+                    if (m_headers.empty()) {
+                        s = co_await conn->publish(m_topic, payload_span, reply_opt);
+                    } else {
+                        s = co_await conn->publish(m_topic, payload_span, m_headers, reply_opt);
+                    }
+                }
+
+                if (s.failed()) {
+                    m_log->error("publish failed: {}", s.error());
+                } else {
+                    m_counter++;
+                }
+                m_in_flight--;
+                co_return;
+            },
+            asio::detached);
+
         co_return;
     }
 
@@ -735,6 +796,11 @@ private:
     bool m_jetstream;
     std::chrono::milliseconds m_js_timeout;
     bool m_wait_for_ack;
+    nats_asio::headers_t m_headers;
+    std::string m_reply_to;
+    int m_count;
+    int m_sleep_ms;
+    std::string m_data;
     asio::posix::stream_descriptor m_stdin;
 };
 
@@ -1014,6 +1080,76 @@ private:
     std::string m_translate_cmd;
     std::string m_queue_group;
     output_mode m_output_mode;
+};
+
+// Benchmarker - measures pub/sub throughput
+class benchmarker : public worker {
+public:
+    benchmarker(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
+                nats_asio::iconnection_sptr conn, const std::string& topic,
+                int stats_interval, int msg_count, int msg_size, bool jetstream)
+        : worker(ioc, console, stats_interval), m_conn(std::move(conn)),
+          m_topic(topic), m_msg_count(msg_count), m_msg_size(msg_size),
+          m_jetstream(jetstream), m_start_time(std::chrono::steady_clock::now()) {
+        // Generate payload of specified size
+        m_payload.resize(msg_size, 'x');
+    }
+
+    asio::awaitable<void> run() {
+        // Wait for connection
+        while (!m_conn->is_connected()) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(100));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        m_log->info("Starting benchmark: {} messages, {} bytes each, jetstream={}",
+                   m_msg_count, m_msg_size, m_jetstream);
+        m_start_time = std::chrono::steady_clock::now();
+
+        std::span<const char> payload_span(m_payload.data(), m_payload.size());
+
+        for (int i = 0; i < m_msg_count && !m_ioc.stopped(); i++) {
+            nats_asio::status s;
+            if (m_jetstream) {
+                s = co_await m_conn->js_publish_async(m_topic, payload_span);
+            } else {
+                s = co_await m_conn->publish(m_topic, payload_span, std::nullopt);
+            }
+
+            if (s.failed()) {
+                m_log->error("publish failed: {}", s.error());
+            } else {
+                m_counter++;
+            }
+        }
+
+        auto end_time = std::chrono::steady_clock::now();
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - m_start_time).count();
+        double duration_sec = duration_ms / 1000.0;
+
+        std::size_t total_msgs = m_counter;
+        std::size_t total_bytes = total_msgs * m_msg_size;
+        double msgs_per_sec = duration_sec > 0 ? total_msgs / duration_sec : 0;
+        double mb_per_sec = duration_sec > 0 ? (total_bytes / 1024.0 / 1024.0) / duration_sec : 0;
+
+        m_log->info("Benchmark complete:");
+        m_log->info("  Messages: {} in {:.2f}s", total_msgs, duration_sec);
+        m_log->info("  Throughput: {:.0f} msgs/sec, {:.2f} MB/sec", msgs_per_sec, mb_per_sec);
+        m_log->info("  Latency: {:.3f} ms/msg avg", duration_sec > 0 ? (duration_ms / static_cast<double>(total_msgs)) : 0);
+
+        m_ioc.stop();
+        co_return;
+    }
+
+private:
+    nats_asio::iconnection_sptr m_conn;
+    std::string m_topic;
+    int m_msg_count;
+    int m_msg_size;
+    bool m_jetstream;
+    std::string m_payload;
+    std::chrono::steady_clock::time_point m_start_time;
 };
 
 // Thread-safe batch queue
@@ -1437,6 +1573,12 @@ int main(int argc, char* argv[]) {
         ("data", "Payload data for req/reply mode (if not provided, reads from stdin)", cxxopts::value<std::string>())
         ("timeout", "Request timeout in ms for req mode (default: 5000)", cxxopts::value<int>())
         ("echo", "Echo mode for reply - reply with received payload")
+        ("H,header", "Add header to message (format: Key:Value, repeatable)", cxxopts::value<std::vector<std::string>>())
+        ("reply_to", "Custom reply-to subject for pub mode", cxxopts::value<std::string>())
+        ("t,timestamp", "Show timestamps in subscribe output")
+        ("count", "Number of messages to publish (pub mode, default: 1)", cxxopts::value<int>())
+        ("sleep", "Sleep interval between publishes in ms (pub mode)", cxxopts::value<int>())
+        ("pub_size", "Message size in bytes for bench mode (default: 128)", cxxopts::value<int>())
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
         ("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
