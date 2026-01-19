@@ -1646,6 +1646,9 @@ int main(int argc, char* argv[]) {
         } else if (mode == reply_mode) {
             m = mode::replier;
             publish_interval = -1;
+        } else if (mode == bench_mode) {
+            m = mode::benchmarker;
+            publish_interval = -1;
         } else if (mode == js_grub_mode) {
             m = mode::js_grubber;
             publish_interval = -1;
@@ -1825,6 +1828,7 @@ int main(int argc, char* argv[]) {
         std::shared_ptr<publisher> pub_ptr;
         std::shared_ptr<requester> req_ptr;
         std::shared_ptr<replier> reply_ptr;
+        std::shared_ptr<benchmarker> bench_ptr;
         std::shared_ptr<batch_publisher> batch_pub_ptr;
         std::shared_ptr<js_grubber> js_grub_ptr;
         std::shared_ptr<js_fetcher> js_fetch_ptr;
@@ -1833,8 +1837,49 @@ int main(int argc, char* argv[]) {
         nats_asio::iconnection_sptr conn;
         std::vector<nats_asio::iconnection_sptr> pub_connections;
 
+        // Parse timestamp option
+        bool show_timestamp = result.count("timestamp") > 0;
+
+        // Parse headers (format: Key:Value)
+        nats_asio::headers_t headers;
+        if (result.count("header")) {
+            auto header_strs = result["header"].as<std::vector<std::string>>();
+            for (const auto& h : header_strs) {
+                auto colon_pos = h.find(':');
+                if (colon_pos != std::string::npos) {
+                    std::string key = h.substr(0, colon_pos);
+                    std::string value = h.substr(colon_pos + 1);
+                    // Trim leading whitespace from value
+                    while (!value.empty() && (value[0] == ' ' || value[0] == '\t')) {
+                        value.erase(0, 1);
+                    }
+                    headers.emplace_back(key, value);
+                } else {
+                    console->warn("Invalid header format (expected Key:Value): {}", h);
+                }
+            }
+        }
+
+        // Parse reply_to, count, sleep options
+        std::string custom_reply_to;
+        int pub_count = 0;
+        int pub_sleep_ms = 0;
+        std::string pub_data;
+        if (result.count("reply_to")) {
+            custom_reply_to = result["reply_to"].as<std::string>();
+        }
+        if (result.count("count")) {
+            pub_count = result["count"].as<int>();
+        }
+        if (result.count("sleep")) {
+            pub_sleep_ms = result["sleep"].as<int>();
+        }
+        if (result.count("data")) {
+            pub_data = result["data"].as<std::string>();
+        }
+
         if (m == mode::grubber) {
-            grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file, translate_cmd);
+            grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file, translate_cmd, show_timestamp);
         } else if (m == mode::js_grubber) {
             js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, out_mode, auto_ack, dump_file, translate_cmd);
         } else if (m == mode::kv_watcher) {
@@ -2058,8 +2103,18 @@ int main(int argc, char* argv[]) {
                 int js_timeout_ms = result.count("js_timeout") ? result["js_timeout"].as<int>() : 5000;
                 bool wait_for_ack = result.count("no_ack") == 0;  // default: wait for ack
                 pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
-                                                       max_in_flight, use_jetstream, js_timeout_ms, wait_for_ack);
+                                                       max_in_flight, use_jetstream, js_timeout_ms, wait_for_ack,
+                                                       headers, custom_reply_to, pub_count, pub_sleep_ms, pub_data);
             }
+        } else if (m == mode::benchmarker) {
+            conn = make_connection();
+            conn->start(conf);
+            int bench_count = result.count("count") ? result["count"].as<int>() : 100000;
+            int bench_size = result.count("pub_size") ? result["pub_size"].as<int>() : 128;
+            bool use_js = result.count("jetstream") > 0;
+            bench_ptr = std::make_shared<benchmarker>(ioc, console, conn, topic, stats_interval,
+                                                       bench_count, bench_size, use_js);
+            asio::co_spawn(ioc, bench_ptr->run(), asio::detached);
         } else {
             conn = make_connection();
             conn->start(conf);
