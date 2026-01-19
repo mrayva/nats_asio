@@ -1265,11 +1265,11 @@ public:
     benchmarker(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
                 std::vector<nats_asio::iconnection_sptr> connections, const std::string& topic,
                 int stats_interval, int msg_count, int msg_size, bool jetstream,
-                bool request_reply = false, int timeout_ms = 5000)
+                bool request_reply = false, int timeout_ms = 5000, int batch_size = 1000)
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
           m_topic(topic), m_msg_count(msg_count), m_msg_size(msg_size),
           m_jetstream(jetstream), m_request_reply(request_reply),
-          m_timeout(std::chrono::milliseconds(timeout_ms)),
+          m_timeout(std::chrono::milliseconds(timeout_ms)), m_batch_size(batch_size),
           m_start_time(std::chrono::steady_clock::now()) {
         // Generate payload of specified size
         m_payload.resize(msg_size, 'x');
@@ -1277,6 +1277,8 @@ public:
         if (m_request_reply) {
             m_latencies.reserve(msg_count);
         }
+        // Pre-format single PUB command for pipelined mode
+        m_pub_cmd = fmt::format("PUB {} {}\r\n", m_topic, m_msg_size);
     }
 
     asio::awaitable<void> run() {
@@ -1287,43 +1289,23 @@ public:
             co_await timer.async_wait(asio::use_awaitable);
         }
 
-        std::string mode_str = m_request_reply ? "request-reply" : (m_jetstream ? "jetstream" : "publish");
-        m_log->info("Starting benchmark: {} messages, {} bytes, {} connections, mode={}",
-                   m_msg_count, m_msg_size, m_connections.size(), mode_str);
+        std::string mode_str = m_request_reply ? "request-reply" :
+                               (m_jetstream ? "jetstream" :
+                               (m_batch_size > 1 ? "pipelined" : "publish"));
+        m_log->info("Starting benchmark: {} messages, {} bytes, {} connections, mode={}{}",
+                   m_msg_count, m_msg_size, m_connections.size(), mode_str,
+                   (m_batch_size > 1 && !m_request_reply && !m_jetstream) ?
+                   fmt::format(", batch={}", m_batch_size) : "");
         m_start_time = std::chrono::steady_clock::now();
 
-        std::span<const char> payload_span(m_payload.data(), m_payload.size());
-
-        for (int i = 0; i < m_msg_count && !m_ioc.stopped(); i++) {
-            auto conn = get_next_connection();
-
-            if (m_request_reply) {
-                // Measure round-trip latency
-                auto start = std::chrono::steady_clock::now();
-                auto [reply, status] = co_await conn->request(m_topic, payload_span, m_timeout);
-                auto end = std::chrono::steady_clock::now();
-
-                if (status.failed()) {
-                    m_log->error("request failed: {}", status.error());
-                } else {
-                    auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-                    m_latencies.push_back(latency_us);
-                    m_counter++;
-                }
-            } else {
-                nats_asio::status s;
-                if (m_jetstream) {
-                    s = co_await conn->js_publish_async(m_topic, payload_span);
-                } else {
-                    s = co_await conn->publish(m_topic, payload_span, std::nullopt);
-                }
-
-                if (s.failed()) {
-                    m_log->error("publish failed: {}", s.error());
-                } else {
-                    m_counter++;
-                }
-            }
+        if (m_request_reply) {
+            co_await run_request_reply();
+        } else if (m_jetstream) {
+            co_await run_jetstream();
+        } else if (m_batch_size > 1) {
+            co_await run_pipelined();
+        } else {
+            co_await run_sequential();
         }
 
         auto end_time = std::chrono::steady_clock::now();
@@ -1363,6 +1345,88 @@ public:
     }
 
 private:
+    asio::awaitable<void> run_pipelined() {
+        // Build batches of PUB commands and write them using write_raw
+        std::string batch_buffer;
+        // Pre-calculate single message size: "PUB topic len\r\npayload\r\n"
+        size_t single_msg_size = m_pub_cmd.size() + m_payload.size() + 2; // +2 for \r\n after payload
+        batch_buffer.reserve(single_msg_size * m_batch_size);
+
+        int remaining = m_msg_count;
+        while (remaining > 0 && !m_ioc.stopped()) {
+            int batch_count = std::min(remaining, m_batch_size);
+            batch_buffer.clear();
+
+            // Build batch of PUB commands
+            for (int i = 0; i < batch_count; i++) {
+                batch_buffer += m_pub_cmd;
+                batch_buffer += m_payload;
+                batch_buffer += "\r\n";
+            }
+
+            // Write batch using write_raw
+            auto conn = get_next_connection();
+            std::span<const char> batch_span(batch_buffer.data(), batch_buffer.size());
+            auto s = co_await conn->write_raw(batch_span);
+
+            if (s.failed()) {
+                m_log->error("write_raw failed: {}", s.error());
+            } else {
+                m_counter += batch_count;
+            }
+
+            remaining -= batch_count;
+        }
+        co_return;
+    }
+
+    asio::awaitable<void> run_sequential() {
+        std::span<const char> payload_span(m_payload.data(), m_payload.size());
+        for (int i = 0; i < m_msg_count && !m_ioc.stopped(); i++) {
+            auto conn = get_next_connection();
+            auto s = co_await conn->publish(m_topic, payload_span, std::nullopt);
+            if (s.failed()) {
+                m_log->error("publish failed: {}", s.error());
+            } else {
+                m_counter++;
+            }
+        }
+        co_return;
+    }
+
+    asio::awaitable<void> run_jetstream() {
+        std::span<const char> payload_span(m_payload.data(), m_payload.size());
+        for (int i = 0; i < m_msg_count && !m_ioc.stopped(); i++) {
+            auto conn = get_next_connection();
+            auto s = co_await conn->js_publish_async(m_topic, payload_span);
+            if (s.failed()) {
+                m_log->error("js_publish failed: {}", s.error());
+            } else {
+                m_counter++;
+            }
+        }
+        co_return;
+    }
+
+    asio::awaitable<void> run_request_reply() {
+        std::span<const char> payload_span(m_payload.data(), m_payload.size());
+        for (int i = 0; i < m_msg_count && !m_ioc.stopped(); i++) {
+            auto conn = get_next_connection();
+            auto start = std::chrono::steady_clock::now();
+            auto [reply, status] = co_await conn->request(m_topic, payload_span, m_timeout);
+            auto end = std::chrono::steady_clock::now();
+
+            if (status.failed()) {
+                m_log->error("request failed: {}", status.error());
+            } else {
+                auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+                m_latencies.push_back(latency_us);
+                m_counter++;
+            }
+        }
+        co_return;
+    }
+
     bool has_connected_connection() const {
         for (const auto& conn : m_connections) {
             if (conn->is_connected()) return true;
@@ -1390,7 +1454,9 @@ private:
     bool m_jetstream;
     bool m_request_reply;
     std::chrono::milliseconds m_timeout;
+    int m_batch_size;
     std::string m_payload;
+    std::string m_pub_cmd;
     std::chrono::steady_clock::time_point m_start_time;
     std::vector<long long> m_latencies;
     std::size_t m_next_conn = 0;
@@ -1824,6 +1890,7 @@ int main(int argc, char* argv[]) {
         ("sleep", "Sleep interval between publishes in ms (pub mode)", cxxopts::value<int>())
         ("pub_size", "Message size in bytes for bench mode (default: 128)", cxxopts::value<int>())
         ("bench_rtt", "Bench mode: measure round-trip latency using request-reply")
+        ("bench_batch", "Bench mode: messages per batch for pipelined publishing (default: 1000)", cxxopts::value<int>())
         ("input_format", "Input format: line (default), json, csv", cxxopts::value<std::string>())
         ("subject_template", "Subject template with {{field}} placeholders (requires json/csv input)", cxxopts::value<std::string>())
         ("payload_fields", "Comma-separated fields to include in payload (default: all)", cxxopts::value<std::string>())
@@ -2385,6 +2452,7 @@ int main(int argc, char* argv[]) {
             bool use_js = result.count("jetstream") > 0;
             bool bench_rtt = result.count("bench_rtt") > 0;
             int bench_timeout = result.count("timeout") ? result["timeout"].as<int>() : 5000;
+            int bench_batch = result.count("bench_batch") ? result["bench_batch"].as<int>() : 1000;
 
             // Create connections for benchmark (use --connections option)
             std::vector<nats_asio::iconnection_sptr> bench_connections;
@@ -2396,7 +2464,7 @@ int main(int argc, char* argv[]) {
             console->info("Benchmark using {} connection(s)", num_connections);
 
             bench_ptr = std::make_shared<benchmarker>(ioc, console, bench_connections, topic, stats_interval,
-                                                       bench_count, bench_size, use_js, bench_rtt, bench_timeout);
+                                                       bench_count, bench_size, use_js, bench_rtt, bench_timeout, bench_batch);
             asio::co_spawn(ioc, bench_ptr->run(), asio::detached);
         } else {
             conn = make_connection();
