@@ -2373,6 +2373,9 @@ private:
 
             co_await asio::async_connect(m_socket.lowest_layer(), results, use_awaitable);
 
+            // Disable Nagle's algorithm for lower latency
+            m_socket.lowest_layer().set_option(asio::ip::tcp::no_delay(true));
+
             co_await asio::async_read_until(m_socket, m_buf, std::string(protocol::crlf), use_awaitable);
 
             std::string header;
