@@ -910,6 +910,11 @@ public:
         return send_ack(msg, "+ACK");
     }
 
+    [[nodiscard]] asio::awaitable<status> ack_batch(
+        const std::vector<js_message>& messages) override {
+        return send_ack_batch(messages, "+ACK");
+    }
+
     [[nodiscard]] asio::awaitable<status> nak(const js_message& msg,
                                                std::chrono::milliseconds delay) override {
         if (delay.count() > 0) {
@@ -930,6 +935,8 @@ public:
 
 private:
     asio::awaitable<status> send_ack(const js_message& msg, std::string_view ack_body);
+    asio::awaitable<status> send_ack_batch(const std::vector<js_message>& messages,
+                                           std::string_view ack_body);
 
     connection<SocketType>* m_conn;
     js_consumer_info m_info;
@@ -2860,6 +2867,46 @@ asio::awaitable<status> js_subscription<SocketType>::send_ack(
 
     std::span<const char> payload(ack_body.data(), ack_body.size());
     co_return co_await m_conn->publish(*msg.msg.reply_to, payload, std::nullopt);
+}
+
+// Batch ack implementation - sends all acks in a single write
+template <class SocketType>
+asio::awaitable<status> js_subscription<SocketType>::send_ack_batch(
+    const std::vector<js_message>& messages, std::string_view ack_body) {
+
+    if (!m_active.load()) {
+        co_return status("subscription is not active");
+    }
+
+    if (messages.empty()) {
+        co_return status();
+    }
+
+    // Build batch of PUB commands: "PUB reply_to len\r\nack_body\r\n" for each message
+    std::string batch;
+    // Estimate size: each ack is roughly "PUB <reply_to> <len>\r\n<ack_body>\r\n"
+    // reply_to is typically ~60 chars, overhead ~20 chars
+    batch.reserve(messages.size() * (80 + ack_body.size()));
+
+    size_t acked_count = 0;
+    for (const auto& msg : messages) {
+        if (!msg.msg.reply_to) {
+            continue;  // Skip messages without reply subject
+        }
+        // Format: PUB <reply_to> <payload_len>\r\n<payload>\r\n
+        batch += fmt::format("PUB {} {}\r\n", *msg.msg.reply_to, ack_body.size());
+        batch += ack_body;
+        batch += "\r\n";
+        ++acked_count;
+    }
+
+    if (acked_count == 0) {
+        co_return status("no messages had reply subjects for acknowledgment");
+    }
+
+    // Send all acks in a single write
+    std::span<const char> batch_span(batch.data(), batch.size());
+    co_return co_await m_conn->write_raw(batch_span);
 }
 
 inline void load_certificates(const ssl_config& conf, ssl::context& ctx) {

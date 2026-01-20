@@ -208,6 +208,10 @@ struct ijs_subscription {
     // Acknowledge message (mark as processed)
     [[nodiscard]] virtual asio::awaitable<status> ack(const js_message& msg) = 0;
 
+    // Batch acknowledge multiple messages (more efficient than individual acks)
+    [[nodiscard]] virtual asio::awaitable<status> ack_batch(
+        const std::vector<js_message>& messages) = 0;
+
     // Negative acknowledge (request redelivery)
     [[nodiscard]] virtual asio::awaitable<status> nak(const js_message& msg,
                                                        std::chrono::milliseconds delay = {}) = 0;
