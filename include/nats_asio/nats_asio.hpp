@@ -395,6 +395,39 @@ inline headers_t parse_headers(string_view data) {
     return headers;
 }
 
+// Parse headers without copying - returns string_views into original data
+// WARNING: Returned views are only valid as long as the input data is valid!
+inline headers_view_t parse_headers_view(string_view data) {
+    headers_view_t headers;
+
+    // Skip "NATS/1.0\r\n" prefix
+    auto pos = data.find("\r\n");
+    if (pos == string_view::npos) return headers;
+    data = data.substr(pos + 2);
+
+    // Parse each header line until empty line
+    while (!data.empty() && data != "\r\n") {
+        pos = data.find("\r\n");
+        if (pos == string_view::npos) break;
+
+        auto line = data.substr(0, pos);
+        data = data.substr(pos + 2);
+
+        if (line.empty()) break;
+
+        auto colon = line.find(':');
+        if (colon != string_view::npos) {
+            auto key = line.substr(0, colon);
+            auto value = line.substr(colon + 1);
+            if (!value.empty() && value[0] == ' ') {
+                value = value.substr(1);
+            }
+            headers.emplace_back(key, value);  // No string copies!
+        }
+    }
+    return headers;
+}
+
 using asio::awaitable;
 using asio::use_awaitable;
 using asio::ip::tcp;
@@ -820,6 +853,10 @@ public:
     subscription(uint64_t sid, const on_message_with_headers_cb& headers_cb, uint32_t max_msgs = 0)
         : m_cancel(false), m_headers_cb(headers_cb), m_sid(sid), m_max_messages(max_msgs), m_message_count(0) {}
 
+    // Constructor with zero-copy callback (references internal buffers)
+    subscription(uint64_t sid, const on_message_zero_copy_cb& zero_copy_cb, uint32_t max_msgs = 0)
+        : m_cancel(false), m_zero_copy_cb(zero_copy_cb), m_sid(sid), m_max_messages(max_msgs), m_message_count(0) {}
+
     subscription(const subscription&) = delete;
     subscription& operator=(const subscription&) = delete;
 
@@ -855,6 +892,14 @@ public:
         return m_headers_cb;
     }
 
+    [[nodiscard]] bool has_zero_copy_callback() const noexcept {
+        return m_zero_copy_cb != nullptr;
+    }
+
+    [[nodiscard]] const on_message_zero_copy_cb& zero_copy_callback() const noexcept {
+        return m_zero_copy_cb;
+    }
+
     // Increment message count and return true if should auto-unsubscribe
     [[nodiscard]] bool increment_and_check() noexcept {
         if (m_max_messages == 0) {
@@ -868,6 +913,7 @@ private:
     std::atomic<bool> m_cancel;
     on_message_cb m_cb;
     on_message_with_headers_cb m_headers_cb;
+    on_message_zero_copy_cb m_zero_copy_cb;
     uint64_t m_sid;
     uint32_t m_max_messages;
     std::atomic<uint32_t> m_message_count;
@@ -1268,6 +1314,32 @@ public:
     // Subscribe with headers callback (for JetStream HMSG messages)
     virtual asio::awaitable<std::pair<isubscription_sptr, status>>
     subscribe(string_view subject, on_message_with_headers_cb cb, subscribe_options opts = {}) override {
+        if (!m_is_connected) {
+            co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
+                                                            status("not connected")};
+        }
+
+        auto sid = next_sid();
+        std::string payload = opts.queue_group.has_value()
+                                  ? fmt::format(fmt::runtime(protocol::sub_fmt), subject, opts.queue_group.value(), sid)
+                                  : fmt::format(fmt::runtime(protocol::sub_fmt), subject, "", sid);
+
+        try {
+            co_await asio::async_write(m_socket, asio::buffer(payload), asio::use_awaitable);
+        } catch (const std::system_error& e) {
+            co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
+                                                            status(e.code().message())};
+        }
+
+        auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
+        m_subs.emplace(sid, sub);
+
+        co_return std::pair<isubscription_sptr, status>{sub, status()};
+    }
+
+    // Zero-copy subscribe - callback receives references to internal buffers
+    virtual asio::awaitable<std::pair<isubscription_sptr, status>>
+    subscribe(string_view subject, on_message_zero_copy_cb cb, subscribe_options opts = {}) override {
         if (!m_is_connected) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
                                                             status("not connected")};
@@ -2586,7 +2658,22 @@ private:
 
         auto b = m_buf.data();
         std::span<const char> payload_span(static_cast<const char*>(b.data()), n);
-        co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+
+        // Check callback type and dispatch appropriately
+        if (it->second->has_zero_copy_callback()) {
+            // Zero-copy path for MSG (no headers)
+            message_view msg_view;
+            msg_view.subject = subject;
+            if (reply_to) {
+                msg_view.reply_to = *reply_to;
+            }
+            // No headers for regular MSG
+            msg_view.payload = payload_span;
+
+            co_await it->second->zero_copy_callback()(msg_view);
+        } else {
+            co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+        }
 
         // Check for auto-unsubscribe after delivering message
         if (it->second->increment_and_check()) {
@@ -2635,9 +2722,21 @@ private:
         std::span<const char> headers_span(data_ptr, header_len);
         std::span<const char> payload_span(data_ptr + header_len, payload_len);
 
-        // Check if subscription has a headers callback
-        if (it->second->has_headers_callback()) {
-            // Build full message with headers
+        // Check callback type and dispatch appropriately
+        if (it->second->has_zero_copy_callback()) {
+            // Zero-copy path - no allocations, references internal buffers
+            message_view msg_view;
+            msg_view.subject = subject;
+            if (reply_to) {
+                msg_view.reply_to = *reply_to;
+            }
+            string_view headers_sv(headers_span.data(), headers_span.size());
+            msg_view.headers = parse_headers_view(headers_sv);
+            msg_view.payload = payload_span;
+
+            co_await it->second->zero_copy_callback()(msg_view);
+        } else if (it->second->has_headers_callback()) {
+            // Build full message with headers (copies data)
             message msg;
             msg.subject = std::string(subject);
             if (reply_to) {

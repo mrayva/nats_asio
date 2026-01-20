@@ -43,12 +43,24 @@ using aio = asio::io_context;
 // Message headers (name-value pairs)
 using headers_t = std::vector<std::pair<std::string, std::string>>;
 
+// Zero-copy headers view (references internal buffer, valid only during callback)
+using headers_view_t = std::vector<std::pair<std::string_view, std::string_view>>;
+
 // Complete message with headers support
 struct message {
     std::string subject;
     optional<std::string> reply_to;
     headers_t headers;
     std::vector<char> payload;
+};
+
+// Zero-copy message view (references internal buffers, valid only during callback)
+// WARNING: All data is only valid for the duration of the callback!
+struct message_view {
+    std::string_view subject;
+    optional<std::string_view> reply_to;
+    headers_view_t headers;
+    std::span<const char> payload;
 };
 
 // JetStream publish acknowledgment
@@ -185,8 +197,13 @@ using on_message_cb = std::function<asio::awaitable<void>(std::string_view subje
                                                           std::optional<std::string_view> reply_to,
                                                           std::span<const char> payload)>;
 
-// Callback for messages with headers
+// Callback for messages with headers (copies data into message struct)
 using on_message_with_headers_cb = std::function<asio::awaitable<void>(const message& msg)>;
+
+// Zero-copy callback for messages with headers (references internal buffers)
+// WARNING: All data in message_view is only valid during callback execution!
+// Do not store references or pointers to the data - copy if you need to keep it.
+using on_message_zero_copy_cb = std::function<asio::awaitable<void>(const message_view& msg)>;
 
 // Forward declaration
 struct ijs_subscription;
@@ -413,6 +430,11 @@ struct iconnection {
     // Subscribe with headers support (for JetStream messages via HMSG)
     [[nodiscard]] virtual asio::awaitable<std::pair<isubscription_sptr, status>>
     subscribe(string_view subject, on_message_with_headers_cb cb, subscribe_options opts = {}) = 0;
+
+    // Zero-copy subscribe - callback receives references to internal buffers
+    // WARNING: Data is only valid during callback! Copy if you need to keep it.
+    [[nodiscard]] virtual asio::awaitable<std::pair<isubscription_sptr, status>>
+    subscribe(string_view subject, on_message_zero_copy_cb cb, subscribe_options opts = {}) = 0;
 };
 using iconnection_sptr = std::shared_ptr<iconnection>;
 
