@@ -2678,6 +2678,16 @@ private:
                         SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
 #endif
 
+            // Socket buffer tuning for throughput
+            if (conf.send_buffer_size > 0) {
+                m_socket.lowest_layer().set_option(
+                    asio::socket_base::send_buffer_size(conf.send_buffer_size));
+            }
+            if (conf.recv_buffer_size > 0) {
+                m_socket.lowest_layer().set_option(
+                    asio::socket_base::receive_buffer_size(conf.recv_buffer_size));
+            }
+
             co_await asio::async_read_until(m_socket, m_buf, std::string(protocol::crlf), use_awaitable);
 
             std::string header;

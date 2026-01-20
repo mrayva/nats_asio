@@ -260,6 +260,10 @@ struct connect_config {
     uint32_t retry_initial_delay_ms = 1000;  // Initial delay in milliseconds
     uint32_t retry_max_delay_ms = 30000;     // Maximum delay cap in milliseconds
     uint32_t retry_max_attempts = 0;         // 0 = unlimited retries
+
+    // Socket buffer tuning (0 = use system defaults)
+    uint32_t send_buffer_size = 0;     // SO_SNDBUF - send buffer size in bytes
+    uint32_t recv_buffer_size = 0;     // SO_RCVBUF - receive buffer size in bytes
 };
 
 struct iconnection {
