@@ -284,6 +284,11 @@ struct iconnection {
     // The data must be valid NATS protocol (e.g., multiple PUB commands)
     [[nodiscard]] virtual asio::awaitable<status> write_raw(std::span<const char> data) = 0;
 
+    // Write multiple buffers using scatter-gather I/O (writev)
+    // More efficient than concatenating buffers - avoids copying
+    [[nodiscard]] virtual asio::awaitable<status> write_raw_iov(
+        std::span<const std::span<const char>> buffers) = 0;
+
     // Request-reply pattern with timeout
     [[nodiscard]] virtual asio::awaitable<std::pair<message, status>> request(
         string_view subject, std::span<const char> payload,

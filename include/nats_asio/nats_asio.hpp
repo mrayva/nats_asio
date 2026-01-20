@@ -26,6 +26,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 
 #include <fmt/format.h>
 
+#ifdef __linux__
+#include <sys/socket.h>  // For SO_BUSY_POLL
+#endif
+
 #include <asio/as_tuple.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/buffer.hpp>
@@ -41,10 +45,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <asio/steady_timer.hpp>
 #include <asio/streambuf.hpp>
 #include <asio/use_awaitable.hpp>
+#include <array>
 #include <atomic>
 #include <concepts>
 #include <iomanip>
 #include <istream>
+#include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -203,6 +209,122 @@ struct buffer_pools {
     string_pool large_strings{32, 4096};    // For header serialization
     char_vector_pool payloads{32, 1024};    // For message payloads
     const_buffer_vector_pool buffer_vectors{64, 4};  // For async_write buffers
+};
+
+// ============================================================================
+// Pre-formatted PUB Template - Caches command prefix for repeated subjects
+// ============================================================================
+
+// Caches "PUB subject len\r\n" for subjects with fixed-size payloads
+// Eliminates fmt::format overhead for high-frequency publishing
+class pub_template {
+public:
+    pub_template() = default;
+
+    // Create template for subject with fixed payload size
+    pub_template(string_view subject, size_t payload_size) {
+        m_prefix = fmt::format("PUB {} {}\r\n", subject, payload_size);
+        m_payload_size = payload_size;
+    }
+
+    // Create template with reply-to for request patterns
+    pub_template(string_view subject, string_view reply_to, size_t payload_size) {
+        m_prefix = fmt::format("PUB {} {} {}\r\n", subject, reply_to, payload_size);
+        m_payload_size = payload_size;
+    }
+
+    // Get the cached prefix
+    const std::string& prefix() const { return m_prefix; }
+    string_view prefix_view() const { return m_prefix; }
+
+    // Get spans for scatter-gather write: [prefix, payload, crlf]
+    std::array<std::span<const char>, 3> get_iov(std::span<const char> payload) const {
+        return {{
+            std::span<const char>(m_prefix.data(), m_prefix.size()),
+            payload,
+            std::span<const char>("\r\n", 2)
+        }};
+    }
+
+    // Build complete message into buffer (for batching)
+    void append_to(std::string& out, std::span<const char> payload) const {
+        out += m_prefix;
+        out.append(payload.data(), payload.size());
+        out += "\r\n";
+    }
+
+    size_t payload_size() const { return m_payload_size; }
+    bool valid() const { return !m_prefix.empty(); }
+
+private:
+    std::string m_prefix;
+    size_t m_payload_size = 0;
+};
+
+// Thread-safe cache of pub_templates keyed by subject+size
+class pub_template_cache {
+public:
+    pub_template_cache(size_t max_entries = 1024) : m_max_entries(max_entries) {}
+
+    // Get or create template for subject with payload size
+    const pub_template& get(string_view subject, size_t payload_size) {
+        auto key = make_key(subject, payload_size);
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_cache.find(key);
+        if (it != m_cache.end()) {
+            return it->second;
+        }
+
+        // Evict oldest if at capacity (simple LRU would be better but adds complexity)
+        if (m_cache.size() >= m_max_entries) {
+            m_cache.erase(m_cache.begin());
+        }
+
+        auto [inserted, _] = m_cache.emplace(key, pub_template(subject, payload_size));
+        return inserted->second;
+    }
+
+    // Get or create template with reply-to
+    const pub_template& get(string_view subject, string_view reply_to, size_t payload_size) {
+        auto key = make_key_with_reply(subject, reply_to, payload_size);
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_cache.find(key);
+        if (it != m_cache.end()) {
+            return it->second;
+        }
+
+        if (m_cache.size() >= m_max_entries) {
+            m_cache.erase(m_cache.begin());
+        }
+
+        auto [inserted, _] = m_cache.emplace(key, pub_template(subject, reply_to, payload_size));
+        return inserted->second;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_cache.clear();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_cache.size();
+    }
+
+private:
+    static std::string make_key(string_view subject, size_t payload_size) {
+        return fmt::format("{}:{}", subject, payload_size);
+    }
+
+    static std::string make_key_with_reply(string_view subject, string_view reply_to, size_t payload_size) {
+        return fmt::format("{}:{}:{}", subject, reply_to, payload_size);
+    }
+
+    mutable std::mutex m_mutex;
+    std::map<std::string, pub_template> m_cache;
+    size_t m_max_entries;
 };
 
 // ============================================================================
@@ -1073,6 +1195,33 @@ public:
 
         try {
             co_await asio::async_write(m_socket, asio::buffer(data.data(), data.size()), asio::use_awaitable);
+        } catch (const std::system_error& e) {
+            co_return status(e.code().message());
+        }
+
+        co_return status();
+    }
+
+    // Write multiple buffers using scatter-gather I/O (writev)
+    virtual asio::awaitable<status> write_raw_iov(
+        std::span<const std::span<const char>> buffers) override {
+        if (!m_is_connected) {
+            co_return status("not connected");
+        }
+
+        if (buffers.empty()) {
+            co_return status();
+        }
+
+        // Convert spans to ASIO buffers for scatter-gather write
+        std::vector<asio::const_buffer> asio_buffers;
+        asio_buffers.reserve(buffers.size());
+        for (const auto& buf : buffers) {
+            asio_buffers.emplace_back(asio::buffer(buf.data(), buf.size()));
+        }
+
+        try {
+            co_await asio::async_write(m_socket, asio_buffers, asio::use_awaitable);
         } catch (const std::system_error& e) {
             co_return status(e.code().message());
         }
@@ -2520,6 +2669,14 @@ private:
 
             // Disable Nagle's algorithm for lower latency
             m_socket.lowest_layer().set_option(asio::ip::tcp::no_delay(true));
+
+#ifdef __linux__
+            // Enable busy polling for lower latency (Linux only)
+            // Spins for up to 50 microseconds before blocking
+            int busy_poll_us = 50;
+            ::setsockopt(m_socket.lowest_layer().native_handle(), SOL_SOCKET,
+                        SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
+#endif
 
             co_await asio::async_read_until(m_socket, m_buf, std::string(protocol::crlf), use_awaitable);
 
