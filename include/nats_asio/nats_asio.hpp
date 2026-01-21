@@ -48,10 +48,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <array>
 #include <atomic>
 #include <concepts>
+#include <concurrentqueue/moodycamel/concurrentqueue.h>
 #include <iomanip>
 #include <istream>
 #include <map>
-#include <mutex>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
@@ -86,17 +86,16 @@ namespace protocol {
 }
 
 // ============================================================================
-// Buffer Pool - Reduces allocations in hot paths
+// Buffer Pool - Lock-free pool using moodycamel::ConcurrentQueue
 // ============================================================================
 
-// Thread-safe buffer pool for reusing string and vector buffers
+// Lock-free buffer pool for reusing string and vector buffers
+// Uses moodycamel::ConcurrentQueue for high-performance concurrent access
 template<typename T>
 class buffer_pool {
 public:
     explicit buffer_pool(size_t initial_capacity = 32, size_t default_buffer_size = 256)
-        : m_default_size(default_buffer_size) {
-        m_pool.reserve(initial_capacity);
-    }
+        : m_pool(initial_capacity), m_default_size(default_buffer_size), m_current_size(0) {}
 
     ~buffer_pool() = default;
 
@@ -106,16 +105,15 @@ public:
 
     // Acquire a buffer from the pool (or create new if empty)
     T acquire() {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_pool.empty()) {
-            T buf;
-            if constexpr (requires { buf.reserve(m_default_size); }) {
-                buf.reserve(m_default_size);
-            }
+        T buf;
+        if (m_pool.try_dequeue(buf)) {
+            m_current_size.fetch_sub(1, std::memory_order_relaxed);
             return buf;
         }
-        T buf = std::move(m_pool.back());
-        m_pool.pop_back();
+        // Pool empty, create new buffer with reserved capacity
+        if constexpr (requires { buf.reserve(m_default_size); }) {
+            buf.reserve(m_default_size);
+        }
         return buf;
     }
 
@@ -125,17 +123,19 @@ public:
         if constexpr (requires { buf.clear(); }) {
             buf.clear();
         }
-        std::lock_guard<std::mutex> lock(m_mutex);
         // Limit pool growth to prevent unbounded memory
-        if (m_pool.size() < m_max_pool_size) {
-            m_pool.push_back(std::move(buf));
+        size_t current = m_current_size.load(std::memory_order_relaxed);
+        if (current < m_max_pool_size) {
+            if (m_pool.enqueue(std::move(buf))) {
+                m_current_size.fetch_add(1, std::memory_order_relaxed);
+            }
         }
+        // If pool is full, buffer is simply destroyed (memory returned to allocator)
     }
 
-    // Get current pool size (for diagnostics)
+    // Get approximate pool size (for diagnostics - not exact due to lock-free nature)
     size_t size() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_pool.size();
+        return m_current_size.load(std::memory_order_relaxed);
     }
 
     void set_max_pool_size(size_t max_size) {
@@ -143,9 +143,9 @@ public:
     }
 
 private:
-    mutable std::mutex m_mutex;
-    std::vector<T> m_pool;
+    moodycamel::ConcurrentQueue<T> m_pool;
     size_t m_default_size;
+    std::atomic<size_t> m_current_size;
     size_t m_max_pool_size = 1024;  // Limit to prevent unbounded growth
 };
 
