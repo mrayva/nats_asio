@@ -296,8 +296,9 @@ inline std::vector<std::string> split_string(const std::string& s, char delim) {
 
 // Apply template substitution: replace {{field}} with values from JSON object
 inline std::string apply_template(const std::string& tpl, const nlohmann::json& obj) {
+    // Static regex - compiled once, reused on every call (significant speedup)
+    static const std::regex field_regex(R"(\{\{(\w+)\}\})");
     std::string result = tpl;
-    std::regex field_regex(R"(\{\{(\w+)\}\})");
     std::smatch match;
     std::string::const_iterator search_start(result.cbegin());
 
