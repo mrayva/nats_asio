@@ -57,6 +57,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <simdjson.h>
 #include <sstream>
 #include <string>
 #include <stringzilla/stringzilla.hpp>
@@ -108,6 +109,122 @@ inline T parse_int_or(string_view sv, T default_val) {
     T result;
     return parse_int(sv, result) ? result : default_val;
 }
+
+// ============================================================================
+// Fast JSON Parsing - Uses simdjson (~10x faster than nlohmann::json)
+// ============================================================================
+
+// Thread-local simdjson parser for parsing server responses
+// simdjson is ~10x faster than nlohmann::json for parsing
+class fast_json {
+public:
+    // Parse JSON from string_view, returns true on success
+    bool parse(string_view sv) {
+        m_padded = simdjson::padded_string(sv.data(), sv.size());
+        auto result = m_parser.parse(m_padded);
+        if (result.error()) {
+            m_error = simdjson::error_message(result.error());
+            return false;
+        }
+        m_doc = std::move(result.value());
+        m_error.clear();
+        return true;
+    }
+
+    // Get string value at path (returns empty on error)
+    std::string_view get_string(std::string_view key) const {
+        auto result = m_doc[key].get_string();
+        return result.error() ? std::string_view{} : result.value();
+    }
+
+    // Get nested string value (e.g., "config", "deliver_subject")
+    std::string_view get_string(std::string_view key1, std::string_view key2) const {
+        auto obj = m_doc[key1];
+        if (obj.error()) return {};
+        auto result = obj[key2].get_string();
+        return result.error() ? std::string_view{} : result.value();
+    }
+
+    // Get int64 value (returns default_val on error)
+    int64_t get_int(std::string_view key, int64_t default_val = 0) const {
+        auto result = m_doc[key].get_int64();
+        return result.error() ? default_val : result.value();
+    }
+
+    // Get nested int64 value
+    int64_t get_int(std::string_view key1, std::string_view key2, int64_t default_val = 0) const {
+        auto obj = m_doc[key1];
+        if (obj.error()) return default_val;
+        auto result = obj[key2].get_int64();
+        return result.error() ? default_val : result.value();
+    }
+
+    // Get uint64 value (returns default_val on error)
+    uint64_t get_uint(std::string_view key, uint64_t default_val = 0) const {
+        auto result = m_doc[key].get_uint64();
+        return result.error() ? default_val : result.value();
+    }
+
+    // Get nested uint64 value
+    uint64_t get_uint(std::string_view key1, std::string_view key2, uint64_t default_val = 0) const {
+        auto obj = m_doc[key1];
+        if (obj.error()) return default_val;
+        auto result = obj[key2].get_uint64();
+        return result.error() ? default_val : result.value();
+    }
+
+    // Get bool value (returns default_val on error)
+    bool get_bool(std::string_view key, bool default_val = false) const {
+        auto result = m_doc[key].get_bool();
+        return result.error() ? default_val : result.value();
+    }
+
+    // Check if key exists
+    bool contains(std::string_view key) const {
+        return !m_doc[key].error();
+    }
+
+    // Check if nested key exists
+    bool contains(std::string_view key1, std::string_view key2) const {
+        auto obj = m_doc[key1];
+        if (obj.error()) return false;
+        return !obj[key2].error();
+    }
+
+    // Get error description from last failed "error" field
+    std::string_view get_error_description() const {
+        auto err = m_doc["error"];
+        if (err.error()) return {};
+        auto desc = err["description"].get_string();
+        return desc.error() ? std::string_view{} : desc.value();
+    }
+
+    // Get raw document for complex access patterns
+    const simdjson::dom::element& doc() const { return m_doc; }
+
+    // Get parse error message
+    const std::string& error() const { return m_error; }
+
+    // Iterate over array of strings (e.g., for keys list)
+    template<typename Func>
+    bool for_each_string_in_array(std::string_view key, Func&& func) const {
+        auto arr = m_doc[key].get_array();
+        if (arr.error()) return false;
+        for (auto elem : arr.value()) {
+            auto str = elem.get_string();
+            if (!str.error()) {
+                func(str.value());
+            }
+        }
+        return true;
+    }
+
+private:
+    simdjson::dom::parser m_parser;
+    simdjson::dom::element m_doc;
+    simdjson::padded_string m_padded;
+    std::string m_error;
+};
 
 // ============================================================================
 // Buffer Pool - Lock-free pool using moodycamel::ConcurrentQueue
@@ -1662,33 +1779,28 @@ private:
             co_return std::pair<js_pub_ack, status>{{}, req_status};
         }
 
-        // Parse JetStream pub ack from response
+        // Parse JetStream pub ack from response using simdjson
         js_pub_ack ack;
-        try {
-            using nlohmann::json;
-            std::string payload_str(response.payload.begin(), response.payload.end());
-            auto j = json::parse(payload_str);
+        fast_json parser;
+        string_view payload_sv(response.payload.data(), response.payload.size());
 
-            if (j.contains("error")) {
-                auto err_msg = j["error"].value("description", "unknown JetStream error");
-                co_return std::pair<js_pub_ack, status>{{}, status(err_msg)};
-            }
-
-            if (j.contains("stream")) {
-                ack.stream = j["stream"].get<std::string>();
-            }
-            if (j.contains("seq")) {
-                ack.sequence = j["seq"].get<uint64_t>();
-            }
-            if (j.contains("domain")) {
-                ack.domain = j["domain"].get<std::string>();
-            }
-            if (j.contains("duplicate")) {
-                ack.duplicate = j["duplicate"].get<bool>();
-            }
-        } catch (const std::exception& e) {
-            co_return std::pair<js_pub_ack, status>{{}, status(fmt::format("failed to parse pub ack: {}", e.what()))};
+        if (!parser.parse(payload_sv)) {
+            co_return std::pair<js_pub_ack, status>{{}, status(fmt::format("failed to parse pub ack: {}", parser.error()))};
         }
+
+        if (parser.contains("error")) {
+            auto err_desc = parser.get_error_description();
+            co_return std::pair<js_pub_ack, status>{{}, status(err_desc.empty() ? "unknown JetStream error" : std::string(err_desc))};
+        }
+
+        if (parser.contains("stream")) {
+            ack.stream = std::string(parser.get_string("stream"));
+        }
+        ack.sequence = parser.get_uint("seq", 0);
+        if (parser.contains("domain")) {
+            ack.domain = std::string(parser.get_string("domain"));
+        }
+        ack.duplicate = parser.get_bool("duplicate", false);
 
         co_return std::pair<js_pub_ack, status>{std::move(ack), status()};
     }
@@ -1753,41 +1865,35 @@ private:
             co_return std::pair<nats_asio::js_consumer_info, status>{{}, req_status};
         }
 
-        // Parse response
+        // Parse response using simdjson
         nats_asio::js_consumer_info info;
-        try {
-            std::string resp_str(response.payload.begin(), response.payload.end());
-            auto j = json::parse(resp_str);
+        fast_json parser;
+        string_view resp_sv(response.payload.data(), response.payload.size());
 
-            if (j.contains("error")) {
-                auto err_msg = j["error"].value("description", "unknown JetStream error");
-                auto err_code = j["error"].value("err_code", 0);
-                co_return std::pair<nats_asio::js_consumer_info, status>{
-                    {}, status(fmt::format("{} (code: {})", err_msg, err_code))};
-            }
-
-            info.stream = j.value("stream_name", config.stream);
-            info.name = j.value("name", config.durable_name.value_or(""));
-            if (j.contains("config")) {
-                info.deliver_subject = j["config"].value("deliver_subject", deliver_subject);
-            }
-            if (j.contains("delivered")) {
-                info.delivered_stream_seq = j["delivered"].value("stream_seq", 0);
-                info.delivered_consumer_seq = j["delivered"].value("consumer_seq", 0);
-            }
-            if (j.contains("num_pending")) {
-                info.num_pending = j["num_pending"].get<uint64_t>();
-            }
-            if (j.contains("num_ack_pending")) {
-                info.num_ack_pending = j["num_ack_pending"].get<uint64_t>();
-            }
-            if (j.contains("num_redelivered")) {
-                info.num_redelivered = j["num_redelivered"].get<uint64_t>();
-            }
-        } catch (const std::exception& e) {
+        if (!parser.parse(resp_sv)) {
             co_return std::pair<nats_asio::js_consumer_info, status>{
-                {}, status(fmt::format("failed to parse consumer info: {}", e.what()))};
+                {}, status(fmt::format("failed to parse consumer info: {}", parser.error()))};
         }
+
+        if (parser.contains("error")) {
+            auto err_desc = parser.get_error_description();
+            auto err_code = parser.get_int("error", "err_code", 0);
+            co_return std::pair<nats_asio::js_consumer_info, status>{
+                {}, status(fmt::format("{} (code: {})",
+                    err_desc.empty() ? "unknown JetStream error" : std::string(err_desc), err_code))};
+        }
+
+        auto stream_name = parser.get_string("stream_name");
+        info.stream = stream_name.empty() ? config.stream : std::string(stream_name);
+        auto name = parser.get_string("name");
+        info.name = name.empty() ? config.durable_name.value_or("") : std::string(name);
+        auto deliver_subj = parser.get_string("config", "deliver_subject");
+        info.deliver_subject = deliver_subj.empty() ? deliver_subject : std::string(deliver_subj);
+        info.delivered_stream_seq = parser.get_uint("delivered", "stream_seq", 0);
+        info.delivered_consumer_seq = parser.get_uint("delivered", "consumer_seq", 0);
+        info.num_pending = parser.get_uint("num_pending", 0);
+        info.num_ack_pending = parser.get_uint("num_ack_pending", 0);
+        info.num_redelivered = parser.get_uint("num_redelivered", 0);
 
         co_return std::pair<nats_asio::js_consumer_info, status>{std::move(info), status()};
     }
@@ -1962,8 +2068,6 @@ private:
             co_return std::pair<nats_asio::js_consumer_info, status>{{}, status(error_code::not_connected)};
         }
 
-        using nlohmann::json;
-
         std::string api_subject = fmt::format("$JS.API.CONSUMER.INFO.{}.{}", stream, consumer);
         auto [response, req_status] = co_await request_impl(api_subject, {}, {}, std::chrono::seconds(5));
 
@@ -1971,32 +2075,32 @@ private:
             co_return std::pair<nats_asio::js_consumer_info, status>{{}, req_status};
         }
 
+        // Parse response using simdjson
         nats_asio::js_consumer_info info;
-        try {
-            std::string resp_str(response.payload.begin(), response.payload.end());
-            auto j = json::parse(resp_str);
+        fast_json parser;
+        string_view resp_sv(response.payload.data(), response.payload.size());
 
-            if (j.contains("error")) {
-                auto err_msg = j["error"].value("description", "unknown JetStream error");
-                co_return std::pair<nats_asio::js_consumer_info, status>{{}, status(err_msg)};
-            }
-
-            info.stream = j.value("stream_name", std::string(stream));
-            info.name = j.value("name", std::string(consumer));
-            if (j.contains("config")) {
-                info.deliver_subject = j["config"].value("deliver_subject", "");
-            }
-            if (j.contains("delivered")) {
-                info.delivered_stream_seq = j["delivered"].value("stream_seq", 0);
-                info.delivered_consumer_seq = j["delivered"].value("consumer_seq", 0);
-            }
-            info.num_pending = j.value("num_pending", 0);
-            info.num_ack_pending = j.value("num_ack_pending", 0);
-            info.num_redelivered = j.value("num_redelivered", 0);
-        } catch (const std::exception& e) {
+        if (!parser.parse(resp_sv)) {
             co_return std::pair<nats_asio::js_consumer_info, status>{
-                {}, status(fmt::format("failed to parse consumer info: {}", e.what()))};
+                {}, status(fmt::format("failed to parse consumer info: {}", parser.error()))};
         }
+
+        if (parser.contains("error")) {
+            auto err_desc = parser.get_error_description();
+            co_return std::pair<nats_asio::js_consumer_info, status>{
+                {}, status(err_desc.empty() ? "unknown JetStream error" : std::string(err_desc))};
+        }
+
+        auto stream_name = parser.get_string("stream_name");
+        info.stream = stream_name.empty() ? std::string(stream) : std::string(stream_name);
+        auto name = parser.get_string("name");
+        info.name = name.empty() ? std::string(consumer) : std::string(name);
+        info.deliver_subject = std::string(parser.get_string("config", "deliver_subject"));
+        info.delivered_stream_seq = parser.get_uint("delivered", "stream_seq", 0);
+        info.delivered_consumer_seq = parser.get_uint("delivered", "consumer_seq", 0);
+        info.num_pending = parser.get_uint("num_pending", 0);
+        info.num_ack_pending = parser.get_uint("num_ack_pending", 0);
+        info.num_redelivered = parser.get_uint("num_redelivered", 0);
 
         co_return std::pair<nats_asio::js_consumer_info, status>{std::move(info), status()};
     }
@@ -2007,8 +2111,6 @@ private:
             co_return status(error_code::not_connected);
         }
 
-        using nlohmann::json;
-
         std::string api_subject = fmt::format("$JS.API.CONSUMER.DELETE.{}.{}", stream, consumer);
         auto [response, req_status] = co_await request_impl(api_subject, {}, {}, std::chrono::seconds(5));
 
@@ -2016,20 +2118,21 @@ private:
             co_return req_status;
         }
 
-        try {
-            std::string resp_str(response.payload.begin(), response.payload.end());
-            auto j = json::parse(resp_str);
+        // Parse response using simdjson
+        fast_json parser;
+        string_view resp_sv(response.payload.data(), response.payload.size());
 
-            if (j.contains("error")) {
-                auto err_msg = j["error"].value("description", "unknown JetStream error");
-                co_return status(err_msg);
-            }
+        if (!parser.parse(resp_sv)) {
+            co_return status(fmt::format("failed to parse delete response: {}", parser.error()));
+        }
 
-            if (!j.value("success", false)) {
-                co_return status(error_code::operation_failed, "consumer deletion failed");
-            }
-        } catch (const std::exception& e) {
-            co_return status(fmt::format("failed to parse delete response: {}", e.what()));
+        if (parser.contains("error")) {
+            auto err_desc = parser.get_error_description();
+            co_return status(err_desc.empty() ? "unknown JetStream error" : std::string(err_desc));
+        }
+
+        if (!parser.get_bool("success", false)) {
+            co_return status(error_code::operation_failed, "consumer deletion failed");
         }
 
         co_return status();
@@ -2306,16 +2409,14 @@ private:
             co_return std::pair<std::vector<std::string>, status>{{}, status(error_code::not_connected)};
         }
 
-        using nlohmann::json;
-
         // Stream name for KV bucket: KV_{bucket}
         std::string stream_name = fmt::format("KV_{}", bucket);
 
         // Use stream info API with subjects filter: $JS.API.STREAM.INFO.{stream}
         std::string api_subject = fmt::format("$JS.API.STREAM.INFO.{}", stream_name);
 
-        // Request body with subjects filter to get all subjects
-        json req;
+        // Request body with subjects filter to get all subjects (use nlohmann for building)
+        nlohmann::json req;
         req["subjects_filter"] = fmt::format("$KV.{}.>", bucket);
 
         auto payload_str = req.dump();
@@ -2327,35 +2428,39 @@ private:
             co_return std::pair<std::vector<std::string>, status>{{}, req_status};
         }
 
-        // Parse response
+        // Parse response using simdjson
         std::vector<std::string> keys;
-        try {
-            std::string response_str(response.payload.begin(), response.payload.end());
-            auto j = json::parse(response_str);
+        fast_json parser;
+        string_view resp_sv(response.payload.data(), response.payload.size());
 
-            // Check for error
-            if (j.contains("error")) {
-                std::string err_msg = "stream info failed";
-                if (j["error"].contains("description")) {
-                    err_msg = j["error"]["description"].get<std::string>();
-                }
-                co_return std::pair<std::vector<std::string>, status>{{}, status(err_msg)};
-            }
+        if (!parser.parse(resp_sv)) {
+            co_return std::pair<std::vector<std::string>, status>{{}, status(fmt::format("failed to parse response: {}", parser.error()))};
+        }
 
-            // Extract keys from state.subjects map
-            // Format: { "state": { "subjects": { "$KV.bucket.key1": 1, "$KV.bucket.key2": 1, ... } } }
-            if (j.contains("state") && j["state"].contains("subjects")) {
-                std::string prefix = fmt::format("$KV.{}.", bucket);
-                for (auto& [subject, count] : j["state"]["subjects"].items()) {
-                    // Strip the $KV.bucket. prefix to get the key name
-                    if (subject.size() > prefix.size() && subject.substr(0, prefix.size()) == prefix) {
-                        keys.push_back(subject.substr(prefix.size()));
+        // Check for error
+        if (parser.contains("error")) {
+            auto err_desc = parser.get_error_description();
+            co_return std::pair<std::vector<std::string>, status>{{}, status(err_desc.empty() ? "stream info failed" : std::string(err_desc))};
+        }
+
+        // Extract keys from state.subjects map
+        // Format: { "state": { "subjects": { "$KV.bucket.key1": 1, "$KV.bucket.key2": 1, ... } } }
+        std::string prefix = fmt::format("$KV.{}.", bucket);
+        auto state = parser.doc()["state"];
+        if (!state.error()) {
+            auto subjects = state["subjects"];
+            if (!subjects.error()) {
+                auto obj = subjects.get_object();
+                if (!obj.error()) {
+                    for (auto [subject_key, count] : obj.value()) {
+                        std::string_view subject(subject_key);
+                        // Strip the $KV.bucket. prefix to get the key name
+                        if (subject.size() > prefix.size() && subject.substr(0, prefix.size()) == prefix) {
+                            keys.emplace_back(subject.substr(prefix.size()));
+                        }
                     }
                 }
             }
-
-        } catch (const json::exception& e) {
-            co_return std::pair<std::vector<std::string>, status>{{}, status(fmt::format("failed to parse response: {}", e.what()))};
         }
 
         co_return std::pair<std::vector<std::string>, status>{std::move(keys), status()};
@@ -2638,18 +2743,13 @@ private:
     }
 
     awaitable<void> on_info(string_view info) override {
-        using nlohmann::json;
-        std::string err_msg;
-        try {
-            auto j = json::parse(info);
-            if (j.contains("max_payload") && j["max_payload"].is_number()) {
-                m_max_payload = j["max_payload"].get<std::size_t>();
+        fast_json parser;
+        if (parser.parse(info)) {
+            if (parser.contains("max_payload")) {
+                m_max_payload = parser.get_uint("max_payload", m_max_payload);
             }
-        } catch (const json::exception& e) {
-            err_msg = fmt::format("failed to parse INFO from server: {}", e.what());
-        }
-
-        if (!err_msg.empty()) {
+        } else {
+            std::string err_msg = fmt::format("failed to parse INFO from server: {}", parser.error());
             co_await on_error(err_msg);
         }
         co_return;

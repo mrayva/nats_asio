@@ -38,8 +38,9 @@ endif()
 
 find_package(fmt CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(simdjson CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
-find_package(asio CONFIG REQUIRED) 
+find_package(asio CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 add_library(nats_asio INTERFACE)
@@ -62,12 +63,13 @@ target_include_directories(nats_asio
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(nats_asio 
+target_link_libraries(nats_asio
     INTERFACE
         fmt::fmt
         nlohmann_json::nlohmann_json
+        simdjson::simdjson
         spdlog::spdlog
-        asio::asio 
+        asio::asio
         OpenSSL::SSL
 )
 
