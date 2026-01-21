@@ -51,6 +51,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <concurrentqueue/moodycamel/concurrentqueue.h>
 #include <iomanip>
 #include <istream>
+#include <magic_enum/magic_enum.hpp>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -1160,36 +1161,30 @@ inline js_message parse_js_message_metadata(const message& msg) {
     return js_msg;
 }
 
-// Helper to convert ack_policy enum to string
+// Helper to convert enum to string using magic_enum
+// Strips trailing underscore for C++ keyword workarounds (explicit_, new_)
+template<typename E>
+inline std::string enum_to_nats_string(E value) {
+    auto name = magic_enum::enum_name(value);
+    std::string result(name);
+    // Strip trailing underscore (used for C++ keywords like explicit_, new_)
+    if (!result.empty() && result.back() == '_') {
+        result.pop_back();
+    }
+    return result;
+}
+
+// Convenience aliases for JetStream enums
 inline std::string js_ack_policy_to_string(js_ack_policy policy) {
-    switch (policy) {
-        case js_ack_policy::none: return "none";
-        case js_ack_policy::all: return "all";
-        case js_ack_policy::explicit_: return "explicit";
-    }
-    return "explicit";
+    return enum_to_nats_string(policy);
 }
 
-// Helper to convert replay_policy enum to string
 inline std::string js_replay_policy_to_string(js_replay_policy policy) {
-    switch (policy) {
-        case js_replay_policy::instant: return "instant";
-        case js_replay_policy::original: return "original";
-    }
-    return "instant";
+    return enum_to_nats_string(policy);
 }
 
-// Helper to convert deliver_policy enum to string
 inline std::string js_deliver_policy_to_string(js_deliver_policy policy) {
-    switch (policy) {
-        case js_deliver_policy::all: return "all";
-        case js_deliver_policy::last: return "last";
-        case js_deliver_policy::new_: return "new";
-        case js_deliver_policy::by_start_sequence: return "by_start_sequence";
-        case js_deliver_policy::by_start_time: return "by_start_time";
-        case js_deliver_policy::last_per_subject: return "last_per_subject";
-    }
-    return "all";
+    return enum_to_nats_string(policy);
 }
 
 template <class SocketType>
