@@ -268,17 +268,29 @@ struct input_config {
     std::vector<std::string> csv_headers;  // Header names for CSV input
 };
 
-// Helper to split string by delimiter
+// Helper to split string by delimiter using StringZilla (SIMD-accelerated)
 inline std::vector<std::string> split_string(const std::string& s, char delim) {
+    namespace sz = ashvardanian::stringzilla;
     std::vector<std::string> result;
-    std::istringstream iss(s);
-    std::string item;
-    while (std::getline(iss, item, delim)) {
+
+    sz::string_view sz_str(s.data(), s.size());
+    char delim_str[2] = {delim, '\0'};
+    sz::string_view sz_delim(delim_str, 1);
+
+    // Use StringZilla's SIMD-accelerated split - returns iterable range
+    for (auto part : sz_str.split(sz_delim)) {
         // Trim whitespace
-        while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.erase(0, 1);
-        while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.pop_back();
-        if (!item.empty()) result.push_back(item);
+        while (!part.empty() && (part.front() == ' ' || part.front() == '\t')) {
+            part = part.substr(1);
+        }
+        while (!part.empty() && (part.back() == ' ' || part.back() == '\t')) {
+            part = part.substr(0, part.size() - 1);
+        }
+        if (!part.empty()) {
+            result.emplace_back(part.data(), part.size());
+        }
     }
+
     return result;
 }
 

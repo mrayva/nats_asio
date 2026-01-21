@@ -55,6 +55,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
+#include <stringzilla/stringzilla.hpp>
 #include <utility>
 
 #include "interface.hpp"
@@ -362,67 +363,80 @@ inline void serialize_headers_to(std::string& out, const headers_t& headers) {
     out += "\r\n";
 }
 
-// Parse headers from NATS format
+// Parse headers from NATS format using StringZilla for SIMD-accelerated search
 inline headers_t parse_headers(string_view data) {
+    namespace sz = ashvardanian::stringzilla;
     headers_t headers;
 
+    sz::string_view sz_data(data.data(), data.size());
+    constexpr sz::string_view crlf("\r\n", 2);
+    constexpr char colon = ':';
+
     // Skip "NATS/1.0\r\n" prefix
-    auto pos = data.find("\r\n");
-    if (pos == string_view::npos) return headers;
-    data = data.substr(pos + 2);
+    auto pos = sz_data.find(crlf);
+    if (pos == sz::string_view::npos) return headers;
+    sz_data = sz_data.substr(pos + 2);
 
     // Parse each header line until empty line
-    while (!data.empty() && data != "\r\n") {
-        pos = data.find("\r\n");
-        if (pos == string_view::npos) break;
+    while (!sz_data.empty() && sz_data != crlf) {
+        pos = sz_data.find(crlf);
+        if (pos == sz::string_view::npos) break;
 
-        auto line = data.substr(0, pos);
-        data = data.substr(pos + 2);
+        auto line = sz_data.substr(0, pos);
+        sz_data = sz_data.substr(pos + 2);
 
         if (line.empty()) break;  // Empty line = end of headers
 
-        auto colon = line.find(':');
-        if (colon != string_view::npos) {
-            auto key = line.substr(0, colon);
-            auto value = line.substr(colon + 1);
+        auto colon_pos = line.find(colon);
+        if (colon_pos != sz::string_view::npos) {
+            auto key = line.substr(0, colon_pos);
+            auto value = line.substr(colon_pos + 1);
             // Trim leading space from value
             if (!value.empty() && value[0] == ' ') {
                 value = value.substr(1);
             }
-            headers.emplace_back(std::string(key), std::string(value));
+            headers.emplace_back(std::string(key.data(), key.size()),
+                                 std::string(value.data(), value.size()));
         }
     }
     return headers;
 }
 
-// Parse headers without copying - returns string_views into original data
+// Parse headers without copying using StringZilla - returns string_views into original data
 // WARNING: Returned views are only valid as long as the input data is valid!
 inline headers_view_t parse_headers_view(string_view data) {
+    namespace sz = ashvardanian::stringzilla;
     headers_view_t headers;
 
+    sz::string_view sz_data(data.data(), data.size());
+    constexpr sz::string_view crlf("\r\n", 2);
+    constexpr char colon = ':';
+
     // Skip "NATS/1.0\r\n" prefix
-    auto pos = data.find("\r\n");
-    if (pos == string_view::npos) return headers;
-    data = data.substr(pos + 2);
+    auto pos = sz_data.find(crlf);
+    if (pos == sz::string_view::npos) return headers;
+    sz_data = sz_data.substr(pos + 2);
 
     // Parse each header line until empty line
-    while (!data.empty() && data != "\r\n") {
-        pos = data.find("\r\n");
-        if (pos == string_view::npos) break;
+    while (!sz_data.empty() && sz_data != crlf) {
+        pos = sz_data.find(crlf);
+        if (pos == sz::string_view::npos) break;
 
-        auto line = data.substr(0, pos);
-        data = data.substr(pos + 2);
+        auto line = sz_data.substr(0, pos);
+        sz_data = sz_data.substr(pos + 2);
 
         if (line.empty()) break;
 
-        auto colon = line.find(':');
-        if (colon != string_view::npos) {
-            auto key = line.substr(0, colon);
-            auto value = line.substr(colon + 1);
+        auto colon_pos = line.find(colon);
+        if (colon_pos != sz::string_view::npos) {
+            auto key = line.substr(0, colon_pos);
+            auto value = line.substr(colon_pos + 1);
             if (!value.empty() && value[0] == ' ') {
                 value = value.substr(1);
             }
-            headers.emplace_back(key, value);  // No string copies!
+            // Convert sz::string_view to std::string_view
+            headers.emplace_back(string_view(key.data(), key.size()),
+                                 string_view(value.data(), value.size()));
         }
     }
     return headers;
@@ -827,16 +841,19 @@ struct protocol_parser {
         co_return status("unknown message");
     }
 
+    // SIMD-accelerated string splitting using StringZilla
     static std::vector<string_view> split_sv(string_view str, string_view delims = " ") {
         std::vector<string_view> output;
         output.reserve(4); // Typical NATS headers have 3-4 tokens
 
-        for (auto first = str.data(), second = str.data(), last = first + str.size();
-             second != last && first != last; first = second + 1) {
-            second = std::find_first_of(first, last, std::cbegin(delims), std::cend(delims));
+        namespace sz = ashvardanian::stringzilla;
+        sz::string_view sz_str(str.data(), str.size());
+        sz::string_view sz_delim(delims.data(), delims.size());
 
-            if (first != second) {
-                output.emplace_back(first, second - first);
+        // Use StringZilla's SIMD-accelerated split - returns iterable range
+        for (auto part : sz_str.split(sz_delim)) {
+            if (!part.empty()) {
+                output.emplace_back(part.data(), part.size());
             }
         }
 

@@ -9,6 +9,7 @@
 	"nlohmann-json",
     "simdjson",
 	"spdlog",
+    "stringzilla",
     "asio",
     "openssl",
     "zstd",
