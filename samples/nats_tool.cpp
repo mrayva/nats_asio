@@ -9,13 +9,11 @@
 #include <asio/detached.hpp>
 #include <asio/posix/stream_descriptor.hpp>
 #include <asio/read_until.hpp>
-#include <condition_variable>
+#include <concurrentqueue/moodycamel/blockingconcurrentqueue.h>
 #include <fstream>
 #include <future>
 #include <iostream>
-#include <mutex>
 #include <nats_asio/nats_asio.hpp>
-#include <queue>
 #include <thread>
 #include <tuple>
 #include <unistd.h>
@@ -1462,77 +1460,69 @@ private:
     std::size_t m_next_conn = 0;
 };
 
-// Thread-safe batch queue
+// Batch item for queue
 struct batch_item {
     std::string data;
     std::size_t msg_count;
 };
 
+// High-performance lock-free batch queue using moodycamel::BlockingConcurrentQueue
 class batch_queue {
 public:
+    batch_queue() : m_queue(1024) {}  // Pre-allocate for 1024 items
+
     void set_max_size(std::size_t max_size) {
         m_max_size = max_size;
     }
 
     // Returns true if pushed, false if queue is full (when max_size set)
     bool push(batch_item item, std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
-        std::unique_lock<std::mutex> lock(m_mutex);
-
-        // Wait if queue is full
-        if (m_max_size > 0) {
-            if (!m_cv_full.wait_for(lock, timeout, [this] { return m_queue.size() < m_max_size || m_done; })) {
-                return false;  // timeout, queue full
+        // Check size limit (approximate, lock-free check)
+        if (m_max_size > 0 && m_size.load(std::memory_order_relaxed) >= m_max_size) {
+            // Wait for space with timeout
+            auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (m_size.load(std::memory_order_relaxed) >= m_max_size) {
+                if (std::chrono::steady_clock::now() >= deadline || m_done.load(std::memory_order_relaxed)) {
+                    return false;
+                }
+                std::this_thread::yield();
             }
         }
 
-        m_queue.push(std::move(item));
-        lock.unlock();
-        m_cv.notify_one();
-        return true;
+        if (m_queue.enqueue(std::move(item))) {
+            m_size.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
     }
 
     bool pop(batch_item& item, std::chrono::milliseconds timeout) {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        if (!m_cv.wait_for(lock, timeout, [this] { return !m_queue.empty() || m_done; })) {
-            return false;  // timeout
+        if (m_queue.wait_dequeue_timed(item, timeout)) {
+            m_size.fetch_sub(1, std::memory_order_relaxed);
+            return true;
         }
-        if (m_queue.empty()) {
-            return false;  // done signal
-        }
-        item = std::move(m_queue.front());
-        m_queue.pop();
-
-        // Notify producer that space is available
-        lock.unlock();
-        m_cv_full.notify_one();
-        return true;
+        return false;
     }
 
     void set_done() {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_done = true;
-        }
-        m_cv.notify_all();
-        m_cv_full.notify_all();
+        m_done.store(true, std::memory_order_release);
+        // Enqueue a sentinel to wake up waiting consumers
+        m_queue.enqueue(batch_item{"", 0});
     }
 
     bool is_done() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_done && m_queue.empty();
+        return m_done.load(std::memory_order_acquire) &&
+               m_size.load(std::memory_order_relaxed) == 0;
     }
 
     std::size_t size() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_queue.size();
+        return m_size.load(std::memory_order_relaxed);
     }
 
 private:
-    std::queue<batch_item> m_queue;
-    mutable std::mutex m_mutex;
-    std::condition_variable m_cv;
-    std::condition_variable m_cv_full;
-    bool m_done = false;
+    moodycamel::BlockingConcurrentQueue<batch_item> m_queue;
+    std::atomic<std::size_t> m_size{0};
+    std::atomic<bool> m_done{false};
     std::size_t m_max_size = 0;  // 0 = unlimited
 };
 
@@ -1738,6 +1728,12 @@ private:
         while (m_running || !m_queue.is_done()) {
             batch_item item;
             if (!m_queue.pop(item, std::chrono::milliseconds(100))) {
+                if (m_queue.is_done()) break;
+                continue;
+            }
+
+            // Skip sentinel items (used to wake up consumers on shutdown)
+            if (item.msg_count == 0 && item.data.empty()) {
                 if (m_queue.is_done()) break;
                 continue;
             }
