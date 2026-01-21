@@ -741,22 +741,22 @@ struct protocol_parser {
     static asio::awaitable<status> parse_header(std::string& header, std::istream& is,
                                                 parser_observer& observer) {
         if (!std::getline(is, header)) {
-            co_return status("can't get line");
+            co_return status(error_code::protocol_error);
         }
 
         if (header.size() < 3) {
-            co_return status("too small header");
+            co_return status(error_code::invalid_header);
         }
 
         if (header.back() != '\r') {
-            co_return status("unexpected len of server message");
+            co_return status(error_code::protocol_error);
         }
 
         header.pop_back();
         auto v = string_view(header);
 
         if (v.empty()) {
-            co_return status("protocol violation from server");
+            co_return status(error_code::protocol_error);
         }
 
         switch (v[0]) {
@@ -767,7 +767,7 @@ struct protocol_parser {
 
                     // HMSG subject sid [reply] hdr_len total_len
                     if (results.size() < 4 || results.size() > 5) {
-                        co_return status("unexpected HMSG format");
+                        co_return status(error_code::invalid_message);
                     }
 
                     bool has_reply = results.size() == 5;
@@ -777,7 +777,7 @@ struct protocol_parser {
 
                     if (!parse_int(results[hdr_idx], hdr_len) ||
                         !parse_int(results[total_idx], total_len)) {
-                        co_return status("can't parse HMSG lengths");
+                        co_return status(error_code::parse_error);
                     }
 
                     if (has_reply) {
@@ -797,7 +797,7 @@ struct protocol_parser {
                     auto results = split_sv(info, protocol::delim);
 
                     if (results.size() < 3 || results.size() > 4) {
-                        co_return status("unexpected message format");
+                        co_return status(error_code::invalid_message);
                     }
 
                     bool reply_to = results.size() == 4;
@@ -805,7 +805,7 @@ struct protocol_parser {
                     std::size_t bytes_n = 0;
 
                     if (!parse_int(results[bytes_id], bytes_n)) {
-                        co_return status("can't parse MSG payload length");
+                        co_return status(error_code::parse_error);
                     }
 
                     if (reply_to) {
@@ -854,7 +854,7 @@ struct protocol_parser {
                 break;
         }
 
-        co_return status("unknown message");
+        co_return status(error_code::invalid_message);
     }
 
     // SIMD-accelerated string splitting using StringZilla
@@ -1237,11 +1237,11 @@ public:
     virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                             optional<string_view> reply_to) override {
         if (!m_is_connected) {
-            co_return status("not connected");
+            co_return status(error_code::not_connected);
         }
 
         if (m_max_payload > 0 && payload.size() > m_max_payload) {
-            co_return status("message size exceeds server limit");
+            co_return status(error_code::message_too_large);
         }
 
         // Use pooled buffers to reduce allocations
@@ -1270,7 +1270,7 @@ public:
     // Write pre-formatted NATS protocol data directly
     virtual asio::awaitable<status> write_raw(std::span<const char> data) override {
         if (!m_is_connected) {
-            co_return status("not connected");
+            co_return status(error_code::not_connected);
         }
 
         try {
@@ -1286,7 +1286,7 @@ public:
     virtual asio::awaitable<status> write_raw_iov(
         std::span<const std::span<const char>> buffers) override {
         if (!m_is_connected) {
-            co_return status("not connected");
+            co_return status(error_code::not_connected);
         }
 
         if (buffers.empty()) {
@@ -1317,7 +1317,7 @@ public:
     subscribe(string_view subject, on_message_cb cb, subscribe_options opts = {}) override {
         if (!m_is_connected) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
-                                                            status("not connected")};
+                                                            status(error_code::not_connected)};
         }
 
         auto sid = next_sid();
@@ -1343,7 +1343,7 @@ public:
     subscribe(string_view subject, on_message_with_headers_cb cb, subscribe_options opts = {}) override {
         if (!m_is_connected) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
-                                                            status("not connected")};
+                                                            status(error_code::not_connected)};
         }
 
         auto sid = next_sid();
@@ -1369,7 +1369,7 @@ public:
     subscribe(string_view subject, on_message_zero_copy_cb cb, subscribe_options opts = {}) override {
         if (!m_is_connected) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
-                                                            status("not connected")};
+                                                            status(error_code::not_connected)};
         }
 
         auto sid = next_sid();
@@ -1395,7 +1395,7 @@ public:
                                             const headers_t& headers,
                                             optional<string_view> reply_to = {}) override {
         if (!m_is_connected) {
-            co_return status("not connected");
+            co_return status(error_code::not_connected);
         }
 
         // Use pooled buffers
@@ -1405,7 +1405,7 @@ public:
         std::size_t total_len = hdr_len + payload.size();
 
         if (m_max_payload > 0 && total_len > m_max_payload) {
-            co_return status("message size exceeds server limit");
+            co_return status(error_code::message_too_large);
         }
 
         pooled_const_buffer_vector buffers(m_pools.buffer_vectors);
@@ -1576,7 +1576,7 @@ private:
         const headers_t& headers, std::chrono::milliseconds timeout) {
 
         if (!m_is_connected) {
-            co_return std::pair<message, status>{{}, status("not connected")};
+            co_return std::pair<message, status>{{}, status(error_code::not_connected)};
         }
 
         // Generate unique inbox
@@ -1624,7 +1624,7 @@ private:
             auto now = std::chrono::steady_clock::now();
             if (now >= deadline) {
                 co_await unsubscribe(sub);
-                co_return std::pair<message, status>{{}, status("request timeout")};
+                co_return std::pair<message, status>{{}, status(error_code::request_timeout)};
             }
 
             // Poll every 5ms
@@ -1797,7 +1797,7 @@ private:
         const js_consumer_config& config, on_js_message_cb cb) {
 
         if (!m_is_connected) {
-            co_return std::pair<ijs_subscription_sptr, status>{nullptr, status("not connected")};
+            co_return std::pair<ijs_subscription_sptr, status>{nullptr, status(error_code::not_connected)};
         }
 
         // Generate delivery subject if not provided
@@ -1856,7 +1856,7 @@ private:
         std::chrono::milliseconds timeout) {
 
         if (!m_is_connected) {
-            co_return std::pair<std::vector<js_message>, status>{{}, status("not connected")};
+            co_return std::pair<std::vector<js_message>, status>{{}, status(error_code::not_connected)};
         }
 
         using nlohmann::json;
@@ -1959,7 +1959,7 @@ private:
         string_view stream, string_view consumer) {
 
         if (!m_is_connected) {
-            co_return std::pair<nats_asio::js_consumer_info, status>{{}, status("not connected")};
+            co_return std::pair<nats_asio::js_consumer_info, status>{{}, status(error_code::not_connected)};
         }
 
         using nlohmann::json;
@@ -2004,7 +2004,7 @@ private:
     // Delete consumer implementation
     asio::awaitable<status> js_delete_consumer_impl(string_view stream, string_view consumer) {
         if (!m_is_connected) {
-            co_return status("not connected");
+            co_return status(error_code::not_connected);
         }
 
         using nlohmann::json;
@@ -2026,7 +2026,7 @@ private:
             }
 
             if (!j.value("success", false)) {
-                co_return status("consumer deletion failed");
+                co_return status(error_code::operation_failed, "consumer deletion failed");
             }
         } catch (const std::exception& e) {
             co_return status(fmt::format("failed to parse delete response: {}", e.what()));
@@ -2049,7 +2049,7 @@ private:
         }
 
         if (!m_is_connected) {
-            co_return std::pair<uint64_t, status>{0, status("not connected")};
+            co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
         // KV subject format: $KV.{bucket}.{key}
@@ -2079,7 +2079,7 @@ private:
         }
 
         if (!m_is_connected) {
-            co_return std::pair<kv_entry, status>{{}, status("not connected")};
+            co_return std::pair<kv_entry, status>{{}, status(error_code::not_connected)};
         }
 
         using nlohmann::json;
@@ -2108,7 +2108,7 @@ private:
         for (const auto& [hdr_key, hdr_val] : response.headers) {
             if (hdr_key == "Status") {
                 if (hdr_val == "404") {
-                    co_return std::pair<kv_entry, status>{{}, status("key not found")};
+                    co_return std::pair<kv_entry, status>{{}, status(error_code::key_not_found)};
                 }
                 co_return std::pair<kv_entry, status>{{}, status(fmt::format("error: {}", hdr_val))};
             }
@@ -2141,7 +2141,7 @@ private:
 
         // If this is a delete marker, return not found
         if (entry.op != kv_entry::operation::put) {
-            co_return std::pair<kv_entry, status>{{}, status("key not found")};
+            co_return std::pair<kv_entry, status>{{}, status(error_code::key_not_found)};
         }
 
         co_return std::pair<kv_entry, status>{std::move(entry), status()};
@@ -2161,7 +2161,7 @@ private:
         }
 
         if (!m_is_connected) {
-            co_return std::pair<uint64_t, status>{0, status("not connected")};
+            co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
         // KV subject format: $KV.{bucket}.{key}
@@ -2194,7 +2194,7 @@ private:
         }
 
         if (!m_is_connected) {
-            co_return std::pair<uint64_t, status>{0, status("not connected")};
+            co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
         // KV subject format: $KV.{bucket}.{key}
@@ -2231,7 +2231,7 @@ private:
         }
 
         if (!m_is_connected) {
-            co_return std::pair<uint64_t, status>{0, status("not connected")};
+            co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
         // KV subject format: $KV.{bucket}.{key}
@@ -2245,7 +2245,7 @@ private:
         if (pub_status.failed()) {
             // Check if it's a sequence mismatch error (key already exists)
             if (pub_status.error().find("wrong last sequence") != std::string::npos) {
-                co_return std::pair<uint64_t, status>{0, status("key already exists")};
+                co_return std::pair<uint64_t, status>{0, status(error_code::already_exists)};
             }
             co_return std::pair<uint64_t, status>{0, pub_status};
         }
@@ -2267,11 +2267,11 @@ private:
         }
 
         if (revision == 0) {
-            co_return std::pair<uint64_t, status>{0, status("revision must be > 0 for update, use create for new keys")};
+            co_return std::pair<uint64_t, status>{0, status(error_code::invalid_argument, "revision must be > 0 for update, use create for new keys")};
         }
 
         if (!m_is_connected) {
-            co_return std::pair<uint64_t, status>{0, status("not connected")};
+            co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
         // KV subject format: $KV.{bucket}.{key}
@@ -2285,7 +2285,7 @@ private:
         if (pub_status.failed()) {
             // Check if it's a sequence mismatch error
             if (pub_status.error().find("wrong last sequence") != std::string::npos) {
-                co_return std::pair<uint64_t, status>{0, status("revision mismatch")};
+                co_return std::pair<uint64_t, status>{0, status(error_code::revision_mismatch)};
             }
             co_return std::pair<uint64_t, status>{0, pub_status};
         }
@@ -2303,7 +2303,7 @@ private:
         }
 
         if (!m_is_connected) {
-            co_return std::pair<std::vector<std::string>, status>{{}, status("not connected")};
+            co_return std::pair<std::vector<std::string>, status>{{}, status(error_code::not_connected)};
         }
 
         using nlohmann::json;
@@ -2374,7 +2374,7 @@ private:
         }
 
         if (!m_is_connected) {
-            co_return std::pair<std::vector<kv_entry>, status>{{}, status("not connected")};
+            co_return std::pair<std::vector<kv_entry>, status>{{}, status(error_code::not_connected)};
         }
 
         using nlohmann::json;
@@ -2477,11 +2477,11 @@ private:
         }
 
         if (revision == 0) {
-            co_return std::pair<uint64_t, status>{0, status("revision must be > 0")};
+            co_return std::pair<uint64_t, status>{0, status(error_code::invalid_argument, "revision must be > 0")};
         }
 
         if (!m_is_connected) {
-            co_return std::pair<uint64_t, status>{0, status("not connected")};
+            co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
         using nlohmann::json;
@@ -2556,7 +2556,7 @@ private:
         }
 
         if (!m_is_connected) {
-            co_return std::pair<ikv_watcher_sptr, status>{nullptr, status("not connected")};
+            co_return std::pair<ikv_watcher_sptr, status>{nullptr, status(error_code::not_connected)};
         }
 
         std::string bucket_str(bucket);
@@ -2980,11 +2980,11 @@ asio::awaitable<status> js_subscription<SocketType>::send_ack(
     const js_message& msg, std::string_view ack_body) {
 
     if (!m_active.load()) {
-        co_return status("subscription is not active");
+        co_return status(error_code::invalid_argument, "subscription is not active");
     }
 
     if (!msg.msg.reply_to) {
-        co_return status("message has no reply subject for acknowledgment");
+        co_return status(error_code::invalid_argument, "message has no reply subject for acknowledgment");
     }
 
     std::span<const char> payload(ack_body.data(), ack_body.size());
@@ -2997,7 +2997,7 @@ asio::awaitable<status> js_subscription<SocketType>::send_ack_batch(
     const std::vector<js_message>& messages, std::string_view ack_body) {
 
     if (!m_active.load()) {
-        co_return status("subscription is not active");
+        co_return status(error_code::invalid_argument, "subscription is not active");
     }
 
     if (messages.empty()) {
@@ -3023,7 +3023,7 @@ asio::awaitable<status> js_subscription<SocketType>::send_ack_batch(
     }
 
     if (acked_count == 0) {
-        co_return status("no messages had reply subjects for acknowledgment");
+        co_return status(error_code::invalid_argument, "no messages had reply subjects for acknowledgment");
     }
 
     // Send all acks in a single write

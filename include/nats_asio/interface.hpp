@@ -151,28 +151,159 @@ using ikv_watcher_sptr = std::shared_ptr<ikv_watcher>;
 // Callback for KV watch events
 using on_kv_entry_cb = std::function<asio::awaitable<void>(const kv_entry& entry)>;
 
+// Error codes for type-safe error handling
+enum class error_code {
+    ok = 0,                    // No error
+
+    // Connection errors (1xx)
+    not_connected = 100,
+    connection_closed = 101,
+    connection_timeout = 102,
+
+    // Protocol/parsing errors (2xx)
+    protocol_error = 200,
+    parse_error = 201,
+    invalid_message = 202,
+    invalid_header = 203,
+
+    // Size/limit errors (3xx)
+    message_too_large = 300,
+    payload_too_large = 301,
+
+    // Timeout errors (4xx)
+    timeout = 400,
+    request_timeout = 401,
+    ack_timeout = 402,
+
+    // Not found errors (5xx)
+    not_found = 500,
+    key_not_found = 501,
+    stream_not_found = 502,
+    consumer_not_found = 503,
+
+    // Conflict errors (6xx)
+    conflict = 600,
+    already_exists = 601,
+    revision_mismatch = 602,
+
+    // Validation errors (7xx)
+    invalid_argument = 700,
+    invalid_subject = 701,
+    invalid_key = 702,
+    invalid_bucket = 703,
+
+    // Operation errors (8xx)
+    operation_failed = 800,
+    permission_denied = 801,
+
+    // Unknown/other (9xx)
+    unknown = 999
+};
+
+// Convert error_code to string
+inline const char* error_code_string(error_code code) noexcept {
+    switch (code) {
+        case error_code::ok: return "ok";
+        case error_code::not_connected: return "not connected";
+        case error_code::connection_closed: return "connection closed";
+        case error_code::connection_timeout: return "connection timeout";
+        case error_code::protocol_error: return "protocol error";
+        case error_code::parse_error: return "parse error";
+        case error_code::invalid_message: return "invalid message";
+        case error_code::invalid_header: return "invalid header";
+        case error_code::message_too_large: return "message too large";
+        case error_code::payload_too_large: return "payload too large";
+        case error_code::timeout: return "timeout";
+        case error_code::request_timeout: return "request timeout";
+        case error_code::ack_timeout: return "ack timeout";
+        case error_code::not_found: return "not found";
+        case error_code::key_not_found: return "key not found";
+        case error_code::stream_not_found: return "stream not found";
+        case error_code::consumer_not_found: return "consumer not found";
+        case error_code::conflict: return "conflict";
+        case error_code::already_exists: return "already exists";
+        case error_code::revision_mismatch: return "revision mismatch";
+        case error_code::invalid_argument: return "invalid argument";
+        case error_code::invalid_subject: return "invalid subject";
+        case error_code::invalid_key: return "invalid key";
+        case error_code::invalid_bucket: return "invalid bucket";
+        case error_code::operation_failed: return "operation failed";
+        case error_code::permission_denied: return "permission denied";
+        case error_code::unknown: return "unknown error";
+    }
+    return "unknown error";
+}
+
 // Status class for error handling - must be defined before ijs_subscription
 class status {
 public:
+    // Success status
     status() = default;
 
-    status(const std::string& error) : m_error(error) {}
+    // Error with code only
+    explicit status(error_code code) : m_code(code) {}
+
+    // Error with code and additional message
+    status(error_code code, const std::string& message)
+        : m_code(code), m_message(message) {}
+
+    // Legacy: error with string only (maps to unknown error code)
+    status(const std::string& error)
+        : m_code(error_code::unknown), m_message(error) {}
 
     ~status() = default;
 
     [[nodiscard]] bool failed() const noexcept {
-        return m_error.has_value();
+        return m_code != error_code::ok;
+    }
+
+    [[nodiscard]] bool ok() const noexcept {
+        return m_code == error_code::ok;
+    }
+
+    [[nodiscard]] error_code code() const noexcept {
+        return m_code;
     }
 
     [[nodiscard]] std::string error() const {
-        if (!m_error.has_value())
+        if (m_code == error_code::ok)
             return {};
 
-        return m_error.value();
+        if (m_message.has_value() && !m_message->empty()) {
+            return *m_message;
+        }
+        return error_code_string(m_code);
+    }
+
+    // Check for specific error categories
+    [[nodiscard]] bool is_connection_error() const noexcept {
+        int c = static_cast<int>(m_code);
+        return c >= 100 && c < 200;
+    }
+
+    [[nodiscard]] bool is_protocol_error() const noexcept {
+        int c = static_cast<int>(m_code);
+        return c >= 200 && c < 300;
+    }
+
+    [[nodiscard]] bool is_timeout() const noexcept {
+        int c = static_cast<int>(m_code);
+        return c >= 400 && c < 500;
+    }
+
+    [[nodiscard]] bool is_not_found() const noexcept {
+        int c = static_cast<int>(m_code);
+        return c >= 500 && c < 600;
+    }
+
+    [[nodiscard]] bool is_conflict() const noexcept {
+        int c = static_cast<int>(m_code);
+        return c >= 600 && c < 700;
     }
 
 private:
-    optional<std::string> m_error;
+    error_code m_code = error_code::ok;
+    optional<std::string> m_message;
 };
 
 // KV watcher interface
