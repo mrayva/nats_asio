@@ -5,6 +5,7 @@
     "cxxopts",
     "concurrentqueue",
     "fmt",
+    "gtl",
     "magic-enum",
     "mimalloc",
 	"nlohmann-json",

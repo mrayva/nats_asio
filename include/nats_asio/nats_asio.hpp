@@ -49,10 +49,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <atomic>
 #include <concepts>
 #include <concurrentqueue/moodycamel/concurrentqueue.h>
+#include <gtl/lru_cache.hpp>
 #include <iomanip>
 #include <istream>
 #include <magic_enum/magic_enum.hpp>
-#include <map>
+#include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
@@ -263,59 +265,56 @@ private:
     size_t m_payload_size = 0;
 };
 
-// Thread-safe cache of pub_templates keyed by subject+size
+// Thread-safe LRU cache of pub_templates keyed by subject+size
+// Uses gtl::lru_cache with mutex for proper LRU eviction
 class pub_template_cache {
 public:
-    pub_template_cache(size_t max_entries = 1024) : m_max_entries(max_entries) {}
+    pub_template_cache(size_t max_entries = 1024)
+        : m_max_entries(max_entries), m_cache(std::make_unique<cache_t>(max_entries)) {}
 
     // Get or create template for subject with payload size
-    const pub_template& get(string_view subject, size_t payload_size) {
+    // Note: Returns by value since LRU cache may evict entries
+    pub_template get(string_view subject, size_t payload_size) {
         auto key = make_key(subject, payload_size);
 
         std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_cache.find(key);
-        if (it != m_cache.end()) {
-            return it->second;
+        if (auto cached = m_cache->get(key)) {
+            return *cached;
         }
 
-        // Evict oldest if at capacity (simple LRU would be better but adds complexity)
-        if (m_cache.size() >= m_max_entries) {
-            m_cache.erase(m_cache.begin());
-        }
-
-        auto [inserted, _] = m_cache.emplace(key, pub_template(subject, payload_size));
-        return inserted->second;
+        pub_template tpl(subject, payload_size);
+        m_cache->insert(key, tpl);
+        return tpl;
     }
 
     // Get or create template with reply-to
-    const pub_template& get(string_view subject, string_view reply_to, size_t payload_size) {
+    pub_template get(string_view subject, string_view reply_to, size_t payload_size) {
         auto key = make_key_with_reply(subject, reply_to, payload_size);
 
         std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_cache.find(key);
-        if (it != m_cache.end()) {
-            return it->second;
+        if (auto cached = m_cache->get(key)) {
+            return *cached;
         }
 
-        if (m_cache.size() >= m_max_entries) {
-            m_cache.erase(m_cache.begin());
-        }
-
-        auto [inserted, _] = m_cache.emplace(key, pub_template(subject, reply_to, payload_size));
-        return inserted->second;
+        pub_template tpl(subject, reply_to, payload_size);
+        m_cache->insert(key, tpl);
+        return tpl;
     }
 
     void clear() {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_cache.clear();
+        // Workaround for GTL lru_cache::clear() bug - recreate the cache
+        m_cache = std::make_unique<cache_t>(m_max_entries);
     }
 
     size_t size() const {
         std::lock_guard<std::mutex> lock(m_mutex);
-        return m_cache.size();
+        return m_cache->size();
     }
 
 private:
+    using cache_t = gtl::lru_cache<std::string, pub_template>;
+
     static std::string make_key(string_view subject, size_t payload_size) {
         return fmt::format("{}:{}", subject, payload_size);
     }
@@ -324,9 +323,9 @@ private:
         return fmt::format("{}:{}:{}", subject, reply_to, payload_size);
     }
 
-    mutable std::mutex m_mutex;
-    std::map<std::string, pub_template> m_cache;
     size_t m_max_entries;
+    mutable std::mutex m_mutex;
+    std::unique_ptr<cache_t> m_cache;
 };
 
 // ============================================================================
