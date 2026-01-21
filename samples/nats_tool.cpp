@@ -346,7 +346,7 @@ inline nlohmann::json parse_csv_line(const std::string& line, const std::vector<
 // Supports {{Subject}} placeholder in command string
 std::string translate_payload(const std::string& cmd, std::string_view subject,
                               std::span<const char> payload,
-                              std::shared_ptr<spdlog::logger>& log) {
+                              const std::shared_ptr<spdlog::logger>& log) {
     // Replace {{Subject}} placeholder with actual subject
     std::string actual_cmd = cmd;
     const std::string placeholder = "{{Subject}}";
@@ -421,6 +421,25 @@ std::string translate_payload(const std::string& cmd, std::string_view subject,
     return result;
 }
 
+// Helper to run blocking work on a thread and await completion
+// Prevents blocking the ASIO event loop
+template<typename Func>
+asio::awaitable<std::invoke_result_t<Func>> async_run_blocking(Func&& func) {
+    using ResultType = std::invoke_result_t<Func>;
+
+    auto executor = co_await asio::this_coro::executor;
+    auto future = std::async(std::launch::async, std::forward<Func>(func));
+
+    // Poll for completion using timer to avoid blocking the event loop
+    asio::steady_timer timer(executor);
+    while (future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        timer.expires_after(std::chrono::milliseconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+
+    co_return future.get();
+}
+
 class grubber : public worker {
 public:
     grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
@@ -444,11 +463,17 @@ public:
 
         std::ostream* out = m_dump_file ? m_dump_file.get() : &std::cout;
 
-        // Apply translation if configured
+        // Apply translation if configured (runs on background thread)
         std::string translated;
         std::span<const char> output_payload = payload;
         if (!m_translate_cmd.empty()) {
-            translated = translate_payload(m_translate_cmd, subject, payload, m_log);
+            std::string subj_str(subject);
+            std::vector<char> payload_copy(payload.begin(), payload.end());
+            auto log = m_log;
+            std::string cmd = m_translate_cmd;
+            translated = co_await async_run_blocking([cmd, subj_str, payload_copy, log]() {
+                return translate_payload(cmd, subj_str, std::span<const char>(payload_copy), log);
+            });
             output_payload = std::span<const char>(translated.data(), translated.size());
         }
 
@@ -555,12 +580,17 @@ public:
         const auto& payload = msg.msg.payload;
         const auto& subject = msg.msg.subject;
 
-        // Apply translation if configured
+        // Apply translation if configured (runs on background thread)
         std::string translated;
         std::span<const char> output_payload(payload.data(), payload.size());
         if (!m_translate_cmd.empty()) {
-            translated = translate_payload(m_translate_cmd, subject,
-                                           std::span<const char>(payload.data(), payload.size()), m_log);
+            std::string subj_str(subject);
+            std::vector<char> payload_copy(payload.begin(), payload.end());
+            auto log = m_log;
+            std::string cmd = m_translate_cmd;
+            translated = co_await async_run_blocking([cmd, subj_str, payload_copy, log]() {
+                return translate_payload(cmd, subj_str, std::span<const char>(payload_copy), log);
+            });
             output_payload = std::span<const char>(translated.data(), translated.size());
         }
 
@@ -1285,7 +1315,7 @@ private:
             // Echo mode - reply with received payload
             reply_payload = std::string(msg.payload.begin(), msg.payload.end());
         } else if (!m_translate_cmd.empty()) {
-            // Transform through external command
+            // Transform through external command (runs on thread pool to avoid blocking)
             std::string cmd = m_translate_cmd;
             // Replace {{Subject}} placeholder if present
             std::string subject_placeholder = "{{Subject}}";
@@ -1294,7 +1324,14 @@ private:
                 cmd.replace(pos, subject_placeholder.length(), msg.subject);
             }
 
-            reply_payload = run_translate_command(cmd, msg.payload);
+            // Copy payload for thread-safe access
+            std::vector<char> payload_copy(msg.payload.begin(), msg.payload.end());
+
+            // Run blocking subprocess on background thread
+            reply_payload = co_await async_run_blocking([this, cmd, payload_copy]() {
+                return run_translate_command(cmd, std::span<const char>(payload_copy));
+            });
+
             if (reply_payload.empty()) {
                 m_log->warn("translate command returned empty output");
             }
