@@ -5,8 +5,8 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <inja/inja.hpp>
 #include <numeric>
-#include <regex>
 #include <sstream>
 #include <asio/as_tuple.hpp>
 #include <asio/detached.hpp>
@@ -295,38 +295,14 @@ inline std::vector<std::string> split_string(const std::string& s, char delim) {
 }
 
 // Apply template substitution: replace {{field}} with values from JSON object
+// Uses inja template engine for Jinja2-style templating
 inline std::string apply_template(const std::string& tpl, const nlohmann::json& obj) {
-    // Static regex - compiled once, reused on every call (significant speedup)
-    static const std::regex field_regex(R"(\{\{(\w+)\}\})");
-    std::string result = tpl;
-    std::smatch match;
-    std::string::const_iterator search_start(result.cbegin());
-
-    std::string output;
-    size_t last_pos = 0;
-
-    auto it = std::sregex_iterator(result.begin(), result.end(), field_regex);
-    auto end = std::sregex_iterator();
-
-    for (; it != end; ++it) {
-        match = *it;
-        output += result.substr(last_pos, match.position() - last_pos);
-        std::string field_name = match[1].str();
-
-        if (obj.contains(field_name)) {
-            const auto& val = obj[field_name];
-            if (val.is_string()) {
-                output += val.get<std::string>();
-            } else {
-                output += val.dump();
-            }
-        } else {
-            output += match[0].str();  // Keep original if field not found
-        }
-        last_pos = match.position() + match.length();
+    try {
+        return inja::render(tpl, obj);
+    } catch (const std::exception&) {
+        // On parse error, return template unchanged
+        return tpl;
     }
-    output += result.substr(last_pos);
-    return output;
 }
 
 // Build payload from selected fields

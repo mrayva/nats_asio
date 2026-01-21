@@ -6,6 +6,7 @@
     "concurrentqueue",
     "fmt",
     "gtl",
+    "inja",
     "magic-enum",
     "mimalloc",
 	"nlohmann-json",
