@@ -76,14 +76,20 @@ target_compile_features(nats_asio INTERFACE cxx_std_20)
 # Samples
 if(NATS_ASIO_BUILD_SAMPLES)
     find_package(cxxopts CONFIG REQUIRED)
-    
+    find_package(mimalloc CONFIG REQUIRED)
+    find_package(simdjson CONFIG REQUIRED)
+    find_package(zstd CONFIG REQUIRED)
+
     add_executable(nats_tool samples/nats_tool.cpp)
-    target_link_libraries(nats_tool 
-        PRIVATE 
+    target_link_libraries(nats_tool
+        PRIVATE
             nats_asio::nats_asio
             cxxopts::cxxopts
+            mimalloc
+            simdjson::simdjson
+            $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
     )
-    
+
     set_target_properties(nats_tool PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )

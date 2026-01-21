@@ -5,10 +5,13 @@
     "cxxopts",
     "concurrentqueue",
     "fmt",
+    "mimalloc",
 	"nlohmann-json",
+    "simdjson",
 	"spdlog",
     "asio",
     "openssl",
+    "zstd",
 	"gtest"
   ]
 }

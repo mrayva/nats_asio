@@ -1,3 +1,6 @@
+// mimalloc: drop-in malloc replacement - must be included first
+#include <mimalloc-new-delete.h>
+
 #include <fmt/format.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
@@ -14,11 +17,13 @@
 #include <future>
 #include <iostream>
 #include <nats_asio/nats_asio.hpp>
+#include <simdjson.h>
 #include <thread>
 #include <tuple>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <zstd.h>
 
 #include "cxxopts.hpp"
 
@@ -40,6 +45,141 @@ const std::string kvpurge_mode("kvpurge");
 const std::string kvrevert_mode("kvrevert");
 
 enum class mode { grubber, generator, publisher, requester, replier, benchmarker, js_grubber, js_fetcher, kv_publisher, kv_watcher, kv_creator, kv_updater, kv_keys_lister, kv_history_viewer, kv_purger, kv_reverter };
+
+// ============================================================================
+// Compression utilities using zstd
+// ============================================================================
+
+class zstd_compressor {
+public:
+    zstd_compressor(int level = 3) : m_level(level) {
+        m_cctx = ZSTD_createCCtx();
+        m_dctx = ZSTD_createDCtx();
+    }
+
+    ~zstd_compressor() {
+        if (m_cctx) ZSTD_freeCCtx(m_cctx);
+        if (m_dctx) ZSTD_freeDCtx(m_dctx);
+    }
+
+    // Compress data, returns compressed bytes (empty on error)
+    std::vector<char> compress(std::span<const char> input) {
+        size_t bound = ZSTD_compressBound(input.size());
+        std::vector<char> output(bound);
+
+        size_t compressed_size = ZSTD_compressCCtx(
+            m_cctx, output.data(), output.size(),
+            input.data(), input.size(), m_level);
+
+        if (ZSTD_isError(compressed_size)) {
+            return {};
+        }
+
+        output.resize(compressed_size);
+        return output;
+    }
+
+    // Decompress data, returns decompressed bytes (empty on error)
+    std::vector<char> decompress(std::span<const char> input) {
+        unsigned long long decompressed_size = ZSTD_getFrameContentSize(input.data(), input.size());
+        if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
+            decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+            return {};
+        }
+
+        std::vector<char> output(decompressed_size);
+        size_t result = ZSTD_decompressDCtx(
+            m_dctx, output.data(), output.size(),
+            input.data(), input.size());
+
+        if (ZSTD_isError(result)) {
+            return {};
+        }
+
+        output.resize(result);
+        return output;
+    }
+
+    // Check if data appears to be zstd compressed
+    static bool is_compressed(std::span<const char> data) {
+        if (data.size() < 4) return false;
+        // zstd magic number: 0xFD2FB528
+        unsigned int magic = ZSTD_MAGICNUMBER;
+        return std::memcmp(data.data(), &magic, 4) == 0;
+    }
+
+private:
+    ZSTD_CCtx* m_cctx = nullptr;
+    ZSTD_DCtx* m_dctx = nullptr;
+    int m_level;
+};
+
+// ============================================================================
+// Fast JSON parsing using simdjson (for read-heavy workloads)
+// ============================================================================
+
+class fast_json_parser {
+public:
+    // Parse JSON string, returns true on success
+    bool parse(const std::string& json_str) {
+        m_padded = simdjson::padded_string(json_str);
+        auto result = m_parser.parse(m_padded);
+        if (result.error()) {
+            return false;
+        }
+        m_doc = std::move(result.value());
+        return true;
+    }
+
+    // Parse from char span (avoids string copy)
+    bool parse(std::span<const char> data) {
+        m_padded = simdjson::padded_string(data.data(), data.size());
+        auto result = m_parser.parse(m_padded);
+        if (result.error()) {
+            return false;
+        }
+        m_doc = std::move(result.value());
+        return true;
+    }
+
+    // Get string field (returns empty string_view on error)
+    std::string_view get_string(const char* field) {
+        auto result = m_doc[field].get_string();
+        if (result.error()) return {};
+        return result.value();
+    }
+
+    // Get int64 field (returns 0 on error)
+    int64_t get_int(const char* field) {
+        auto result = m_doc[field].get_int64();
+        if (result.error()) return 0;
+        return result.value();
+    }
+
+    // Get double field (returns 0.0 on error)
+    double get_double(const char* field) {
+        auto result = m_doc[field].get_double();
+        if (result.error()) return 0.0;
+        return result.value();
+    }
+
+    // Get bool field (returns false on error)
+    bool get_bool(const char* field) {
+        auto result = m_doc[field].get_bool();
+        if (result.error()) return false;
+        return result.value();
+    }
+
+    // Get the raw element for complex access patterns
+    simdjson::dom::element& doc() { return m_doc; }
+
+private:
+    simdjson::dom::parser m_parser;
+    simdjson::dom::element m_doc;
+    simdjson::padded_string m_padded;
+};
+
+// ============================================================================
 
 class worker {
 public:
@@ -1891,6 +2031,9 @@ int main(int argc, char* argv[]) {
         ("subject_template", "Subject template with {{field}} placeholders (requires json/csv input)", cxxopts::value<std::string>())
         ("payload_fields", "Comma-separated fields to include in payload (default: all)", cxxopts::value<std::string>())
         ("csv_headers", "Comma-separated header names for CSV input", cxxopts::value<std::string>())
+        ("compress", "Compress payloads with zstd (pub/batch_pub mode)")
+        ("decompress", "Decompress zstd payloads (grub mode)")
+        ("compress_level", "Compression level 1-22 (default: 3)", cxxopts::value<int>())
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
         ("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
