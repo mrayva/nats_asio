@@ -549,6 +549,183 @@ private:
 };
 
 // ============================================================================
+// Subject Builders - Efficient subject string construction
+// ============================================================================
+
+// Fast subject building using string concatenation (faster than fmt::format for simple cases)
+namespace subjects {
+
+// Build KV subject: $KV.{bucket}.{key}
+inline std::string kv_subject(string_view bucket, string_view key) {
+    std::string result;
+    result.reserve(4 + bucket.size() + 1 + key.size());  // "$KV." + bucket + "." + key
+    result += "$KV.";
+    result.append(bucket.data(), bucket.size());
+    result += '.';
+    result.append(key.data(), key.size());
+    return result;
+}
+
+// Build KV wildcard subject: $KV.{bucket}.>
+inline std::string kv_wildcard(string_view bucket) {
+    std::string result;
+    result.reserve(4 + bucket.size() + 2);  // "$KV." + bucket + ".>"
+    result += "$KV.";
+    result.append(bucket.data(), bucket.size());
+    result += ".>";
+    return result;
+}
+
+// Build KV prefix: $KV.{bucket}.
+inline std::string kv_prefix(string_view bucket) {
+    std::string result;
+    result.reserve(4 + bucket.size() + 1);  // "$KV." + bucket + "."
+    result += "$KV.";
+    result.append(bucket.data(), bucket.size());
+    result += '.';
+    return result;
+}
+
+// Build KV stream name: KV_{bucket}
+inline std::string kv_stream_name(string_view bucket) {
+    std::string result;
+    result.reserve(3 + bucket.size());  // "KV_" + bucket
+    result += "KV_";
+    result.append(bucket.data(), bucket.size());
+    return result;
+}
+
+// Build JetStream direct get subject: $JS.API.DIRECT.GET.{stream}
+inline std::string js_direct_get(string_view stream) {
+    std::string result;
+    result.reserve(20 + stream.size());  // "$JS.API.DIRECT.GET." + stream
+    result += "$JS.API.DIRECT.GET.";
+    result.append(stream.data(), stream.size());
+    return result;
+}
+
+// Build JetStream stream info subject: $JS.API.STREAM.INFO.{stream}
+inline std::string js_stream_info(string_view stream) {
+    std::string result;
+    result.reserve(20 + stream.size());  // "$JS.API.STREAM.INFO." + stream
+    result += "$JS.API.STREAM.INFO.";
+    result.append(stream.data(), stream.size());
+    return result;
+}
+
+// Build JetStream consumer info subject: $JS.API.CONSUMER.INFO.{stream}.{consumer}
+inline std::string js_consumer_info(string_view stream, string_view consumer) {
+    std::string result;
+    result.reserve(22 + stream.size() + 1 + consumer.size());
+    result += "$JS.API.CONSUMER.INFO.";
+    result.append(stream.data(), stream.size());
+    result += '.';
+    result.append(consumer.data(), consumer.size());
+    return result;
+}
+
+// Build JetStream consumer delete subject: $JS.API.CONSUMER.DELETE.{stream}.{consumer}
+inline std::string js_consumer_delete(string_view stream, string_view consumer) {
+    std::string result;
+    result.reserve(24 + stream.size() + 1 + consumer.size());
+    result += "$JS.API.CONSUMER.DELETE.";
+    result.append(stream.data(), stream.size());
+    result += '.';
+    result.append(consumer.data(), consumer.size());
+    return result;
+}
+
+// Build JetStream consumer fetch subject: $JS.API.CONSUMER.MSG.NEXT.{stream}.{consumer}
+inline std::string js_consumer_fetch(string_view stream, string_view consumer) {
+    std::string result;
+    result.reserve(26 + stream.size() + 1 + consumer.size());
+    result += "$JS.API.CONSUMER.MSG.NEXT.";
+    result.append(stream.data(), stream.size());
+    result += '.';
+    result.append(consumer.data(), consumer.size());
+    return result;
+}
+
+// Build JetStream durable consumer create: $JS.API.CONSUMER.DURABLE.CREATE.{stream}.{consumer}
+inline std::string js_consumer_durable_create(string_view stream, string_view consumer) {
+    std::string result;
+    result.reserve(32 + stream.size() + 1 + consumer.size());
+    result += "$JS.API.CONSUMER.DURABLE.CREATE.";
+    result.append(stream.data(), stream.size());
+    result += '.';
+    result.append(consumer.data(), consumer.size());
+    return result;
+}
+
+// Build JetStream ephemeral consumer create: $JS.API.CONSUMER.CREATE.{stream}
+inline std::string js_consumer_create(string_view stream) {
+    std::string result;
+    result.reserve(24 + stream.size());
+    result += "$JS.API.CONSUMER.CREATE.";
+    result.append(stream.data(), stream.size());
+    return result;
+}
+
+}  // namespace subjects
+
+// Cache for KV bucket prefixes - avoids repeated string construction
+// Thread-safe LRU cache keyed by bucket name
+class kv_prefix_cache {
+public:
+    // Cached prefixes for a single bucket
+    struct bucket_prefixes {
+        std::string kv_prefix;       // $KV.{bucket}.
+        std::string stream_name;     // KV_{bucket}
+        std::string direct_get;      // $JS.API.DIRECT.GET.KV_{bucket}
+        std::string stream_info;     // $JS.API.STREAM.INFO.KV_{bucket}
+    };
+
+    kv_prefix_cache(size_t max_entries = 64)
+        : m_max_entries(max_entries), m_cache(std::make_unique<cache_t>(max_entries)) {}
+
+    // Get or create prefixes for bucket (returns by value - small struct)
+    bucket_prefixes get(string_view bucket) {
+        std::string key(bucket);
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (auto cached = m_cache->get(key)) {
+            return *cached;
+        }
+
+        bucket_prefixes prefixes;
+        prefixes.kv_prefix = subjects::kv_prefix(bucket);
+        prefixes.stream_name = subjects::kv_stream_name(bucket);
+        prefixes.direct_get = subjects::js_direct_get(prefixes.stream_name);
+        prefixes.stream_info = subjects::js_stream_info(prefixes.stream_name);
+
+        m_cache->insert(key, prefixes);
+        return prefixes;
+    }
+
+    // Build full KV subject using cached prefix
+    std::string kv_subject(string_view bucket, string_view key) {
+        auto p = get(bucket);
+        std::string result;
+        result.reserve(p.kv_prefix.size() + key.size());
+        result += p.kv_prefix;
+        result.append(key.data(), key.size());
+        return result;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_cache = std::make_unique<cache_t>(m_max_entries);
+    }
+
+private:
+    using cache_t = gtl::lru_cache<std::string, bucket_prefixes>;
+
+    size_t m_max_entries;
+    mutable std::mutex m_mutex;
+    std::unique_ptr<cache_t> m_cache;
+};
+
+// ============================================================================
 
 // Generate unique inbox for request-reply
 inline std::string generate_inbox() {
@@ -1314,7 +1491,7 @@ inline kv_entry parse_kv_entry_from_message(const message& msg, string_view buck
 
     // Extract key from subject: $KV.{bucket}.{key}
     // Subject format: $KV.bucket.key or $KV.bucket.key.with.dots
-    std::string prefix = fmt::format("$KV.{}.", bucket);
+    std::string prefix = subjects::kv_prefix(bucket);
     if (msg.subject.size() > prefix.size() && msg.subject.substr(0, prefix.size()) == prefix) {
         entry.key = msg.subject.substr(prefix.size());
     }
@@ -2014,10 +2191,9 @@ private:
         // API subject depends on whether it's durable or ephemeral
         std::string api_subject;
         if (config.durable_name) {
-            api_subject = fmt::format("$JS.API.CONSUMER.DURABLE.CREATE.{}.{}",
-                                      config.stream, *config.durable_name);
+            api_subject = subjects::js_consumer_durable_create(config.stream, *config.durable_name);
         } else {
-            api_subject = fmt::format("$JS.API.CONSUMER.CREATE.{}", config.stream);
+            api_subject = subjects::js_consumer_create(config.stream);
         }
 
         auto [response, req_status] = co_await request_impl(api_subject, payload, {},
@@ -2189,7 +2365,7 @@ private:
         }
 
         // Send fetch request
-        std::string api_subject = fmt::format("$JS.API.CONSUMER.MSG.NEXT.{}.{}", stream, consumer);
+        auto api_subject = subjects::js_consumer_fetch(stream, consumer);
         auto pub_status = co_await publish(api_subject, payload, inbox);
 
         if (pub_status.failed()) {
@@ -2230,7 +2406,7 @@ private:
             co_return std::pair<nats_asio::js_consumer_info, status>{{}, status(error_code::not_connected)};
         }
 
-        std::string api_subject = fmt::format("$JS.API.CONSUMER.INFO.{}.{}", stream, consumer);
+        auto api_subject = subjects::js_consumer_info(stream, consumer);
         auto [response, req_status] = co_await request_impl(api_subject, {}, {}, std::chrono::seconds(5));
 
         if (req_status.failed()) {
@@ -2273,7 +2449,7 @@ private:
             co_return status(error_code::not_connected);
         }
 
-        std::string api_subject = fmt::format("$JS.API.CONSUMER.DELETE.{}.{}", stream, consumer);
+        auto api_subject = subjects::js_consumer_delete(stream, consumer);
         auto [response, req_status] = co_await request_impl(api_subject, {}, {}, std::chrono::seconds(5));
 
         if (req_status.failed()) {
@@ -2317,8 +2493,8 @@ private:
             co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
-        // KV subject format: $KV.{bucket}.{key}
-        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+        // KV subject format: $KV.{bucket}.{key} (using cached prefix)
+        std::string subject = m_kv_cache.kv_subject(bucket, key);
 
         // Use JetStream publish to get acknowledgment with sequence number
         auto [ack, pub_status] = co_await js_publish_impl(subject, value, {}, timeout, true);
@@ -2349,21 +2525,18 @@ private:
 
         using nlohmann::json;
 
-        // Stream name for KV bucket: KV_{bucket}
-        std::string stream_name = fmt::format("KV_{}", bucket);
-
-        // Use direct get API: $JS.API.DIRECT.GET.{stream}
-        std::string api_subject = fmt::format("$JS.API.DIRECT.GET.{}", stream_name);
+        // Get cached prefixes for this bucket
+        auto prefixes = m_kv_cache.get(bucket);
 
         // Request body with the subject (key)
-        std::string kv_subject = fmt::format("$KV.{}.{}", bucket, key);
+        std::string kv_subject = m_kv_cache.kv_subject(bucket, key);
         json req;
         req["last_by_subj"] = kv_subject;
 
         auto payload_str = req.dump();
         std::span<const char> payload(payload_str.data(), payload_str.size());
 
-        auto [response, req_status] = co_await request_impl(api_subject, payload, {}, timeout);
+        auto [response, req_status] = co_await request_impl(prefixes.direct_get, payload, {}, timeout);
 
         if (req_status.failed()) {
             co_return std::pair<kv_entry, status>{{}, req_status};
@@ -2429,8 +2602,8 @@ private:
             co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
-        // KV subject format: $KV.{bucket}.{key}
-        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+        // KV subject format: $KV.{bucket}.{key} (using cached prefix)
+        std::string subject = m_kv_cache.kv_subject(bucket, key);
 
         // Publish empty payload with KV-Operation: DEL header
         headers_t headers = {{"KV-Operation", "DEL"}};
@@ -2462,8 +2635,8 @@ private:
             co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
-        // KV subject format: $KV.{bucket}.{key}
-        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+        // KV subject format: $KV.{bucket}.{key} (using cached prefix)
+        std::string subject = m_kv_cache.kv_subject(bucket, key);
 
         // Publish empty payload with KV-Operation: PURGE and Nats-Rollup: sub headers
         // Nats-Rollup: sub tells the server to remove all previous messages for this subject
@@ -2499,8 +2672,8 @@ private:
             co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
-        // KV subject format: $KV.{bucket}.{key}
-        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+        // KV subject format: $KV.{bucket}.{key} (using cached prefix)
+        std::string subject = m_kv_cache.kv_subject(bucket, key);
 
         // Use Nats-Expected-Last-Subject-Sequence: 0 to ensure key doesn't exist
         headers_t headers = {{"Nats-Expected-Last-Subject-Sequence", "0"}};
@@ -2539,8 +2712,8 @@ private:
             co_return std::pair<uint64_t, status>{0, status(error_code::not_connected)};
         }
 
-        // KV subject format: $KV.{bucket}.{key}
-        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+        // KV subject format: $KV.{bucket}.{key} (using cached prefix)
+        std::string subject = m_kv_cache.kv_subject(bucket, key);
 
         // Use Nats-Expected-Last-Subject-Sequence to ensure revision matches
         headers_t headers = {{"Nats-Expected-Last-Subject-Sequence", std::to_string(revision)}};
@@ -2571,20 +2744,17 @@ private:
             co_return std::pair<std::vector<std::string>, status>{{}, status(error_code::not_connected)};
         }
 
-        // Stream name for KV bucket: KV_{bucket}
-        std::string stream_name = fmt::format("KV_{}", bucket);
-
-        // Use stream info API with subjects filter: $JS.API.STREAM.INFO.{stream}
-        std::string api_subject = fmt::format("$JS.API.STREAM.INFO.{}", stream_name);
+        // Get cached prefixes for this bucket
+        auto prefixes = m_kv_cache.get(bucket);
 
         // Request body with subjects filter to get all subjects (use nlohmann for building)
         nlohmann::json req;
-        req["subjects_filter"] = fmt::format("$KV.{}.>", bucket);
+        req["subjects_filter"] = subjects::kv_wildcard(bucket);
 
         auto payload_str = req.dump();
         std::span<const char> payload(payload_str.data(), payload_str.size());
 
-        auto [response, req_status] = co_await request_impl(api_subject, payload, {}, timeout);
+        auto [response, req_status] = co_await request_impl(prefixes.stream_info, payload, {}, timeout);
 
         if (req_status.failed()) {
             co_return std::pair<std::vector<std::string>, status>{{}, req_status};
@@ -2605,9 +2775,9 @@ private:
             co_return std::pair<std::vector<std::string>, status>{{}, status(err_desc.empty() ? "stream info failed" : std::string(err_desc))};
         }
 
-        // Extract keys from state.subjects map
+        // Extract keys from state.subjects map using cached prefix
         // Format: { "state": { "subjects": { "$KV.bucket.key1": 1, "$KV.bucket.key2": 1, ... } } }
-        std::string prefix = fmt::format("$KV.{}.", bucket);
+        const auto& prefix = prefixes.kv_prefix;
         auto state = parser.doc()["state"];
         if (!state.error()) {
             auto subjects = state["subjects"];
@@ -2646,12 +2816,9 @@ private:
 
         using nlohmann::json;
 
-        // Stream name for KV bucket: KV_{bucket}
-        std::string stream_name = fmt::format("KV_{}", bucket);
-        std::string kv_subject = fmt::format("$KV.{}.{}", bucket, key);
-
-        // Use direct get API: $JS.API.DIRECT.GET.{stream}
-        std::string api_subject = fmt::format("$JS.API.DIRECT.GET.{}", stream_name);
+        // Get cached prefixes and build subject
+        auto prefixes = m_kv_cache.get(bucket);
+        std::string kv_subject = m_kv_cache.kv_subject(bucket, key);
 
         std::vector<kv_entry> history;
         uint64_t last_seq = 0;
@@ -2671,7 +2838,7 @@ private:
             auto payload_str = req.dump();
             std::span<const char> payload(payload_str.data(), payload_str.size());
 
-            auto [response, req_status] = co_await request_impl(api_subject, payload, {}, timeout);
+            auto [response, req_status] = co_await request_impl(prefixes.direct_get, payload, {}, timeout);
 
             if (req_status.failed()) {
                 // Check if it's "no message found" - that means we've reached the end
@@ -2753,11 +2920,8 @@ private:
 
         using nlohmann::json;
 
-        // Stream name for KV bucket: KV_{bucket}
-        std::string stream_name = fmt::format("KV_{}", bucket);
-
-        // Use direct get API to fetch the value at the specific revision
-        std::string api_subject = fmt::format("$JS.API.DIRECT.GET.{}", stream_name);
+        // Get cached prefixes for this bucket
+        auto prefixes = m_kv_cache.get(bucket);
 
         // Request the message at the specific sequence number
         json req;
@@ -2766,7 +2930,7 @@ private:
         auto payload_str = req.dump();
         std::span<const char> payload(payload_str.data(), payload_str.size());
 
-        auto [response, req_status] = co_await request_impl(api_subject, payload, {}, timeout);
+        auto [response, req_status] = co_await request_impl(prefixes.direct_get, payload, {}, timeout);
 
         if (req_status.failed()) {
             co_return std::pair<uint64_t, status>{0, status(fmt::format("failed to get revision {}: {}", revision, req_status.error()))};
@@ -2780,7 +2944,7 @@ private:
         }
 
         // Verify this message is for the correct key by checking subject
-        std::string expected_subject = fmt::format("$KV.{}.{}", bucket, key);
+        std::string expected_subject = m_kv_cache.kv_subject(bucket, key);
         if (response.subject != expected_subject) {
             co_return std::pair<uint64_t, status>{0, status(fmt::format("revision {} is not for key '{}'", revision, key))};
         }
@@ -2794,8 +2958,8 @@ private:
             }
         }
 
-        // Now put the value back as a new revision
-        std::string subject = fmt::format("$KV.{}.{}", bucket, key);
+        // Now put the value back as a new revision (reuse expected_subject)
+        const std::string& subject = expected_subject;
         std::span<const char> value_span(response.payload.data(), response.payload.size());
 
         auto [ack, pub_status] = co_await js_publish_impl(subject, value_span, {}, timeout, true);
@@ -2829,16 +2993,19 @@ private:
         std::string bucket_str(bucket);
         std::string key_filter_str(key);
 
+        // Get cached prefixes
+        auto prefixes = m_kv_cache.get(bucket);
+
         // Build filter subject: $KV.{bucket}.{key} or $KV.{bucket}.> for all keys
         std::string filter_subject;
         if (key.empty()) {
-            filter_subject = fmt::format("$KV.{}.>", bucket);
+            filter_subject = subjects::kv_wildcard(bucket);
         } else {
-            filter_subject = fmt::format("$KV.{}.{}", bucket, key);
+            filter_subject = m_kv_cache.kv_subject(bucket, key);
         }
 
-        // KV stream name is KV_{bucket}
-        std::string stream_name = fmt::format("KV_{}", bucket);
+        // KV stream name (from cache)
+        const std::string& stream_name = prefixes.stream_name;
 
         // Generate delivery subject for push consumer
         std::string deliver_subject = generate_inbox();
@@ -3270,6 +3437,9 @@ private:
     // Write coalescing queue
     write_queue m_write_queue;
     std::atomic<bool> m_flush_running{false};
+
+    // KV prefix cache for efficient subject building
+    mutable kv_prefix_cache m_kv_cache;
 
     std::shared_ptr<ssl::context> m_ssl_ctx;
     uni_socket<SocketType> m_socket;
