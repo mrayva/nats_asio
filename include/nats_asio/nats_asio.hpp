@@ -1610,10 +1610,74 @@ public:
         return m_is_connected;
     }
 
+    // Get connection statistics
+    [[nodiscard]] virtual const connection_stats& stats() const noexcept override {
+        return m_stats;
+    }
+
+    // Check if connection is draining
+    [[nodiscard]] virtual bool is_draining() const noexcept override {
+        return m_draining.load(std::memory_order_acquire);
+    }
+
+    // Graceful drain - stops accepting new operations, flushes pending writes
+    virtual asio::awaitable<status> drain(
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(30000)) override {
+
+        if (!m_is_connected) {
+            co_return status(error_code::not_connected);
+        }
+
+        // Mark as draining - new publishes will be rejected
+        m_draining.store(true, std::memory_order_release);
+
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+
+        // 1. Flush any pending write queue data
+        if (!m_write_queue.empty()) {
+            auto flush_status = co_await flush();
+            if (flush_status.failed()) {
+                m_draining.store(false, std::memory_order_release);
+                co_return flush_status;
+            }
+        }
+
+        // 2. Unsubscribe all subscriptions
+        std::vector<isubscription_sptr> subs_to_remove;
+        for (auto& [sid, sub] : m_subs) {
+            subs_to_remove.push_back(sub);
+        }
+
+        for (auto& sub : subs_to_remove) {
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                m_draining.store(false, std::memory_order_release);
+                co_return status(error_code::timeout, "drain timeout during unsubscribe");
+            }
+            co_await unsubscribe_impl(sub);
+        }
+
+        // 3. Final flush to ensure all unsub commands are sent
+        if (!m_write_queue.empty()) {
+            co_await flush();
+        }
+
+        // 4. Stop the connection
+        m_stop_flag.store(true, std::memory_order_release);
+
+        m_draining.store(false, std::memory_order_release);
+        co_return status();
+    }
+
     virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                             optional<string_view> reply_to) override {
         if (!m_is_connected) {
             co_return status(error_code::not_connected);
+        }
+
+        if (m_draining.load(std::memory_order_acquire)) {
+            co_return status(error_code::connection_closed, "connection is draining");
         }
 
         if (m_max_payload > 0 && payload.size() > m_max_payload) {
@@ -1634,11 +1698,17 @@ public:
         buffers->emplace_back(asio::buffer(payload.data(), payload.size()));
         buffers->emplace_back(asio::buffer(protocol::crlf.data(), protocol::crlf.size()));
 
+        size_t total_bytes = header->size() + payload.size() + protocol::crlf.size();
+
         try {
             co_await asio::async_write(m_socket, *buffers, asio::use_awaitable);
         } catch (const std::system_error& e) {
             co_return status(e.code().message());
         }
+
+        // Update stats
+        m_stats.msgs_sent.fetch_add(1, std::memory_order_relaxed);
+        m_stats.bytes_sent.fetch_add(total_bytes, std::memory_order_relaxed);
 
         co_return status();
     }
@@ -1694,6 +1764,10 @@ public:
                                   optional<string_view> reply_to = {}) override {
         if (!m_is_connected) {
             return status(error_code::not_connected);
+        }
+
+        if (m_draining.load(std::memory_order_acquire)) {
+            return status(error_code::connection_closed, "connection is draining");
         }
 
         if (m_max_payload > 0 && payload.size() > m_max_payload) {
@@ -3057,6 +3131,9 @@ private:
     }
 
     awaitable<void> on_pong() override {
+        // Reset outstanding pings - connection is alive
+        m_pings_outstanding.store(0, std::memory_order_release);
+        m_stats.pongs_received.fetch_add(1, std::memory_order_relaxed);
         co_return;
     }
 
@@ -3094,6 +3171,10 @@ private:
                                       asio::transfer_at_least(static_cast<std::size_t>(bytes_to_transfer)),
                                       use_awaitable);
         }
+
+        // Update stats
+        m_stats.msgs_received.fetch_add(1, std::memory_order_relaxed);
+        m_stats.bytes_received.fetch_add(n, std::memory_order_relaxed);
 
         std::size_t sid_u = 0;
         if (!parse_int(sid_str, sid_u)) {
@@ -3149,6 +3230,10 @@ private:
                                       asio::transfer_at_least(static_cast<std::size_t>(bytes_to_transfer)),
                                       use_awaitable);
         }
+
+        // Update stats
+        m_stats.msgs_received.fetch_add(1, std::memory_order_relaxed);
+        m_stats.bytes_received.fetch_add(total_len, std::memory_order_relaxed);
 
         std::size_t sid_u = 0;
         if (!parse_int(sid_str, sid_u)) {
@@ -3271,6 +3356,11 @@ private:
         uint32_t retry_delay_ms = conf.retry_initial_delay_ms;
         uint32_t retry_count = 0;
 
+        // Store ping configuration
+        m_ping_interval_ms = conf.ping_interval_ms;
+        m_ping_timeout_ms = conf.ping_timeout_ms;
+        m_max_pings_outstanding = conf.max_pings_outstanding;
+
         for (;;) {
             if (m_stop_flag) {
                 co_return;
@@ -3301,7 +3391,22 @@ private:
                 retry_delay_ms = conf.retry_initial_delay_ms;
                 retry_count = 0;
 
+                // Update stats for reconnection
+                if (m_stats.reconnect_count.load(std::memory_order_relaxed) > 0 ||
+                    m_stats.connected_at != std::chrono::steady_clock::time_point{}) {
+                    m_stats.reconnect_count.fetch_add(1, std::memory_order_relaxed);
+                }
+                m_stats.connected_at = std::chrono::steady_clock::now();
+                m_pings_outstanding.store(0, std::memory_order_release);
+
                 m_is_connected = true;
+
+                // Start ping loop if configured
+                if (m_ping_interval_ms > 0 &&
+                    !m_ping_loop_running.exchange(true, std::memory_order_acq_rel)) {
+                    asio::co_spawn(m_io, ping_loop(), asio::detached);
+                }
+
                 if (m_connected_cb) {
                     co_await m_connected_cb(*this);
                 }
@@ -3386,6 +3491,53 @@ private:
         co_return;
     }
 
+    // Background coroutine for ping/pong keep-alive
+    asio::awaitable<void> ping_loop() {
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+
+        while (m_is_connected && !m_stop_flag && !m_draining.load(std::memory_order_acquire)) {
+            if (m_ping_interval_ms == 0) {
+                // Ping disabled, stop the loop
+                break;
+            }
+
+            // Wait for ping interval
+            timer.expires_after(std::chrono::milliseconds(m_ping_interval_ms));
+            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+
+            if (ec || !m_is_connected || m_stop_flag || m_draining.load(std::memory_order_acquire)) {
+                break;
+            }
+
+            // Check for too many outstanding pings
+            uint32_t outstanding = m_pings_outstanding.load(std::memory_order_acquire);
+            if (outstanding >= m_max_pings_outstanding) {
+                // Connection appears dead - too many unanswered pings
+                if (m_error_cb) {
+                    co_await m_error_cb(*this, fmt::format(
+                        "connection timeout: {} pings without response", outstanding));
+                }
+                // Trigger disconnect
+                m_stop_flag.store(true, std::memory_order_release);
+                break;
+            }
+
+            // Send PING
+            try {
+                co_await asio::async_write(m_socket,
+                    asio::buffer("PING\r\n", 6), asio::use_awaitable);
+                m_pings_outstanding.fetch_add(1, std::memory_order_acq_rel);
+                m_stats.pings_sent.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::system_error&) {
+                // Connection error - will be handled by main read loop
+                break;
+            }
+        }
+
+        m_ping_loop_running.store(false, std::memory_order_release);
+        co_return;
+    }
+
     std::string prepare_info(const connect_config& o) {
         constexpr auto name = "nats_asio";
         constexpr auto lang = "cpp";
@@ -3423,6 +3575,7 @@ private:
 
     std::atomic<bool> m_is_connected;
     std::atomic<bool> m_stop_flag;
+    std::atomic<bool> m_draining{false};
 
     std::unordered_map<uint64_t, subscription_sptr> m_subs;
     on_connected_cb m_connected_cb;
@@ -3440,6 +3593,16 @@ private:
 
     // KV prefix cache for efficient subject building
     mutable kv_prefix_cache m_kv_cache;
+
+    // Connection statistics
+    mutable connection_stats m_stats;
+
+    // Ping/pong state
+    std::atomic<uint32_t> m_pings_outstanding{0};
+    std::atomic<bool> m_ping_loop_running{false};
+    uint32_t m_ping_interval_ms{0};
+    uint32_t m_ping_timeout_ms{0};
+    uint32_t m_max_pings_outstanding{0};
 
     std::shared_ptr<ssl::context> m_ssl_ctx;
     uni_socket<SocketType> m_socket;

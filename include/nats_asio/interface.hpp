@@ -397,6 +397,45 @@ struct ssl_config {
     bool verify = true;
 };
 
+// Connection statistics for monitoring and diagnostics
+struct connection_stats {
+    // Message counts
+    std::atomic<uint64_t> msgs_sent{0};
+    std::atomic<uint64_t> msgs_received{0};
+
+    // Byte counts
+    std::atomic<uint64_t> bytes_sent{0};
+    std::atomic<uint64_t> bytes_received{0};
+
+    // Connection state
+    std::atomic<uint32_t> reconnect_count{0};
+    std::chrono::steady_clock::time_point connected_at{};
+
+    // Ping/pong statistics
+    std::atomic<uint64_t> pings_sent{0};
+    std::atomic<uint64_t> pongs_received{0};
+
+    // Reset all counters
+    void reset() noexcept {
+        msgs_sent.store(0, std::memory_order_relaxed);
+        msgs_received.store(0, std::memory_order_relaxed);
+        bytes_sent.store(0, std::memory_order_relaxed);
+        bytes_received.store(0, std::memory_order_relaxed);
+        reconnect_count.store(0, std::memory_order_relaxed);
+        pings_sent.store(0, std::memory_order_relaxed);
+        pongs_received.store(0, std::memory_order_relaxed);
+    }
+
+    // Get uptime since connected
+    std::chrono::milliseconds uptime() const noexcept {
+        if (connected_at == std::chrono::steady_clock::time_point{}) {
+            return std::chrono::milliseconds{0};
+        }
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - connected_at);
+    }
+};
+
 struct connect_config {
     std::string address;
     uint16_t port;
@@ -416,6 +455,11 @@ struct connect_config {
     // Socket buffer tuning (0 = use system defaults)
     uint32_t send_buffer_size = 0;     // SO_SNDBUF - send buffer size in bytes
     uint32_t recv_buffer_size = 0;     // SO_RCVBUF - receive buffer size in bytes
+
+    // Ping/pong keep-alive configuration
+    uint32_t ping_interval_ms = 30000;   // Ping interval in milliseconds (0 = disabled)
+    uint32_t ping_timeout_ms = 10000;    // Pong timeout before connection is considered dead
+    uint32_t max_pings_outstanding = 2;  // Max unanswered pings before disconnect
 };
 
 struct iconnection {
@@ -426,6 +470,18 @@ struct iconnection {
     virtual void stop() noexcept = 0;
 
     [[nodiscard]] virtual bool is_connected() noexcept = 0;
+
+    // Get connection statistics
+    [[nodiscard]] virtual const connection_stats& stats() const noexcept = 0;
+
+    // Graceful drain - stops accepting new operations, flushes pending writes,
+    // waits for outstanding acks, then closes connection
+    // Returns when drain is complete or timeout expires
+    [[nodiscard]] virtual asio::awaitable<status> drain(
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(30000)) = 0;
+
+    // Check if connection is draining
+    [[nodiscard]] virtual bool is_draining() const noexcept = 0;
 
     // Basic publish (no headers)
     [[nodiscard]] virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
