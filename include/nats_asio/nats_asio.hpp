@@ -466,6 +466,93 @@ private:
 };
 
 // ============================================================================
+// Offline Message Queue - Queues messages when disconnected
+// ============================================================================
+
+// Message stored in offline queue
+struct offline_message {
+    std::string subject;
+    std::vector<char> payload;
+    headers_t headers;
+    optional<std::string> reply_to;
+    std::chrono::steady_clock::time_point queued_at;
+};
+
+// Thread-safe offline message queue with size limits
+class offline_queue {
+public:
+    offline_queue(uint32_t max_size = 10000, uint32_t max_bytes = 10485760)
+        : m_max_size(max_size), m_max_bytes(max_bytes) {}
+
+    // Enqueue a message, returns true if successful, false if queue is full or disabled
+    bool enqueue(string_view subject, std::span<const char> payload,
+                 const headers_t& headers, optional<string_view> reply_to) {
+        if (m_max_size == 0) return false;  // Queue disabled
+
+        std::lock_guard lock(m_mutex);
+
+        size_t msg_bytes = subject.size() + payload.size();
+        for (const auto& [k, v] : headers) {
+            msg_bytes += k.size() + v.size();
+        }
+        if (reply_to) msg_bytes += reply_to->size();
+
+        // Check limits
+        if (m_queue.size() >= m_max_size || m_current_bytes + msg_bytes > m_max_bytes) {
+            return false;
+        }
+
+        offline_message msg;
+        msg.subject = std::string(subject);
+        msg.payload.assign(payload.begin(), payload.end());
+        msg.headers = headers;
+        if (reply_to) msg.reply_to = std::string(*reply_to);
+        msg.queued_at = std::chrono::steady_clock::now();
+
+        m_queue.push_back(std::move(msg));
+        m_current_bytes += msg_bytes;
+        return true;
+    }
+
+    // Drain all messages from the queue
+    std::vector<offline_message> drain() {
+        std::lock_guard lock(m_mutex);
+        std::vector<offline_message> result = std::move(m_queue);
+        m_queue.clear();
+        m_current_bytes = 0;
+        return result;
+    }
+
+    size_t size() const {
+        std::lock_guard lock(m_mutex);
+        return m_queue.size();
+    }
+
+    size_t bytes() const {
+        std::lock_guard lock(m_mutex);
+        return m_current_bytes;
+    }
+
+    bool empty() const {
+        std::lock_guard lock(m_mutex);
+        return m_queue.empty();
+    }
+
+    void clear() {
+        std::lock_guard lock(m_mutex);
+        m_queue.clear();
+        m_current_bytes = 0;
+    }
+
+private:
+    mutable std::mutex m_mutex;
+    std::vector<offline_message> m_queue;
+    uint32_t m_max_size;
+    uint32_t m_max_bytes;
+    size_t m_current_bytes{0};
+};
+
+// ============================================================================
 // Fast JSON Parsing - Uses simdjson (~10x faster than nlohmann::json)
 // ============================================================================
 
@@ -2028,7 +2115,16 @@ public:
 
     virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                             optional<string_view> reply_to) override {
+        // Record start time for latency tracking
+        auto start_time = std::chrono::steady_clock::now();
+
+        // If not connected, try offline queue
         if (!m_is_connected) {
+            if (m_offline_queue && m_offline_queue->enqueue(subject, payload, {}, reply_to)) {
+                m_stats.offline_queued.fetch_add(1, std::memory_order_relaxed);
+                co_return status();  // Queued for later delivery
+            }
+            m_stats.offline_dropped.fetch_add(1, std::memory_order_relaxed);
             co_return status(error_code::not_connected);
         }
 
@@ -2043,6 +2139,24 @@ public:
 
         if (m_max_payload > 0 && payload.size() > m_max_payload) {
             co_return status(error_code::message_too_large);
+        }
+
+        // Publish with retry logic
+        auto result = co_await publish_with_retry(subject, payload, reply_to);
+
+        // Record latency
+        auto end_time = std::chrono::steady_clock::now();
+        auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        m_stats.record_latency(static_cast<uint64_t>(latency_us));
+
+        co_return result;
+    }
+
+    // Internal publish implementation without retry/offline queue (for draining and internal use)
+    asio::awaitable<status> publish_impl(string_view subject, std::span<const char> payload,
+                                         optional<string_view> reply_to) {
+        if (!m_is_connected) {
+            co_return status(error_code::not_connected);
         }
 
         // Use pooled buffers to reduce allocations
@@ -2076,6 +2190,59 @@ public:
         m_stats.bytes_sent.fetch_add(total_bytes, std::memory_order_relaxed);
 
         co_return status();
+    }
+
+    // Publish with exponential backoff retry
+    asio::awaitable<status> publish_with_retry(string_view subject, std::span<const char> payload,
+                                               optional<string_view> reply_to) {
+        uint32_t attempts = 0;
+        uint32_t delay_ms = m_publish_retry_initial_ms;
+
+        while (true) {
+            auto result = co_await publish_impl(subject, payload, reply_to);
+
+            if (result.ok()) {
+                co_return result;
+            }
+
+            // Don't retry if disabled or we've exhausted attempts
+            if (m_publish_retry_max == 0 || attempts >= m_publish_retry_max) {
+                if (attempts > 0) {
+                    m_stats.publish_retry_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                co_return result;
+            }
+
+            // Don't retry for non-retryable errors
+            if (result.code() == error_code::message_too_large ||
+                result.code() == error_code::invalid_subject ||
+                result.code() == error_code::permission_denied) {
+                co_return result;
+            }
+
+            // Not connected - try offline queue instead of retrying
+            if (result.code() == error_code::not_connected) {
+                if (m_offline_queue && m_offline_queue->enqueue(subject, payload, {}, reply_to)) {
+                    m_stats.offline_queued.fetch_add(1, std::memory_order_relaxed);
+                    co_return status();
+                }
+                m_stats.offline_dropped.fetch_add(1, std::memory_order_relaxed);
+                co_return result;
+            }
+
+            attempts++;
+            m_stats.publish_retries.fetch_add(1, std::memory_order_relaxed);
+
+            // Wait before retry with exponential backoff
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(delay_ms));
+            co_await timer.async_wait(asio::use_awaitable);
+
+            // Exponential backoff
+            delay_ms = std::min(
+                static_cast<uint32_t>(delay_ms * m_publish_retry_multiplier),
+                m_publish_retry_max_ms);
+        }
     }
 
     // Write pre-formatted NATS protocol data directly
@@ -2289,7 +2456,16 @@ public:
     virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                             const headers_t& headers,
                                             optional<string_view> reply_to = {}) override {
+        // Record start time for latency tracking
+        auto start_time = std::chrono::steady_clock::now();
+
+        // If not connected, try offline queue
         if (!m_is_connected) {
+            if (m_offline_queue && m_offline_queue->enqueue(subject, payload, headers, reply_to)) {
+                m_stats.offline_queued.fetch_add(1, std::memory_order_relaxed);
+                co_return status();  // Queued for later delivery
+            }
+            m_stats.offline_dropped.fetch_add(1, std::memory_order_relaxed);
             co_return status(error_code::not_connected);
         }
 
@@ -2300,6 +2476,35 @@ public:
         // Check circuit breaker
         if (!m_circuit_breaker.allow_request()) {
             co_return status(error_code::operation_failed, "circuit breaker is open");
+        }
+
+        // Check payload size early
+        pooled_string hdr_data(m_pools.large_strings);
+        serialize_headers_to(*hdr_data, headers);
+        std::size_t hdr_len = hdr_data->size();
+        std::size_t total_len = hdr_len + payload.size();
+
+        if (m_max_payload > 0 && total_len > m_max_payload) {
+            co_return status(error_code::message_too_large);
+        }
+
+        // Publish with retry logic
+        auto result = co_await publish_with_retry_headers(subject, payload, headers, reply_to);
+
+        // Record latency
+        auto end_time = std::chrono::steady_clock::now();
+        auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
+        m_stats.record_latency(static_cast<uint64_t>(latency_us));
+
+        co_return result;
+    }
+
+    // Internal publish with headers implementation without retry/offline queue
+    asio::awaitable<status> publish_impl(string_view subject, std::span<const char> payload,
+                                         const headers_t& headers,
+                                         optional<string_view> reply_to) {
+        if (!m_is_connected) {
+            co_return status(error_code::not_connected);
         }
 
         // Use pooled buffers
@@ -2326,6 +2531,8 @@ public:
         buffers->emplace_back(asio::buffer(payload.data(), payload.size()));
         buffers->emplace_back(asio::buffer(protocol::crlf.data(), protocol::crlf.size()));
 
+        size_t bytes_sent = cmd->size() + hdr_data->size() + payload.size() + protocol::crlf.size();
+
         try {
             co_await asio::async_write(m_socket, *buffers, asio::use_awaitable);
         } catch (const std::system_error& e) {
@@ -2334,7 +2541,64 @@ public:
         }
 
         m_circuit_breaker.record_success();
+        m_stats.msgs_sent.fetch_add(1, std::memory_order_relaxed);
+        m_stats.bytes_sent.fetch_add(bytes_sent, std::memory_order_relaxed);
+
         co_return status();
+    }
+
+    // Publish with headers with exponential backoff retry
+    asio::awaitable<status> publish_with_retry_headers(string_view subject, std::span<const char> payload,
+                                                       const headers_t& headers,
+                                                       optional<string_view> reply_to) {
+        uint32_t attempts = 0;
+        uint32_t delay_ms = m_publish_retry_initial_ms;
+
+        while (true) {
+            auto result = co_await publish_impl(subject, payload, headers, reply_to);
+
+            if (result.ok()) {
+                co_return result;
+            }
+
+            // Don't retry if disabled or we've exhausted attempts
+            if (m_publish_retry_max == 0 || attempts >= m_publish_retry_max) {
+                if (attempts > 0) {
+                    m_stats.publish_retry_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                co_return result;
+            }
+
+            // Don't retry for non-retryable errors
+            if (result.code() == error_code::message_too_large ||
+                result.code() == error_code::invalid_subject ||
+                result.code() == error_code::permission_denied) {
+                co_return result;
+            }
+
+            // Not connected - try offline queue instead of retrying
+            if (result.code() == error_code::not_connected) {
+                if (m_offline_queue && m_offline_queue->enqueue(subject, payload, headers, reply_to)) {
+                    m_stats.offline_queued.fetch_add(1, std::memory_order_relaxed);
+                    co_return status();
+                }
+                m_stats.offline_dropped.fetch_add(1, std::memory_order_relaxed);
+                co_return result;
+            }
+
+            attempts++;
+            m_stats.publish_retries.fetch_add(1, std::memory_order_relaxed);
+
+            // Wait before retry with exponential backoff
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(delay_ms));
+            co_await timer.async_wait(asio::use_awaitable);
+
+            // Exponential backoff
+            delay_ms = std::min(
+                static_cast<uint32_t>(delay_ms * m_publish_retry_multiplier),
+                m_publish_retry_max_ms);
+        }
     }
 
     // Request-reply pattern
@@ -3753,6 +4017,18 @@ private:
         m_compression_threshold = conf.compression_threshold;
         m_compression_level = conf.compression_level;
 
+        // Store publish retry settings
+        m_publish_retry_max = conf.publish_retry_max;
+        m_publish_retry_initial_ms = conf.publish_retry_initial_ms;
+        m_publish_retry_max_ms = conf.publish_retry_max_ms;
+        m_publish_retry_multiplier = conf.publish_retry_multiplier;
+
+        // Initialize offline queue if enabled
+        if (conf.offline_queue_max_size > 0) {
+            m_offline_queue = std::make_unique<offline_queue>(
+                conf.offline_queue_max_size, conf.offline_queue_max_bytes);
+        }
+
         // Random number generator for jitter
         std::random_device rd;
         std::mt19937 rng(rd());
@@ -3810,6 +4086,11 @@ private:
                 if (m_ping_interval_ms > 0 &&
                     !m_ping_loop_running.exchange(true, std::memory_order_acq_rel)) {
                     asio::co_spawn(m_io, ping_loop(), asio::detached);
+                }
+
+                // Drain offline queue if we have queued messages
+                if (m_offline_queue && !m_offline_queue->empty()) {
+                    co_await drain_offline_queue();
                 }
 
                 if (m_connected_cb) {
@@ -3893,6 +4174,54 @@ private:
         }
 
         m_flush_running.store(false, std::memory_order_release);
+        co_return;
+    }
+
+    // Drain offline queue after reconnection
+    asio::awaitable<void> drain_offline_queue() {
+        if (!m_offline_queue) {
+            co_return;
+        }
+
+        auto messages = m_offline_queue->drain();
+        if (messages.empty()) {
+            co_return;
+        }
+
+        size_t drained = 0;
+        for (auto& msg : messages) {
+            if (!m_is_connected || m_stop_flag) {
+                // Connection lost, re-queue remaining messages
+                for (size_t i = drained; i < messages.size(); ++i) {
+                    m_offline_queue->enqueue(
+                        messages[i].subject,
+                        std::span<const char>(messages[i].payload.data(), messages[i].payload.size()),
+                        messages[i].headers,
+                        messages[i].reply_to ? optional<string_view>(*messages[i].reply_to) : std::nullopt);
+                }
+                break;
+            }
+
+            std::span<const char> payload_span(msg.payload.data(), msg.payload.size());
+            status pub_status;
+            if (msg.headers.empty()) {
+                pub_status = co_await publish_impl(msg.subject, payload_span,
+                    msg.reply_to ? optional<string_view>(*msg.reply_to) : std::nullopt);
+            } else {
+                pub_status = co_await publish_impl(msg.subject, payload_span, msg.headers,
+                    msg.reply_to ? optional<string_view>(*msg.reply_to) : std::nullopt);
+            }
+
+            if (pub_status.ok()) {
+                drained++;
+                m_stats.offline_drained.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // Re-queue failed message (will be at back of queue)
+                m_offline_queue->enqueue(msg.subject, payload_span, msg.headers,
+                    msg.reply_to ? optional<string_view>(*msg.reply_to) : std::nullopt);
+            }
+        }
+
         co_return;
     }
 
@@ -4033,6 +4362,15 @@ private:
     // Compression settings
     uint32_t m_compression_threshold{0};
     int m_compression_level{3};
+
+    // Publish retry settings
+    uint32_t m_publish_retry_max{0};
+    uint32_t m_publish_retry_initial_ms{100};
+    uint32_t m_publish_retry_max_ms{5000};
+    float m_publish_retry_multiplier{2.0f};
+
+    // Offline message queue
+    std::unique_ptr<offline_queue> m_offline_queue;
 
     std::shared_ptr<ssl::context> m_ssl_ctx;
     uni_socket<SocketType> m_socket;

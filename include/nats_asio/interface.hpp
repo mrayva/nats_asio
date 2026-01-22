@@ -416,6 +416,71 @@ struct connection_stats {
     std::atomic<uint64_t> pings_sent{0};
     std::atomic<uint64_t> pongs_received{0};
 
+    // Publish retry statistics
+    std::atomic<uint64_t> publish_retries{0};
+    std::atomic<uint64_t> publish_retry_failures{0};
+
+    // Offline queue statistics
+    std::atomic<uint64_t> offline_queued{0};
+    std::atomic<uint64_t> offline_drained{0};
+    std::atomic<uint64_t> offline_dropped{0};
+
+    // Latency tracking (in microseconds) - uses simple histogram buckets
+    // Buckets: <100us, <500us, <1ms, <5ms, <10ms, <50ms, <100ms, <500ms, >=500ms
+    static constexpr size_t LATENCY_BUCKETS = 9;
+    std::atomic<uint64_t> latency_histogram[LATENCY_BUCKETS]{};
+    std::atomic<uint64_t> latency_count{0};
+    std::atomic<uint64_t> latency_sum_us{0};  // Sum for calculating average
+
+    // Record a latency sample in microseconds
+    void record_latency(uint64_t latency_us) noexcept {
+        latency_count.fetch_add(1, std::memory_order_relaxed);
+        latency_sum_us.fetch_add(latency_us, std::memory_order_relaxed);
+
+        size_t bucket;
+        if (latency_us < 100)        bucket = 0;
+        else if (latency_us < 500)   bucket = 1;
+        else if (latency_us < 1000)  bucket = 2;
+        else if (latency_us < 5000)  bucket = 3;
+        else if (latency_us < 10000) bucket = 4;
+        else if (latency_us < 50000) bucket = 5;
+        else if (latency_us < 100000) bucket = 6;
+        else if (latency_us < 500000) bucket = 7;
+        else                          bucket = 8;
+
+        latency_histogram[bucket].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Get approximate percentile latency in microseconds
+    // Uses linear interpolation within buckets
+    uint64_t latency_percentile(double percentile) const noexcept {
+        uint64_t total = latency_count.load(std::memory_order_relaxed);
+        if (total == 0) return 0;
+
+        uint64_t target = static_cast<uint64_t>(total * percentile / 100.0);
+        uint64_t cumulative = 0;
+
+        static constexpr uint64_t bucket_limits[] = {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000};
+        for (size_t i = 0; i < LATENCY_BUCKETS; ++i) {
+            uint64_t count = latency_histogram[i].load(std::memory_order_relaxed);
+            if (cumulative + count >= target) {
+                // Return approximate value at mid-point of bucket
+                return (i == 0) ? bucket_limits[0] / 2 : (bucket_limits[i-1] + bucket_limits[i]) / 2;
+            }
+            cumulative += count;
+        }
+        return bucket_limits[LATENCY_BUCKETS - 1];
+    }
+
+    // Convenience methods for common percentiles
+    uint64_t latency_p50() const noexcept { return latency_percentile(50); }
+    uint64_t latency_p95() const noexcept { return latency_percentile(95); }
+    uint64_t latency_p99() const noexcept { return latency_percentile(99); }
+    uint64_t latency_avg() const noexcept {
+        uint64_t count = latency_count.load(std::memory_order_relaxed);
+        return count > 0 ? latency_sum_us.load(std::memory_order_relaxed) / count : 0;
+    }
+
     // Reset all counters
     void reset() noexcept {
         msgs_sent.store(0, std::memory_order_relaxed);
@@ -425,6 +490,16 @@ struct connection_stats {
         reconnect_count.store(0, std::memory_order_relaxed);
         pings_sent.store(0, std::memory_order_relaxed);
         pongs_received.store(0, std::memory_order_relaxed);
+        publish_retries.store(0, std::memory_order_relaxed);
+        publish_retry_failures.store(0, std::memory_order_relaxed);
+        offline_queued.store(0, std::memory_order_relaxed);
+        offline_drained.store(0, std::memory_order_relaxed);
+        offline_dropped.store(0, std::memory_order_relaxed);
+        latency_count.store(0, std::memory_order_relaxed);
+        latency_sum_us.store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < LATENCY_BUCKETS; ++i) {
+            latency_histogram[i].store(0, std::memory_order_relaxed);
+        }
     }
 
     // Get uptime since connected
