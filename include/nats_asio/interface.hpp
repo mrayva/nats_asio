@@ -474,6 +474,16 @@ struct connect_config {
 
     // Inbox pool size for request-reply pattern (0 = generate new each time)
     uint32_t inbox_pool_size = 64;
+
+    // Publish retry configuration (0 = disabled)
+    uint32_t publish_retry_max = 3;              // Max retry attempts (0 = no retry)
+    uint32_t publish_retry_initial_ms = 100;     // Initial retry delay in ms
+    uint32_t publish_retry_max_ms = 5000;        // Max retry delay in ms
+    float publish_retry_multiplier = 2.0f;       // Backoff multiplier
+
+    // Offline queue configuration (0 = disabled)
+    uint32_t offline_queue_max_size = 10000;     // Max messages to queue when disconnected
+    uint32_t offline_queue_max_bytes = 10485760; // Max bytes to queue (10MB default)
 };
 
 // Circuit breaker state for monitoring
