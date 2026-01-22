@@ -57,6 +57,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <random>
 #include <simdjson.h>
 #include <sstream>
 #include <string>
@@ -108,6 +109,98 @@ template<typename T>
 inline T parse_int_or(string_view sv, T default_val) {
     T result;
     return parse_int(sv, result) ? result : default_val;
+}
+
+// ============================================================================
+// Fast Timestamp Parsing - Parses ISO 8601 without streams (~10x faster)
+// ============================================================================
+
+// Parse ISO 8601 timestamp: 2021-08-15T23:24:24.123456789Z
+// Returns system_clock::time_point, or epoch on parse error
+// Uses from_chars for fast integer parsing, avoids iostreams entirely
+inline std::chrono::system_clock::time_point fast_parse_timestamp(string_view sv) {
+    // Minimum format: YYYY-MM-DDTHH:MM:SSZ (20 chars)
+    if (sv.size() < 20) {
+        return std::chrono::system_clock::time_point{};
+    }
+
+    int year, month, day, hour, minute, second;
+    const char* p = sv.data();
+    const char* end = p + sv.size();
+
+    // Parse YYYY-MM-DDTHH:MM:SS
+    auto parse_field = [&p, end](int& out, size_t len) -> bool {
+        if (p + len > end) return false;
+        auto [ptr, ec] = std::from_chars(p, p + len, out);
+        if (ec != std::errc{} || ptr != p + len) return false;
+        p = ptr;
+        return true;
+    };
+
+    auto skip_char = [&p, end](char c) -> bool {
+        if (p >= end || *p != c) return false;
+        ++p;
+        return true;
+    };
+
+    if (!parse_field(year, 4)) return {};
+    if (!skip_char('-')) return {};
+    if (!parse_field(month, 2)) return {};
+    if (!skip_char('-')) return {};
+    if (!parse_field(day, 2)) return {};
+    if (!skip_char('T')) return {};
+    if (!parse_field(hour, 2)) return {};
+    if (!skip_char(':')) return {};
+    if (!parse_field(minute, 2)) return {};
+    if (!skip_char(':')) return {};
+    if (!parse_field(second, 2)) return {};
+
+    // Parse optional fractional seconds (.123456789)
+    long nanoseconds = 0;
+    if (p < end && *p == '.') {
+        ++p;
+        const char* frac_start = p;
+        // Read up to 9 digits
+        while (p < end && *p >= '0' && *p <= '9' && (p - frac_start) < 9) {
+            ++p;
+        }
+        size_t frac_len = p - frac_start;
+        if (frac_len > 0) {
+            int frac_val = 0;
+            std::from_chars(frac_start, p, frac_val);
+            // Scale to nanoseconds (pad with zeros if needed)
+            static const long scale[] = {
+                1000000000L, 100000000L, 10000000L, 1000000L,
+                100000L, 10000L, 1000L, 100L, 10L, 1L
+            };
+            if (frac_len <= 9) {
+                nanoseconds = frac_val * scale[frac_len];
+            }
+        }
+    }
+
+    // Build time_t using a simplified calculation (assumes UTC)
+    // Days since epoch calculation
+    auto days_from_civil = [](int y, int m, int d) -> long {
+        y -= m <= 2;
+        const int era = (y >= 0 ? y : y - 399) / 400;
+        const unsigned yoe = static_cast<unsigned>(y - era * 400);
+        const unsigned doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+        const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        return era * 146097 + static_cast<long>(doe) - 719468;
+    };
+
+    long days = days_from_civil(year, month, day);
+    long seconds_since_epoch = days * 86400L + hour * 3600L + minute * 60L + second;
+
+    auto tp = std::chrono::system_clock::from_time_t(
+        static_cast<std::time_t>(seconds_since_epoch));
+
+    // Add nanoseconds (converted to system_clock duration)
+    tp += std::chrono::duration_cast<std::chrono::system_clock::duration>(
+        std::chrono::nanoseconds(nanoseconds));
+
+    return tp;
 }
 
 // ============================================================================
@@ -1501,10 +1594,7 @@ inline kv_entry parse_kv_entry_from_message(const message& msg, string_view buck
         if (key == "Nats-Sequence") {
             parse_int(value, entry.revision);
         } else if (key == "Nats-Time-Stamp") {
-            std::tm tm = {};
-            std::istringstream ss(value);
-            ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
-            entry.created = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+            entry.created = fast_parse_timestamp(value);
         } else if (key == "KV-Operation") {
             if (value == "DEL") {
                 entry.op = kv_entry::operation::del;
@@ -1539,13 +1629,7 @@ inline js_message parse_js_message_metadata(const message& msg) {
         } else if (key == "Nats-Num-Pending") {
             parse_int(value, js_msg.num_pending);
         } else if (key == "Nats-Time-Stamp") {
-            // Parse ISO 8601 timestamp (simplified)
-            // Format: 2021-08-15T23:24:24.123456789Z
-            std::tm tm = {};
-            std::istringstream ss(value);
-            ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
-            auto tp = std::chrono::system_clock::from_time_t(std::mktime(&tm));
-            js_msg.timestamp = tp;
+            js_msg.timestamp = fast_parse_timestamp(value);
         }
     }
 
@@ -2637,11 +2721,7 @@ private:
             if (hdr_key == "Nats-Sequence") {
                 parse_int(hdr_val, entry.revision);
             } else if (hdr_key == "Nats-Time-Stamp") {
-                // Parse timestamp (simplified)
-                std::tm tm = {};
-                std::istringstream ss(hdr_val);
-                ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
-                entry.created = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+                entry.created = fast_parse_timestamp(hdr_val);
             } else if (hdr_key == "KV-Operation") {
                 if (hdr_val == "DEL") {
                     entry.op = kv_entry::operation::del;
@@ -2947,10 +3027,7 @@ private:
                     parse_int(hdr_val, entry.revision);
                     last_seq = entry.revision;
                 } else if (hdr_key == "Nats-Time-Stamp") {
-                    std::tm tm = {};
-                    std::istringstream ss(hdr_val);
-                    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
-                    entry.created = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+                    entry.created = fast_parse_timestamp(hdr_val);
                 } else if (hdr_key == "KV-Operation") {
                     if (hdr_val == "DEL") {
                         entry.op = kv_entry::operation::del;
@@ -3361,6 +3438,10 @@ private:
         m_ping_timeout_ms = conf.ping_timeout_ms;
         m_max_pings_outstanding = conf.max_pings_outstanding;
 
+        // Random number generator for jitter
+        std::random_device rd;
+        std::mt19937 rng(rd());
+
         for (;;) {
             if (m_stop_flag) {
                 co_return;
@@ -3377,8 +3458,17 @@ private:
                         co_return;
                     }
 
+                    // Apply jitter to delay: delay * (1 ± jitter_factor)
+                    uint32_t actual_delay = retry_delay_ms;
+                    if (conf.retry_jitter_factor > 0.0f) {
+                        float jitter_range = retry_delay_ms * conf.retry_jitter_factor;
+                        std::uniform_real_distribution<float> dist(-jitter_range, jitter_range);
+                        actual_delay = static_cast<uint32_t>(
+                            std::max(1.0f, retry_delay_ms + dist(rng)));
+                    }
+
                     asio::steady_timer timer(co_await asio::this_coro::executor);
-                    timer.expires_after(std::chrono::milliseconds(retry_delay_ms));
+                    timer.expires_after(std::chrono::milliseconds(actual_delay));
                     co_await timer.async_wait(asio::use_awaitable);
 
                     // Exponential backoff: double delay, cap at max
