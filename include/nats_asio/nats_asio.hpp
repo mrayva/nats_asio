@@ -204,6 +204,268 @@ inline std::chrono::system_clock::time_point fast_parse_timestamp(string_view sv
 }
 
 // ============================================================================
+// Optional Compression Support - Define NATS_ASIO_USE_ZSTD and link zstd
+// ============================================================================
+
+#ifdef NATS_ASIO_USE_ZSTD
+#include <zstd.h>
+
+// Compress data using zstd, returns empty vector on failure
+inline std::vector<char> zstd_compress(std::span<const char> data, int level = 3) {
+    size_t bound = ZSTD_compressBound(data.size());
+    std::vector<char> compressed(bound);
+
+    size_t result = ZSTD_compress(compressed.data(), bound,
+                                   data.data(), data.size(), level);
+    if (ZSTD_isError(result)) {
+        return {};
+    }
+
+    compressed.resize(result);
+    return compressed;
+}
+
+// Decompress zstd data, returns empty vector on failure
+inline std::vector<char> zstd_decompress(std::span<const char> data) {
+    // Get decompressed size from frame header
+    unsigned long long decompressed_size = ZSTD_getFrameContentSize(data.data(), data.size());
+    if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
+        decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+        // Unknown size, use streaming or estimate
+        decompressed_size = data.size() * 4;  // Estimate 4x expansion
+    }
+
+    std::vector<char> decompressed(decompressed_size);
+    size_t result = ZSTD_decompress(decompressed.data(), decompressed.size(),
+                                     data.data(), data.size());
+    if (ZSTD_isError(result)) {
+        return {};
+    }
+
+    decompressed.resize(result);
+    return decompressed;
+}
+
+// Check if data looks like zstd compressed (magic number check)
+inline bool is_zstd_compressed(std::span<const char> data) {
+    if (data.size() < 4) return false;
+    // zstd magic number: 0xFD2FB528 (little-endian)
+    return static_cast<unsigned char>(data[0]) == 0x28 &&
+           static_cast<unsigned char>(data[1]) == 0xB5 &&
+           static_cast<unsigned char>(data[2]) == 0x2F &&
+           static_cast<unsigned char>(data[3]) == 0xFD;
+}
+#endif // NATS_ASIO_USE_ZSTD
+
+// ============================================================================
+// Inbox Pool - Reuse inbox strings for request-reply pattern
+// ============================================================================
+
+class inbox_pool {
+public:
+    explicit inbox_pool(size_t pool_size = 64, string_view prefix = "_INBOX.")
+        : m_pool(pool_size), m_prefix(prefix), m_counter(0) {
+        // Pre-generate inbox strings
+        for (size_t i = 0; i < pool_size; ++i) {
+            m_pool.enqueue(generate_inbox_string());
+        }
+    }
+
+    // Get an inbox from the pool (or generate new if empty)
+    std::string acquire() {
+        std::string inbox;
+        if (m_pool.try_dequeue(inbox)) {
+            return inbox;
+        }
+        // Pool empty, generate new
+        return generate_inbox_string();
+    }
+
+    // Return an inbox to the pool for reuse
+    void release(std::string&& inbox) {
+        // Only return if pool isn't full
+        m_pool.enqueue(std::move(inbox));
+    }
+
+    // RAII handle for automatic inbox management
+    class scoped_inbox {
+    public:
+        scoped_inbox(inbox_pool& pool) : m_pool(&pool), m_inbox(pool.acquire()) {}
+        ~scoped_inbox() { if (m_pool) m_pool->release(std::move(m_inbox)); }
+
+        scoped_inbox(scoped_inbox&& other) noexcept
+            : m_pool(other.m_pool), m_inbox(std::move(other.m_inbox)) {
+            other.m_pool = nullptr;
+        }
+
+        scoped_inbox& operator=(scoped_inbox&& other) noexcept {
+            if (this != &other) {
+                if (m_pool) m_pool->release(std::move(m_inbox));
+                m_pool = other.m_pool;
+                m_inbox = std::move(other.m_inbox);
+                other.m_pool = nullptr;
+            }
+            return *this;
+        }
+
+        scoped_inbox(const scoped_inbox&) = delete;
+        scoped_inbox& operator=(const scoped_inbox&) = delete;
+
+        const std::string& get() const { return m_inbox; }
+        operator const std::string&() const { return m_inbox; }
+
+    private:
+        inbox_pool* m_pool;
+        std::string m_inbox;
+    };
+
+    scoped_inbox get_scoped() { return scoped_inbox(*this); }
+
+private:
+    std::string generate_inbox_string() {
+        // Generate unique inbox: _INBOX.<random>.<counter>
+        uint64_t count = m_counter.fetch_add(1, std::memory_order_relaxed);
+        // Use a simple hash of time + counter for uniqueness
+        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        uint64_t hash = now ^ (count * 0x9E3779B97F4A7C15ULL);
+
+        // Convert to base62 string for compactness
+        static constexpr char chars[] =
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        char buf[12];
+        for (int i = 0; i < 11; ++i) {
+            buf[i] = chars[hash % 62];
+            hash /= 62;
+        }
+        buf[11] = '\0';
+
+        std::string result;
+        result.reserve(m_prefix.size() + 11);
+        result += m_prefix;
+        result += buf;
+        return result;
+    }
+
+    moodycamel::ConcurrentQueue<std::string> m_pool;
+    std::string m_prefix;
+    std::atomic<uint64_t> m_counter;
+};
+
+// ============================================================================
+// Circuit Breaker - Auto-disable publishing on repeated failures
+// ============================================================================
+
+class circuit_breaker_impl {
+public:
+    circuit_breaker_impl() = default;
+
+    void configure(uint32_t threshold, uint32_t timeout_ms, uint32_t half_open_max) {
+        m_threshold = threshold;
+        m_timeout = std::chrono::milliseconds(timeout_ms);
+        m_half_open_max = half_open_max;
+    }
+
+    // Check if request should be allowed
+    // Returns true if allowed, false if circuit is open
+    bool allow_request() {
+        if (m_threshold == 0) return true;  // Disabled
+
+        auto state = m_stats.state.load(std::memory_order_acquire);
+
+        switch (state) {
+            case circuit_state::closed:
+                return true;
+
+            case circuit_state::open: {
+                // Check if timeout expired -> transition to half-open
+                auto now = std::chrono::steady_clock::now();
+                if (now - m_stats.opened_at >= m_timeout) {
+                    // Try to transition to half-open
+                    circuit_state expected = circuit_state::open;
+                    if (m_stats.state.compare_exchange_strong(expected, circuit_state::half_open,
+                                                              std::memory_order_acq_rel)) {
+                        m_stats.success_count.store(0, std::memory_order_relaxed);
+                    }
+                    return true;
+                }
+                m_stats.rejected_count.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+
+            case circuit_state::half_open:
+                // Allow limited requests to test recovery
+                if (m_stats.success_count.load(std::memory_order_relaxed) +
+                    m_stats.failure_count.load(std::memory_order_relaxed) < m_half_open_max) {
+                    return true;
+                }
+                m_stats.rejected_count.fetch_add(1, std::memory_order_relaxed);
+                return false;
+        }
+        return true;
+    }
+
+    // Record successful operation
+    void record_success() {
+        if (m_threshold == 0) return;
+
+        auto state = m_stats.state.load(std::memory_order_acquire);
+
+        if (state == circuit_state::half_open) {
+            uint32_t successes = m_stats.success_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            // If enough successes in half-open, close the circuit
+            if (successes >= m_half_open_max) {
+                m_stats.state.store(circuit_state::closed, std::memory_order_release);
+                m_stats.failure_count.store(0, std::memory_order_relaxed);
+            }
+        } else if (state == circuit_state::closed) {
+            // Decay failure count on success (gradual recovery)
+            uint32_t failures = m_stats.failure_count.load(std::memory_order_relaxed);
+            if (failures > 0) {
+                m_stats.failure_count.compare_exchange_weak(failures, failures - 1,
+                                                            std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // Record failed operation
+    void record_failure() {
+        if (m_threshold == 0) return;
+
+        m_stats.last_failure_time = std::chrono::steady_clock::now();
+        auto state = m_stats.state.load(std::memory_order_acquire);
+
+        if (state == circuit_state::half_open) {
+            // Any failure in half-open -> back to open
+            m_stats.state.store(circuit_state::open, std::memory_order_release);
+            m_stats.opened_at = std::chrono::steady_clock::now();
+        } else if (state == circuit_state::closed) {
+            uint32_t failures = m_stats.failure_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (failures >= m_threshold) {
+                // Open the circuit
+                circuit_state expected = circuit_state::closed;
+                if (m_stats.state.compare_exchange_strong(expected, circuit_state::open,
+                                                          std::memory_order_acq_rel)) {
+                    m_stats.opened_at = std::chrono::steady_clock::now();
+                }
+            }
+        }
+    }
+
+    // Reset circuit breaker to closed state
+    void reset() noexcept {
+        m_stats.reset();
+    }
+
+    const circuit_breaker_stats& stats() const noexcept { return m_stats; }
+
+private:
+    circuit_breaker_stats m_stats;
+    uint32_t m_threshold{0};
+    std::chrono::milliseconds m_timeout{30000};
+    uint32_t m_half_open_max{3};
+};
+
+// ============================================================================
 // Fast JSON Parsing - Uses simdjson (~10x faster than nlohmann::json)
 // ============================================================================
 
@@ -1704,6 +1966,16 @@ public:
         return m_draining.load(std::memory_order_acquire);
     }
 
+    // Get circuit breaker stats
+    [[nodiscard]] virtual const circuit_breaker_stats& circuit_breaker() const noexcept override {
+        return m_circuit_breaker.stats();
+    }
+
+    // Reset circuit breaker to closed state
+    virtual void reset_circuit_breaker() noexcept override {
+        m_circuit_breaker.reset();
+    }
+
     // Graceful drain - stops accepting new operations, flushes pending writes
     virtual asio::awaitable<status> drain(
         std::chrono::milliseconds timeout = std::chrono::milliseconds(30000)) override {
@@ -1764,6 +2036,11 @@ public:
             co_return status(error_code::connection_closed, "connection is draining");
         }
 
+        // Check circuit breaker
+        if (!m_circuit_breaker.allow_request()) {
+            co_return status(error_code::operation_failed, "circuit breaker is open");
+        }
+
         if (m_max_payload > 0 && payload.size() > m_max_payload) {
             co_return status(error_code::message_too_large);
         }
@@ -1787,8 +2064,12 @@ public:
         try {
             co_await asio::async_write(m_socket, *buffers, asio::use_awaitable);
         } catch (const std::system_error& e) {
+            m_circuit_breaker.record_failure();
             co_return status(e.code().message());
         }
+
+        // Record success for circuit breaker
+        m_circuit_breaker.record_success();
 
         // Update stats
         m_stats.msgs_sent.fetch_add(1, std::memory_order_relaxed);
@@ -2012,6 +2293,15 @@ public:
             co_return status(error_code::not_connected);
         }
 
+        if (m_draining.load(std::memory_order_acquire)) {
+            co_return status(error_code::connection_closed, "connection is draining");
+        }
+
+        // Check circuit breaker
+        if (!m_circuit_breaker.allow_request()) {
+            co_return status(error_code::operation_failed, "circuit breaker is open");
+        }
+
         // Use pooled buffers
         pooled_string hdr_data(m_pools.large_strings);
         serialize_headers_to(*hdr_data, headers);
@@ -2039,9 +2329,11 @@ public:
         try {
             co_await asio::async_write(m_socket, *buffers, asio::use_awaitable);
         } catch (const std::system_error& e) {
+            m_circuit_breaker.record_failure();
             co_return status(e.code().message());
         }
 
+        m_circuit_breaker.record_success();
         co_return status();
     }
 
@@ -2193,8 +2485,8 @@ private:
             co_return std::pair<message, status>{{}, status(error_code::not_connected)};
         }
 
-        // Generate unique inbox
-        auto inbox = generate_inbox();
+        // Get inbox from pool (or generate new)
+        auto inbox = get_inbox();
 
         // Create shared state for response
         auto state = std::make_shared<request_state>();
@@ -2214,6 +2506,7 @@ private:
             {.max_messages = 1});
 
         if (sub_status.failed()) {
+            return_inbox(std::move(inbox));
             co_return std::pair<message, status>{{}, sub_status};
         }
 
@@ -2227,6 +2520,7 @@ private:
 
         if (pub_status.failed()) {
             co_await unsubscribe(sub);
+            return_inbox(std::move(inbox));
             co_return std::pair<message, status>{{}, pub_status};
         }
 
@@ -2238,6 +2532,7 @@ private:
             auto now = std::chrono::steady_clock::now();
             if (now >= deadline) {
                 co_await unsubscribe(sub);
+                return_inbox(std::move(inbox));
                 co_return std::pair<message, status>{{}, status(error_code::request_timeout)};
             }
 
@@ -2246,10 +2541,13 @@ private:
             auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
             if (ec && ec != asio::error::operation_aborted) {
                 co_await unsubscribe(sub);
+                return_inbox(std::move(inbox));
                 co_return std::pair<message, status>{{}, status(ec.message())};
             }
         }
 
+        // Return inbox to pool for reuse
+        return_inbox(std::move(inbox));
         co_return std::pair<message, status>{std::move(state->response), status()};
     }
 
@@ -2471,8 +2769,8 @@ private:
         auto payload_str = req.dump();
         std::span<const char> payload(payload_str.data(), payload_str.size());
 
-        // Generate inbox for responses
-        auto inbox = generate_inbox();
+        // Get inbox from pool for responses
+        auto inbox = get_inbox();
 
         // Shared state for collecting messages
         struct fetch_state {
@@ -2519,6 +2817,7 @@ private:
         auto [sub, sub_status] = co_await subscribe(inbox, std::move(headers_callback));
 
         if (sub_status.failed()) {
+            return_inbox(std::move(inbox));
             co_return std::pair<std::vector<js_message>, status>{{}, sub_status};
         }
 
@@ -2528,6 +2827,7 @@ private:
 
         if (pub_status.failed()) {
             co_await unsubscribe(sub);
+            return_inbox(std::move(inbox));
             co_return std::pair<std::vector<js_message>, status>{{}, pub_status};
         }
 
@@ -2546,6 +2846,7 @@ private:
         }
 
         co_await unsubscribe(sub);
+        return_inbox(std::move(inbox));
 
         std::vector<js_message> result;
         {
@@ -3438,6 +3739,20 @@ private:
         m_ping_timeout_ms = conf.ping_timeout_ms;
         m_max_pings_outstanding = conf.max_pings_outstanding;
 
+        // Initialize circuit breaker
+        m_circuit_breaker.configure(conf.circuit_breaker_threshold,
+                                    conf.circuit_breaker_timeout_ms,
+                                    conf.circuit_breaker_half_open_max);
+
+        // Initialize inbox pool
+        if (conf.inbox_pool_size > 0) {
+            m_inbox_pool = std::make_unique<inbox_pool>(conf.inbox_pool_size);
+        }
+
+        // Store compression settings
+        m_compression_threshold = conf.compression_threshold;
+        m_compression_level = conf.compression_level;
+
         // Random number generator for jitter
         std::random_device rd;
         std::mt19937 rng(rd());
@@ -3659,6 +3974,21 @@ private:
         return m_sid++;
     }
 
+    // Get inbox string - uses pool if available, otherwise generates new
+    std::string get_inbox() {
+        if (m_inbox_pool) {
+            return m_inbox_pool->acquire();
+        }
+        return generate_inbox();
+    }
+
+    // Return inbox to pool (no-op if not using pool)
+    void return_inbox(std::string&& inbox) {
+        if (m_inbox_pool) {
+            m_inbox_pool->release(std::move(inbox));
+        }
+    }
+
     std::atomic<uint64_t> m_sid;
     std::size_t m_max_payload;
     aio& m_io;
@@ -3693,6 +4023,16 @@ private:
     uint32_t m_ping_interval_ms{0};
     uint32_t m_ping_timeout_ms{0};
     uint32_t m_max_pings_outstanding{0};
+
+    // Inbox pool for request-reply pattern
+    std::unique_ptr<inbox_pool> m_inbox_pool;
+
+    // Circuit breaker for publish operations
+    circuit_breaker_impl m_circuit_breaker;
+
+    // Compression settings
+    uint32_t m_compression_threshold{0};
+    int m_compression_level{3};
 
     std::shared_ptr<ssl::context> m_ssl_ctx;
     uni_socket<SocketType> m_socket;

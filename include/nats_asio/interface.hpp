@@ -25,6 +25,7 @@ persons to whom the Software is furnished to do so, subject to the following con
 #pragma once
 
 #include <asio/io_context.hpp>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -461,6 +462,37 @@ struct connect_config {
     uint32_t ping_interval_ms = 30000;   // Ping interval in milliseconds (0 = disabled)
     uint32_t ping_timeout_ms = 10000;    // Pong timeout before connection is considered dead
     uint32_t max_pings_outstanding = 2;  // Max unanswered pings before disconnect
+
+    // Circuit breaker configuration (0 = disabled)
+    uint32_t circuit_breaker_threshold = 5;      // Errors before circuit opens
+    uint32_t circuit_breaker_timeout_ms = 30000; // Time before half-open state
+    uint32_t circuit_breaker_half_open_max = 3;  // Max requests in half-open state
+
+    // Compression configuration
+    uint32_t compression_threshold = 0;  // Min payload size for compression (0 = disabled)
+    int compression_level = 3;           // zstd compression level (1-22, 3 = default)
+
+    // Inbox pool size for request-reply pattern (0 = generate new each time)
+    uint32_t inbox_pool_size = 64;
+};
+
+// Circuit breaker state for monitoring
+enum class circuit_state { closed, open, half_open };
+
+struct circuit_breaker_stats {
+    std::atomic<circuit_state> state{circuit_state::closed};
+    std::atomic<uint32_t> failure_count{0};
+    std::atomic<uint32_t> success_count{0};
+    std::atomic<uint64_t> rejected_count{0};
+    std::chrono::steady_clock::time_point last_failure_time{};
+    std::chrono::steady_clock::time_point opened_at{};
+
+    void reset() noexcept {
+        state.store(circuit_state::closed, std::memory_order_relaxed);
+        failure_count.store(0, std::memory_order_relaxed);
+        success_count.store(0, std::memory_order_relaxed);
+        rejected_count.store(0, std::memory_order_relaxed);
+    }
 };
 
 struct iconnection {
@@ -483,6 +515,12 @@ struct iconnection {
 
     // Check if connection is draining
     [[nodiscard]] virtual bool is_draining() const noexcept = 0;
+
+    // Circuit breaker state
+    [[nodiscard]] virtual const circuit_breaker_stats& circuit_breaker() const noexcept = 0;
+
+    // Manually reset the circuit breaker to closed state
+    virtual void reset_circuit_breaker() noexcept = 0;
 
     // Basic publish (no headers)
     [[nodiscard]] virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
