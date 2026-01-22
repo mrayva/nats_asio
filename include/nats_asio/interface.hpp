@@ -445,6 +445,29 @@ struct iconnection {
     [[nodiscard]] virtual asio::awaitable<status> write_raw_iov(
         std::span<const std::span<const char>> buffers) = 0;
 
+    // =========================================================================
+    // Write Coalescing - Queue publishes for batched sending (reduces syscalls)
+    // =========================================================================
+
+    // Queue a publish for batched sending (fire-and-forget, no await needed)
+    // Messages are buffered and flushed automatically or via flush()
+    // Returns immediately - does not wait for network write
+    virtual status publish_queued(string_view subject, std::span<const char> payload,
+                                  optional<string_view> reply_to = {}) = 0;
+
+    // Flush the write queue - sends all queued messages in a single write
+    // Call this after a batch of publish_queued calls to ensure delivery
+    [[nodiscard]] virtual asio::awaitable<status> flush() = 0;
+
+    // Configure write coalescing behavior
+    // flush_interval: auto-flush interval (0 = disabled, default 1ms)
+    // max_pending: max queued bytes before auto-flush (default 64KB)
+    virtual void set_write_coalescing(std::chrono::microseconds flush_interval,
+                                      size_t max_pending_bytes) = 0;
+
+    // Get number of bytes currently queued for writing
+    [[nodiscard]] virtual size_t pending_bytes() const noexcept = 0;
+
     // Request-reply pattern with timeout
     [[nodiscard]] virtual asio::awaitable<std::pair<message, status>> request(
         string_view subject, std::span<const char> payload,

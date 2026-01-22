@@ -354,6 +354,88 @@ struct buffer_pools {
 };
 
 // ============================================================================
+// Write Queue - Lock-free queue for coalescing multiple writes
+// ============================================================================
+
+// Thread-safe write queue that buffers messages for batched sending
+// Uses lock-free queue for high-performance concurrent access
+class write_queue {
+public:
+    write_queue(size_t initial_capacity = 1024)
+        : m_queue(initial_capacity), m_pending_bytes(0),
+          m_flush_interval(std::chrono::microseconds(1000)),  // 1ms default
+          m_max_pending_bytes(64 * 1024) {}  // 64KB default
+
+    // Queue a pre-formatted NATS message (e.g., "PUB subject len\r\npayload\r\n")
+    // Returns false if queue is full (shouldn't happen with unbounded queue)
+    bool enqueue(std::string&& data) {
+        size_t size = data.size();
+        if (m_queue.enqueue(std::move(data))) {
+            m_pending_bytes.fetch_add(size, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+
+    // Dequeue all pending messages into output buffer
+    // Returns number of messages dequeued
+    size_t dequeue_all(std::string& output) {
+        std::string item;
+        size_t count = 0;
+        size_t bytes = 0;
+
+        while (m_queue.try_dequeue(item)) {
+            bytes += item.size();
+            output += item;
+            ++count;
+        }
+
+        if (bytes > 0) {
+            m_pending_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        }
+        return count;
+    }
+
+    // Get approximate pending bytes (for flush threshold checking)
+    size_t pending_bytes() const noexcept {
+        return m_pending_bytes.load(std::memory_order_relaxed);
+    }
+
+    // Check if queue should be flushed (exceeds threshold)
+    bool should_flush() const noexcept {
+        return m_pending_bytes.load(std::memory_order_relaxed) >= m_max_pending_bytes;
+    }
+
+    // Check if queue is empty
+    bool empty() const noexcept {
+        return m_pending_bytes.load(std::memory_order_relaxed) == 0;
+    }
+
+    // Configuration
+    void set_flush_interval(std::chrono::microseconds interval) {
+        m_flush_interval = interval;
+    }
+
+    std::chrono::microseconds flush_interval() const noexcept {
+        return m_flush_interval;
+    }
+
+    void set_max_pending_bytes(size_t max_bytes) {
+        m_max_pending_bytes = max_bytes;
+    }
+
+    size_t max_pending_bytes() const noexcept {
+        return m_max_pending_bytes;
+    }
+
+private:
+    moodycamel::ConcurrentQueue<std::string> m_queue;
+    std::atomic<size_t> m_pending_bytes;
+    std::chrono::microseconds m_flush_interval;
+    size_t m_max_pending_bytes;
+};
+
+// ============================================================================
 // Pre-formatted PUB Template - Caches command prefix for repeated subjects
 // ============================================================================
 
@@ -1424,6 +1506,86 @@ public:
         }
 
         co_return status();
+    }
+
+    // =========================================================================
+    // Write Coalescing Implementation
+    // =========================================================================
+
+    // Queue a publish for batched sending (fire-and-forget)
+    virtual status publish_queued(string_view subject, std::span<const char> payload,
+                                  optional<string_view> reply_to = {}) override {
+        if (!m_is_connected) {
+            return status(error_code::not_connected);
+        }
+
+        if (m_max_payload > 0 && payload.size() > m_max_payload) {
+            return status(error_code::message_too_large);
+        }
+
+        // Format the complete NATS message
+        std::string msg;
+        if (reply_to.has_value() && !reply_to->empty()) {
+            msg = fmt::format("PUB {} {} {}\r\n", subject, *reply_to, payload.size());
+        } else {
+            msg = fmt::format("PUB {} {}\r\n", subject, payload.size());
+        }
+        msg.append(payload.data(), payload.size());
+        msg += "\r\n";
+
+        // Enqueue the message
+        if (!m_write_queue.enqueue(std::move(msg))) {
+            return status(error_code::operation_failed, "write queue full");
+        }
+
+        // Start auto-flush coroutine if not running and interval > 0
+        if (m_write_queue.flush_interval().count() > 0 &&
+            !m_flush_running.exchange(true, std::memory_order_acq_rel)) {
+            asio::co_spawn(m_io, auto_flush_loop(), asio::detached);
+        }
+
+        return status();
+    }
+
+    // Flush the write queue - sends all queued messages in a single write
+    virtual asio::awaitable<status> flush() override {
+        if (!m_is_connected) {
+            co_return status(error_code::not_connected);
+        }
+
+        if (m_write_queue.empty()) {
+            co_return status();
+        }
+
+        // Dequeue all pending messages
+        std::string batch;
+        batch.reserve(m_write_queue.pending_bytes() + 256);
+        m_write_queue.dequeue_all(batch);
+
+        if (batch.empty()) {
+            co_return status();
+        }
+
+        // Write all messages in a single syscall
+        try {
+            co_await asio::async_write(m_socket, asio::buffer(batch), asio::use_awaitable);
+        } catch (const std::system_error& e) {
+            co_return status(e.code().message());
+        }
+
+        co_return status();
+    }
+
+    // Configure write coalescing behavior
+    virtual void set_write_coalescing(std::chrono::microseconds flush_interval,
+                                      size_t max_pending_bytes) override {
+        m_write_queue.set_flush_interval(flush_interval);
+        m_write_queue.set_max_pending_bytes(max_pending_bytes);
+    }
+
+    // Get number of bytes currently queued for writing
+    [[nodiscard]] virtual size_t pending_bytes() const noexcept override {
+        return m_write_queue.pending_bytes();
     }
 
     virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) override {
@@ -3022,6 +3184,41 @@ private:
         }
     }
 
+    // Background coroutine for automatic write queue flushing
+    asio::awaitable<void> auto_flush_loop() {
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+
+        while (m_is_connected && !m_stop_flag) {
+            auto interval = m_write_queue.flush_interval();
+            if (interval.count() == 0) {
+                // Auto-flush disabled, stop the loop
+                break;
+            }
+
+            // Wait for flush interval or until threshold exceeded
+            timer.expires_after(interval);
+            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+
+            if (ec || !m_is_connected || m_stop_flag) {
+                break;
+            }
+
+            // Flush if there's pending data
+            if (!m_write_queue.empty()) {
+                co_await flush();
+            }
+
+            // If queue is empty and no new data, we can stop the loop
+            // It will be restarted when new data is queued
+            if (m_write_queue.empty()) {
+                break;
+            }
+        }
+
+        m_flush_running.store(false, std::memory_order_release);
+        co_return;
+    }
+
     std::string prepare_info(const connect_config& o) {
         constexpr auto name = "nats_asio";
         constexpr auto lang = "cpp";
@@ -3069,6 +3266,10 @@ private:
 
     // Buffer pools for reduced allocations in hot paths
     mutable buffer_pools m_pools;
+
+    // Write coalescing queue
+    write_queue m_write_queue;
+    std::atomic<bool> m_flush_running{false};
 
     std::shared_ptr<ssl::context> m_ssl_ctx;
     uni_socket<SocketType> m_socket;
