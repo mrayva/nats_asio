@@ -821,21 +821,27 @@ public:
 
     // Dequeue all pending messages into output buffer
     // Returns number of messages dequeued
+    // Uses bulk dequeue for better performance (reduces atomic operations)
     size_t dequeue_all(std::string& output) {
-        std::string item;
-        size_t count = 0;
-        size_t bytes = 0;
+        constexpr size_t bulk_size = 64;
+        std::string items[bulk_size];
+        size_t total_count = 0;
+        size_t total_bytes = 0;
 
-        while (m_queue.try_dequeue(item)) {
-            bytes += item.size();
-            output += item;
-            ++count;
+        // Bulk dequeue is more efficient than one-by-one
+        size_t count;
+        while ((count = m_queue.try_dequeue_bulk(items, bulk_size)) > 0) {
+            for (size_t i = 0; i < count; ++i) {
+                total_bytes += items[i].size();
+                output.append(std::move(items[i]));
+            }
+            total_count += count;
         }
 
-        if (bytes > 0) {
-            m_pending_bytes.fetch_sub(bytes, std::memory_order_relaxed);
+        if (total_bytes > 0) {
+            m_pending_bytes.fetch_sub(total_bytes, std::memory_order_relaxed);
         }
-        return count;
+        return total_count;
     }
 
     // Get approximate pending bytes (for flush threshold checking)
@@ -977,12 +983,30 @@ public:
 private:
     using cache_t = gtl::lru_cache<std::string, pub_template>;
 
+    // Fast key generation using to_chars instead of fmt::format
+    // Avoids format string parsing overhead on every cache lookup
     static std::string make_key(string_view subject, size_t payload_size) {
-        return fmt::format("{}:{}", subject, payload_size);
+        std::string key;
+        key.reserve(subject.size() + 21);  // max uint64 digits (20) + colon
+        key.append(subject);
+        key.push_back(':');
+        char buf[24];
+        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), payload_size);
+        key.append(buf, ptr - buf);
+        return key;
     }
 
     static std::string make_key_with_reply(string_view subject, string_view reply_to, size_t payload_size) {
-        return fmt::format("{}:{}:{}", subject, reply_to, payload_size);
+        std::string key;
+        key.reserve(subject.size() + reply_to.size() + 22);
+        key.append(subject);
+        key.push_back(':');
+        key.append(reply_to);
+        key.push_back(':');
+        char buf[24];
+        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), payload_size);
+        key.append(buf, ptr - buf);
+        return key;
     }
 
     size_t m_max_entries;
