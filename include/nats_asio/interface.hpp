@@ -72,6 +72,15 @@ struct js_pub_ack {
     bool duplicate = false;
 };
 
+// JetStream batch publish message
+struct js_batch_message {
+    std::string subject;
+    std::vector<char> payload;
+    headers_t headers;
+};
+
+// Forward declaration - js_batch_result defined after status class
+
 // JetStream message with metadata
 struct js_message {
     message msg;                                           // base message with payload/headers
@@ -305,6 +314,14 @@ public:
 private:
     error_code m_code = error_code::ok;
     optional<std::string> m_message;
+};
+
+// JetStream batch publish result (defined after status)
+struct js_batch_result {
+    std::vector<js_pub_ack> acks;      // Successful acks (in order)
+    std::vector<status> errors;         // Errors for failed publishes (in order)
+    size_t success_count = 0;
+    size_t error_count = 0;
 };
 
 // KV watcher interface
@@ -559,6 +576,11 @@ struct connect_config {
     // Offline queue configuration (0 = disabled)
     uint32_t offline_queue_max_size = 10000;     // Max messages to queue when disconnected
     uint32_t offline_queue_max_bytes = 10485760; // Max bytes to queue (10MB default)
+
+    // Backpressure configuration
+    uint32_t backpressure_high_watermark = 1048576;  // High watermark in bytes (1MB) - start applying backpressure
+    uint32_t backpressure_low_watermark = 262144;    // Low watermark in bytes (256KB) - resume normal operation
+    uint32_t backpressure_max_wait_ms = 5000;        // Max time to wait for buffer to drain (0 = fail immediately)
 };
 
 // Circuit breaker state for monitoring
@@ -648,6 +670,25 @@ struct iconnection {
     // Get number of bytes currently queued for writing
     [[nodiscard]] virtual size_t pending_bytes() const noexcept = 0;
 
+    // =========================================================================
+    // Backpressure - Wait for write buffer to drain before publishing
+    // =========================================================================
+
+    // Check if backpressure is currently active (pending bytes > high watermark)
+    [[nodiscard]] virtual bool is_backpressure_active() const noexcept = 0;
+
+    // Wait until pending bytes drop below low watermark or timeout expires
+    // Returns ok if buffer drained, timeout error if max_wait exceeded
+    [[nodiscard]] virtual asio::awaitable<status> wait_for_drain(
+        std::chrono::milliseconds max_wait = std::chrono::milliseconds(5000)) = 0;
+
+    // Publish with backpressure - waits for buffer space before publishing
+    // If buffer is above high watermark, waits until it drops below low watermark
+    [[nodiscard]] virtual asio::awaitable<status> publish_with_backpressure(
+        string_view subject, std::span<const char> payload,
+        optional<string_view> reply_to = {},
+        std::chrono::milliseconds max_wait = std::chrono::milliseconds(5000)) = 0;
+
     // Request-reply pattern with timeout
     [[nodiscard]] virtual asio::awaitable<std::pair<message, status>> request(
         string_view subject, std::span<const char> payload,
@@ -679,6 +720,13 @@ struct iconnection {
     // JetStream fire-and-forget publish with headers (no ack, no timeout)
     [[nodiscard]] virtual asio::awaitable<status> js_publish_async(
         string_view subject, std::span<const char> payload, const headers_t& headers) = 0;
+
+    // JetStream batch publish - publishes multiple messages and collects all acks
+    // More efficient than individual publishes for high-throughput scenarios
+    // Messages are sent in parallel and acks are collected concurrently
+    [[nodiscard]] virtual asio::awaitable<js_batch_result> js_publish_batch(
+        const std::vector<js_batch_message>& messages,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
 
     // JetStream subscribe (push consumer) - creates/binds consumer and subscribes to delivery subject
     [[nodiscard]] virtual asio::awaitable<std::pair<ijs_subscription_sptr, status>>

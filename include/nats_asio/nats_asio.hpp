@@ -2371,6 +2371,66 @@ public:
         return m_write_queue.pending_bytes();
     }
 
+    // =========================================================================
+    // Backpressure Implementation
+    // =========================================================================
+
+    // Check if backpressure is currently active
+    [[nodiscard]] virtual bool is_backpressure_active() const noexcept override {
+        return m_write_queue.pending_bytes() > m_backpressure_high_watermark;
+    }
+
+    // Wait until pending bytes drop below low watermark or timeout expires
+    virtual asio::awaitable<status> wait_for_drain(
+        std::chrono::milliseconds max_wait) override {
+        if (!m_is_connected) {
+            co_return status(error_code::not_connected);
+        }
+
+        // Already below low watermark - no need to wait
+        if (m_write_queue.pending_bytes() <= m_backpressure_low_watermark) {
+            co_return status();
+        }
+
+        auto deadline = std::chrono::steady_clock::now() + max_wait;
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+
+        while (m_write_queue.pending_bytes() > m_backpressure_low_watermark) {
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                co_return status(error_code::timeout, "backpressure drain timeout");
+            }
+
+            if (!m_is_connected) {
+                co_return status(error_code::not_connected);
+            }
+
+            // Poll every 1ms
+            timer.expires_after(std::chrono::milliseconds(1));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        co_return status();
+    }
+
+    // Publish with backpressure - waits for buffer space before publishing
+    virtual asio::awaitable<status> publish_with_backpressure(
+        string_view subject, std::span<const char> payload,
+        optional<string_view> reply_to,
+        std::chrono::milliseconds max_wait) override {
+
+        // If above high watermark, wait for drain
+        if (m_write_queue.pending_bytes() > m_backpressure_high_watermark) {
+            auto drain_status = co_await wait_for_drain(max_wait);
+            if (drain_status.failed()) {
+                co_return drain_status;
+            }
+        }
+
+        // Now publish normally
+        co_return co_await publish(subject, payload, reply_to);
+    }
+
     virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) override {
         co_return co_await unsubscribe_impl(p);
     }
@@ -2639,6 +2699,102 @@ public:
     virtual asio::awaitable<status> js_publish_async(
         string_view subject, std::span<const char> payload, const headers_t& headers) override {
         co_return co_await publish(subject, payload, headers, std::nullopt);
+    }
+
+    // JetStream batch publish - publishes multiple messages and collects acks in parallel
+    virtual asio::awaitable<js_batch_result> js_publish_batch(
+        const std::vector<js_batch_message>& messages,
+        std::chrono::milliseconds timeout) override {
+
+        js_batch_result result;
+        result.acks.resize(messages.size());
+        result.errors.resize(messages.size());
+
+        if (messages.empty()) {
+            co_return result;
+        }
+
+        if (!m_is_connected) {
+            for (size_t i = 0; i < messages.size(); ++i) {
+                result.errors[i] = status(error_code::not_connected);
+                result.error_count++;
+            }
+            co_return result;
+        }
+
+        // Shared state for collecting results
+        struct batch_state {
+            std::atomic<size_t> completed{0};
+            std::vector<std::pair<js_pub_ack, status>> results;
+            std::mutex mutex;
+        };
+
+        auto state = std::make_shared<batch_state>();
+        state->results.resize(messages.size());
+
+        // Launch all publishes concurrently
+        std::vector<asio::awaitable<void>> tasks;
+        tasks.reserve(messages.size());
+
+        for (size_t i = 0; i < messages.size(); ++i) {
+            auto publish_task = [this, &messages, state, i, timeout]() -> asio::awaitable<void> {
+                const auto& msg = messages[i];
+                std::span<const char> payload_span(msg.payload.data(), msg.payload.size());
+
+                auto [ack, pub_status] = co_await js_publish_impl(
+                    msg.subject, payload_span, msg.headers, timeout, true);
+
+                {
+                    std::lock_guard lock(state->mutex);
+                    state->results[i] = {std::move(ack), std::move(pub_status)};
+                }
+                state->completed.fetch_add(1, std::memory_order_release);
+                co_return;
+            };
+
+            asio::co_spawn(m_io, publish_task(), asio::detached);
+        }
+
+        // Wait for all publishes to complete with timeout
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+
+        while (state->completed.load(std::memory_order_acquire) < messages.size()) {
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                break;  // Timeout - return partial results
+            }
+
+            timer.expires_after(std::chrono::milliseconds(1));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        // Collect results
+        {
+            std::lock_guard lock(state->mutex);
+            for (size_t i = 0; i < messages.size(); ++i) {
+                auto& [ack, pub_status] = state->results[i];
+                if (pub_status.ok()) {
+                    result.acks[i] = std::move(ack);
+                    result.success_count++;
+                } else {
+                    result.errors[i] = std::move(pub_status);
+                    result.error_count++;
+                }
+            }
+        }
+
+        // Fill in timeout errors for incomplete publishes
+        if (result.success_count + result.error_count < messages.size()) {
+            for (size_t i = 0; i < messages.size(); ++i) {
+                if (result.errors[i].ok() && result.acks[i].sequence == 0) {
+                    result.errors[i] = status(error_code::timeout, "batch publish timeout");
+                    result.error_count++;
+                }
+            }
+        }
+
+        co_return result;
     }
 
     // JetStream subscribe (push consumer)
@@ -4029,6 +4185,11 @@ private:
                 conf.offline_queue_max_size, conf.offline_queue_max_bytes);
         }
 
+        // Store backpressure settings
+        m_backpressure_high_watermark = conf.backpressure_high_watermark;
+        m_backpressure_low_watermark = conf.backpressure_low_watermark;
+        m_backpressure_max_wait_ms = conf.backpressure_max_wait_ms;
+
         // Random number generator for jitter
         std::random_device rd;
         std::mt19937 rng(rd());
@@ -4371,6 +4532,11 @@ private:
 
     // Offline message queue
     std::unique_ptr<offline_queue> m_offline_queue;
+
+    // Backpressure settings
+    uint32_t m_backpressure_high_watermark{1048576};
+    uint32_t m_backpressure_low_watermark{262144};
+    uint32_t m_backpressure_max_wait_ms{5000};
 
     std::shared_ptr<ssl::context> m_ssl_ctx;
     uni_socket<SocketType> m_socket;
