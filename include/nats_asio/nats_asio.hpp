@@ -1267,7 +1267,8 @@ inline headers_t parse_headers(string_view data) {
 
 // Parse headers without copying using StringZilla - returns string_views into original data
 // WARNING: Returned views are only valid as long as the input data is valid!
-inline headers_view_t parse_headers_view(string_view data) {
+// This is the implementation function called by lazy_headers_view
+inline headers_view_t parse_headers_view_impl(string_view data) {
     namespace sz = ashvardanian::stringzilla;
     headers_view_t headers;
 
@@ -4090,7 +4091,7 @@ private:
                 msg_view.reply_to = *reply_to;
             }
             string_view headers_sv(headers_span.data(), headers_span.size());
-            msg_view.headers = parse_headers_view(headers_sv);
+            msg_view.headers = lazy_headers_view(headers_sv);  // Lazy parsing - only parsed when accessed
             msg_view.payload = payload_span;
 
             co_await it->second->zero_copy_callback()(msg_view);

@@ -47,6 +47,50 @@ using headers_t = std::vector<std::pair<std::string, std::string>>;
 // Zero-copy headers view (references internal buffer, valid only during callback)
 using headers_view_t = std::vector<std::pair<std::string_view, std::string_view>>;
 
+// Forward declaration for lazy parsing
+headers_view_t parse_headers_view_impl(string_view data);
+
+// Lazy headers view - defers parsing until first access
+// This avoids parsing overhead when headers are not used by the callback
+class lazy_headers_view {
+public:
+    lazy_headers_view() = default;
+    explicit lazy_headers_view(string_view raw_data) : m_raw_data(raw_data) {}
+
+    // Parse and return headers on first access (cached)
+    const headers_view_t& get() const {
+        if (!m_parsed) {
+            m_headers = parse_headers_view_impl(m_raw_data);
+            m_parsed = true;
+        }
+        return m_headers;
+    }
+
+    // Convenience accessors
+    const headers_view_t& operator*() const { return get(); }
+    const headers_view_t* operator->() const { return &get(); }
+
+    // Check if headers exist without parsing
+    bool has_data() const noexcept { return !m_raw_data.empty(); }
+
+    // Check if already parsed
+    bool is_parsed() const noexcept { return m_parsed; }
+
+    // Get raw data without parsing
+    string_view raw() const noexcept { return m_raw_data; }
+
+    // STL-like interface forwarding to parsed headers
+    auto begin() const { return get().begin(); }
+    auto end() const { return get().end(); }
+    auto size() const { return get().size(); }
+    bool empty() const { return get().empty(); }
+
+private:
+    string_view m_raw_data;
+    mutable headers_view_t m_headers;
+    mutable bool m_parsed = false;
+};
+
 // Complete message with headers support
 struct message {
     std::string subject;
@@ -60,7 +104,7 @@ struct message {
 struct message_view {
     std::string_view subject;
     optional<std::string_view> reply_to;
-    headers_view_t headers;
+    lazy_headers_view headers;  // Lazy parsing - only parsed when accessed
     std::span<const char> payload;
 };
 
