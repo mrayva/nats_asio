@@ -22,6 +22,8 @@
 #include <tuple>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <zstd.h>
 
@@ -112,6 +114,188 @@ private:
     ZSTD_CCtx* m_cctx = nullptr;
     ZSTD_DCtx* m_dctx = nullptr;
     int m_level;
+};
+
+// ============================================================================
+// Generic input reader - supports stdin, file, and follow mode (tail -f)
+// ============================================================================
+
+struct input_source_config {
+    std::string file_path;              // Empty = use stdin
+    bool follow = false;                // Continuously read new data (like tail -f)
+    int poll_interval_ms = 100;         // Poll interval for follow mode
+};
+
+// Async line reader that works with both stdin and files, with follow mode support
+class async_input_reader {
+public:
+    async_input_reader(asio::io_context& ioc, const input_source_config& config,
+                       std::shared_ptr<spdlog::logger> log)
+        : m_ioc(ioc), m_config(config), m_log(std::move(log)) {}
+
+    // Initialize the reader - must be called before reading
+    bool init() {
+        if (m_config.file_path.empty()) {
+            // Use stdin
+            m_fd = ::dup(STDIN_FILENO);
+            if (m_fd < 0) {
+                m_log->error("Failed to dup stdin");
+                return false;
+            }
+            m_stream = std::make_unique<asio::posix::stream_descriptor>(m_ioc, m_fd);
+            m_is_stdin = true;
+        } else {
+            // Open file
+            m_fd = ::open(m_config.file_path.c_str(), O_RDONLY | O_NONBLOCK);
+            if (m_fd < 0) {
+                m_log->error("Failed to open file: {}", m_config.file_path);
+                return false;
+            }
+            m_stream = std::make_unique<asio::posix::stream_descriptor>(m_ioc, m_fd);
+            m_is_stdin = false;
+
+            // For follow mode, seek to end of file to start reading new data
+            if (m_config.follow) {
+                m_file_pos = ::lseek(m_fd, 0, SEEK_END);
+                if (m_file_pos < 0) m_file_pos = 0;
+            }
+        }
+        return true;
+    }
+
+    // Read next line asynchronously
+    // Returns: {line, eof_reached, error_occurred}
+    asio::awaitable<std::tuple<std::string, bool, bool>> read_line() {
+        if (!m_stream) {
+            co_return std::make_tuple("", true, true);
+        }
+
+        // Check if we have a complete line in the buffer
+        auto newline_pos = m_buffer.find('\n');
+        if (newline_pos != std::string::npos) {
+            std::string line = m_buffer.substr(0, newline_pos);
+            m_buffer.erase(0, newline_pos + 1);
+            // Remove trailing \r if present (Windows line endings)
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            co_return std::make_tuple(std::move(line), false, false);
+        }
+
+        // Need to read more data
+        char read_buf[8192];
+
+        for (;;) {
+            if (m_config.follow && !m_is_stdin) {
+                // Follow mode for files - poll for new data
+                co_return co_await read_line_follow_mode(read_buf, sizeof(read_buf));
+            } else {
+                // Normal read (stdin or non-follow file)
+                auto [ec, bytes_read] = co_await m_stream->async_read_some(
+                    asio::buffer(read_buf, sizeof(read_buf)),
+                    asio::as_tuple(asio::use_awaitable));
+
+                if (ec) {
+                    if (ec == asio::error::eof || ec == asio::error::not_found) {
+                        // EOF - return any remaining data in buffer
+                        if (!m_buffer.empty()) {
+                            std::string line = std::move(m_buffer);
+                            m_buffer.clear();
+                            if (!line.empty() && line.back() == '\r') line.pop_back();
+                            co_return std::make_tuple(std::move(line), true, false);
+                        }
+                        co_return std::make_tuple("", true, false);
+                    }
+                    m_log->error("Read error: {}", ec.message());
+                    co_return std::make_tuple("", true, true);
+                }
+
+                if (bytes_read == 0) {
+                    // No more data
+                    if (!m_buffer.empty()) {
+                        std::string line = std::move(m_buffer);
+                        m_buffer.clear();
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        co_return std::make_tuple(std::move(line), true, false);
+                    }
+                    co_return std::make_tuple("", true, false);
+                }
+
+                m_buffer.append(read_buf, bytes_read);
+
+                // Check for complete line
+                newline_pos = m_buffer.find('\n');
+                if (newline_pos != std::string::npos) {
+                    std::string line = m_buffer.substr(0, newline_pos);
+                    m_buffer.erase(0, newline_pos + 1);
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    co_return std::make_tuple(std::move(line), false, false);
+                }
+            }
+        }
+    }
+
+    bool is_follow_mode() const { return m_config.follow; }
+
+private:
+    // Read with follow mode (tail -f behavior)
+    asio::awaitable<std::tuple<std::string, bool, bool>> read_line_follow_mode(
+        char* read_buf, size_t buf_size) {
+
+        asio::steady_timer timer(co_await asio::this_coro::executor);
+
+        for (;;) {
+            // Check current file size
+            struct stat st;
+            if (::fstat(m_fd, &st) < 0) {
+                m_log->error("fstat failed");
+                co_return std::make_tuple("", true, true);
+            }
+
+            // Check if file was truncated (e.g., log rotation)
+            if (st.st_size < m_file_pos) {
+                m_log->info("File truncated, seeking to beginning");
+                m_file_pos = 0;
+                ::lseek(m_fd, 0, SEEK_SET);
+            }
+
+            // Read any new data
+            if (st.st_size > m_file_pos) {
+                ::lseek(m_fd, m_file_pos, SEEK_SET);
+                ssize_t bytes_read = ::read(m_fd, read_buf, buf_size);
+
+                if (bytes_read > 0) {
+                    m_file_pos += bytes_read;
+                    m_buffer.append(read_buf, bytes_read);
+
+                    // Check for complete line
+                    auto newline_pos = m_buffer.find('\n');
+                    if (newline_pos != std::string::npos) {
+                        std::string line = m_buffer.substr(0, newline_pos);
+                        m_buffer.erase(0, newline_pos + 1);
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        co_return std::make_tuple(std::move(line), false, false);
+                    }
+                }
+            }
+
+            // No new data, wait and poll again
+            timer.expires_after(std::chrono::milliseconds(m_config.poll_interval_ms));
+            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            if (ec) {
+                co_return std::make_tuple("", true, false);
+            }
+        }
+    }
+
+    asio::io_context& m_ioc;
+    input_source_config m_config;
+    std::shared_ptr<spdlog::logger> m_log;
+    std::unique_ptr<asio::posix::stream_descriptor> m_stream;
+    int m_fd = -1;
+    bool m_is_stdin = false;
+    std::string m_buffer;
+    off_t m_file_pos = 0;
 };
 
 // ============================================================================
@@ -897,13 +1081,14 @@ public:
               int js_timeout_ms = 5000, bool wait_for_ack = true,
               const nats_asio::headers_t& headers = {}, const std::string& reply_to = {},
               int count = 0, int sleep_ms = 0, const std::string& data = {},
-              const input_config& in_cfg = {})
+              const input_config& in_cfg = {},
+              const input_source_config& src_cfg = {})
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
           m_topic(topic), m_next_conn(0), m_in_flight(0), m_max_in_flight(max_in_flight),
           m_jetstream(jetstream), m_js_timeout(std::chrono::milliseconds(js_timeout_ms)),
           m_wait_for_ack(wait_for_ack), m_headers(headers), m_reply_to(reply_to),
           m_count(count), m_sleep_ms(sleep_ms), m_data(data), m_input_cfg(in_cfg),
-          m_stdin(ioc, ::dup(STDIN_FILENO)) {
+          m_input_reader(ioc, src_cfg, console) {
         asio::co_spawn(ioc, read_and_publish(), asio::detached);
     }
 
@@ -927,23 +1112,26 @@ public:
                 }
             }
         } else {
-            // Read from stdin
-            asio::streambuf buf;
-            for (;;) {
-                auto [ec, bytes_read] = co_await asio::async_read_until(
-                    m_stdin, buf, '\n', asio::as_tuple(asio::use_awaitable));
+            // Initialize input reader
+            if (!m_input_reader.init()) {
+                m_log->error("Failed to initialize input reader");
+                m_ioc.stop();
+                co_return;
+            }
 
-                if (ec) {
-                    if (ec == asio::error::eof || ec == asio::error::not_found) {
-                        break;
-                    }
-                    m_log->error("stdin read error: {}", ec.message());
+            // Read from stdin or file
+            for (;;) {
+                auto [line, eof, error] = co_await m_input_reader.read_line();
+
+                if (error) {
+                    m_log->error("Input read error");
                     break;
                 }
 
-                std::string line;
-                std::istream is(&buf);
-                std::getline(is, line);
+                if (eof && !m_input_reader.is_follow_mode()) {
+                    // EOF reached and not in follow mode - stop reading
+                    break;
+                }
 
                 if (line.empty()) continue;
 
@@ -958,7 +1146,7 @@ public:
         }
 
         // Wait for all in-flight publishes to complete
-        m_log->info("EOF reached, waiting for {} in-flight publishes", m_in_flight.load());
+        m_log->info("Input complete, waiting for {} in-flight publishes", m_in_flight.load());
         while (m_in_flight > 0) {
             asio::steady_timer timer(co_await asio::this_coro::executor);
             timer.expires_after(std::chrono::milliseconds(50));
@@ -1121,7 +1309,7 @@ private:
     std::string m_data;
     input_config m_input_cfg;
     std::size_t m_msg_number = 0;
-    asio::posix::stream_descriptor m_stdin;
+    async_input_reader m_input_reader;
 };
 
 // Requester - sends requests and waits for replies
@@ -2060,6 +2248,9 @@ int main(int argc, char* argv[]) {
         ("compress", "Compress payloads with zstd (pub/batch_pub mode)")
         ("decompress", "Decompress zstd payloads (grub mode)")
         ("compress_level", "Compression level 1-22 (default: 3)", cxxopts::value<int>())
+        ("file", "Read input from file instead of stdin", cxxopts::value<std::string>())
+        ("follow,f", "Follow mode - continuously read new data (like tail -f)")
+        ("poll_interval", "Poll interval in ms for follow mode (default: 100)", cxxopts::value<int>())
         ("ssl", "Enable ssl")
         ("ssl_key", "ssl_key", cxxopts::value<std::string>(ssl_key_file))
         ("ssl_cert", "ssl_cert", cxxopts::value<std::string>(ssl_cert_file))
@@ -2382,6 +2573,16 @@ int main(int argc, char* argv[]) {
             in_cfg.csv_headers = split_string(result["csv_headers"].as<std::string>(), ',');
         }
 
+        // Parse input source options (file vs stdin, follow mode)
+        input_source_config src_cfg;
+        if (result.count("file")) {
+            src_cfg.file_path = result["file"].as<std::string>();
+        }
+        src_cfg.follow = result.count("follow") > 0;
+        if (result.count("poll_interval")) {
+            src_cfg.poll_interval_ms = result["poll_interval"].as<int>();
+        }
+
         if (m == mode::grubber) {
             grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file, translate_cmd, show_timestamp);
         } else if (m == mode::js_grubber) {
@@ -2609,7 +2810,7 @@ int main(int argc, char* argv[]) {
                 pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
                                                        max_in_flight, use_jetstream, js_timeout_ms, wait_for_ack,
                                                        headers, custom_reply_to, pub_count, pub_sleep_ms, pub_data,
-                                                       in_cfg);
+                                                       in_cfg, src_cfg);
             }
         } else if (m == mode::benchmarker) {
             int bench_count = result.count("count") ? result["count"].as<int>() : 100000;
