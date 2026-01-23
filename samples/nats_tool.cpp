@@ -137,7 +137,7 @@ struct input_source_config {
 };
 
 // ============================================================================
-// HTTP streaming reader - reads line-delimited data from HTTP endpoint
+// HTTP streaming reader - reads line-delimited data from HTTP endpoint (standalone ASIO)
 // ============================================================================
 
 class async_http_reader {
@@ -157,7 +157,6 @@ public:
     // Parse URL into components
     bool parse_url(const std::string& url, std::string& protocol, std::string& host,
                    std::string& port, std::string& path) {
-        // Simple URL parser for http:// and https://
         std::string u = url;
         if (u.find("https://") == 0) {
             protocol = "https";
@@ -170,7 +169,6 @@ public:
             return false;
         }
 
-        // Find path
         auto path_pos = u.find('/');
         if (path_pos != std::string::npos) {
             path = u.substr(path_pos);
@@ -179,7 +177,6 @@ public:
             path = "/";
         }
 
-        // Find port
         auto port_pos = u.find(':');
         if (port_pos != std::string::npos) {
             host = u.substr(0, port_pos);
@@ -292,7 +289,7 @@ public:
                 co_return std::make_tuple(std::move(line), false, false);
             }
 
-            // No complete line yet, but we got data - continue reading
+            // No complete line yet, continue reading
             co_return co_await read_line();
 
         } catch (const asio::system_error& e) {
@@ -796,20 +793,48 @@ inline std::string build_payload(const nlohmann::json& obj, const std::vector<st
     return result.dump();
 }
 
-// Parse CSV line into JSON object using headers
+// Parse CSV line into JSON object using headers (RFC 4180 compliant)
+// Handles: quoted fields, commas in quotes, escaped quotes (doubled)
 inline nlohmann::json parse_csv_line(const std::string& line, const std::vector<std::string>& headers) {
     nlohmann::json obj;
     std::vector<std::string> values;
+    std::string field;
+    bool in_quotes = false;
 
-    // Simple CSV parsing (doesn't handle quoted fields with commas)
-    std::istringstream iss(line);
-    std::string value;
-    while (std::getline(iss, value, ',')) {
-        // Trim whitespace
-        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.erase(0, 1);
-        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.pop_back();
-        values.push_back(value);
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+
+        if (in_quotes) {
+            if (c == '"') {
+                // Check for escaped quote (doubled quote)
+                if (i + 1 < line.size() && line[i + 1] == '"') {
+                    field += '"';
+                    ++i;  // Skip next quote
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field += c;
+            }
+        } else {
+            if (c == '"') {
+                in_quotes = true;
+            } else if (c == ',') {
+                // Trim whitespace from unquoted fields
+                while (!field.empty() && (field.front() == ' ' || field.front() == '\t')) field.erase(0, 1);
+                while (!field.empty() && (field.back() == ' ' || field.back() == '\t')) field.pop_back();
+                values.push_back(std::move(field));
+                field.clear();
+            } else {
+                field += c;
+            }
+        }
     }
+
+    // Don't forget the last field
+    while (!field.empty() && (field.front() == ' ' || field.front() == '\t')) field.erase(0, 1);
+    while (!field.empty() && (field.back() == ' ' || field.back() == '\t')) field.pop_back();
+    values.push_back(std::move(field));
 
     for (size_t i = 0; i < headers.size() && i < values.size(); i++) {
         obj[headers[i]] = values[i];
