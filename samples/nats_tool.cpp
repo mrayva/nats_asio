@@ -2244,12 +2244,67 @@ public:
                     int num_writers, int stats_interval,
                     std::size_t batch_size = 65536,
                     std::size_t max_queue_size = 100,
-                    int flush_timeout_ms = 0)
+                    int flush_timeout_ms = 0,
+                    const std::string& file_path = "")
         : m_console(std::move(console)), m_conf(conf), m_ssl_conf(std::move(ssl_conf)),
           m_topic(topic), m_num_writers(num_writers), m_stats_interval(stats_interval),
           m_batch_size(batch_size), m_flush_timeout_ms(flush_timeout_ms),
-          m_counter(0), m_pending_writes(0), m_running(true) {
+          m_file_path(file_path), m_counter(0), m_pending_writes(0), m_running(true) {
         m_queue.set_max_size(max_queue_size);
+        // Pre-build the static part of PUB command: "PUB <topic> "
+        m_pub_prefix = "PUB ";
+        m_pub_prefix += m_topic;
+        m_pub_prefix += ' ';
+    }
+
+    // Fast integer to string using 2-digit lookup table
+    // Returns pointer past the last written character
+    static char* fast_itoa(char* buf, std::size_t val) {
+        // Lookup table for 2-digit pairs "00" to "99"
+        static constexpr char digits[201] =
+            "00010203040506070809"
+            "10111213141516171819"
+            "20212223242526272829"
+            "30313233343536373839"
+            "40414243444546474849"
+            "50515253545556575859"
+            "60616263646566676869"
+            "70717273747576777879"
+            "80818283848586878889"
+            "90919293949596979899";
+
+        // Count digits to write backwards
+        char temp[24];
+        char* p = temp + sizeof(temp);
+
+        while (val >= 100) {
+            auto idx = (val % 100) * 2;
+            val /= 100;
+            *--p = digits[idx + 1];
+            *--p = digits[idx];
+        }
+
+        if (val >= 10) {
+            auto idx = val * 2;
+            *--p = digits[idx + 1];
+            *--p = digits[idx];
+        } else {
+            *--p = '0' + static_cast<char>(val);
+        }
+
+        auto len = static_cast<std::size_t>((temp + sizeof(temp)) - p);
+        std::memcpy(buf, p, len);
+        return buf + len;
+    }
+
+    // Fast PUB header formatting without fmt overhead
+    // Appends "PUB <topic> <size>\r\n" to buffer
+    void append_pub_header(std::string& buf, std::size_t payload_size) {
+        buf.append(m_pub_prefix);
+        char size_buf[24];
+        char* end = fast_itoa(size_buf, payload_size);
+        buf.append(size_buf, static_cast<std::size_t>(end - size_buf));
+        buf.append("\r\n", 2);
     }
 
     void run() {
@@ -2282,6 +2337,20 @@ public:
 
 private:
     void reader_thread() {
+        // Open file or use stdin
+        int input_fd = STDIN_FILENO;
+        bool close_fd = false;
+
+        if (!m_file_path.empty()) {
+            input_fd = ::open(m_file_path.c_str(), O_RDONLY);
+            if (input_fd < 0) {
+                m_console->error("Failed to open file '{}': {}", m_file_path, strerror(errno));
+                return;
+            }
+            close_fd = true;
+            m_console->info("Reading from file: {}", m_file_path);
+        }
+
         if (m_flush_timeout_ms > 0) {
             m_console->info("Reader thread started, batch_size={}, flush_timeout={}ms",
                            m_batch_size, m_flush_timeout_ms);
@@ -2289,13 +2358,16 @@ private:
             m_console->info("Reader thread started, batch_size={}", m_batch_size);
         }
 
-        std::vector<char> read_buf(m_batch_size);
-        std::string leftover;
+        // Accumulation buffer - data is appended here, processed lines are removed
+        std::string accum_buf;
+        accum_buf.reserve(m_batch_size * 2);
+
+        // Output batch buffer
         std::string batch_buf;
         batch_buf.reserve(m_batch_size * 2);
 
         struct pollfd pfd;
-        pfd.fd = STDIN_FILENO;
+        pfd.fd = input_fd;
         pfd.events = POLLIN;
 
         while (m_running) {
@@ -2304,19 +2376,18 @@ private:
                 int poll_result = poll(&pfd, 1, m_flush_timeout_ms);
                 if (poll_result == 0) {
                     // Timeout - no data available within flush_timeout
-                    // Flush leftover as a complete message if present
-                    if (!leftover.empty()) {
-                        auto leftover_size = leftover.size();
+                    // Flush accum_buf as a complete message if present
+                    if (!accum_buf.empty()) {
+                        auto accum_size = accum_buf.size();
                         batch_buf.clear();
-                        fmt::format_to(std::back_inserter(batch_buf),
-                            "PUB {} {}\r\n", m_topic, leftover_size);
-                        batch_buf.append(leftover);
-                        batch_buf.append("\r\n");
+                        append_pub_header(batch_buf, accum_size);
+                        batch_buf.append(accum_buf);
+                        batch_buf.append("\r\n", 2);
                         m_queue.push({std::move(batch_buf), 1});
-                        batch_buf = std::string();
+                        batch_buf.clear();
                         batch_buf.reserve(m_batch_size * 2);
-                        leftover.clear();
-                        m_console->debug("Flush timeout: flushed partial line ({} bytes)", leftover_size);
+                        accum_buf.clear();
+                        m_console->debug("Flush timeout: flushed partial line ({} bytes)", accum_size);
                     }
                     continue;
                 } else if (poll_result < 0) {
@@ -2327,72 +2398,90 @@ private:
                 // poll_result > 0: data available, proceed to read
             }
 
+            // Read directly into accum_buf to avoid extra copy
+            std::size_t old_size = accum_buf.size();
+            accum_buf.resize(old_size + m_batch_size);
+
             auto read_start = std::chrono::steady_clock::now();
-            ssize_t bytes_read = ::read(STDIN_FILENO, read_buf.data(), read_buf.size());
+            ssize_t bytes_read = ::read(input_fd, accum_buf.data() + old_size, m_batch_size);
             auto read_end = std::chrono::steady_clock::now();
 
             if (bytes_read <= 0) {
+                accum_buf.resize(old_size);  // Restore size
                 break;  // EOF or error
             }
 
+            accum_buf.resize(old_size + static_cast<std::size_t>(bytes_read));
             m_bytes_read += static_cast<std::size_t>(bytes_read);
+
             auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(read_end - read_start).count();
             if (read_us > 10000) {  // Log if read took > 10ms
-                m_console->warn("Slow stdin read: {}ms for {} bytes", read_us / 1000, bytes_read);
+                m_console->warn("Slow read: {}ms for {} bytes", read_us / 1000, bytes_read);
             }
-
-            std::string_view chunk(read_buf.data(), static_cast<std::size_t>(bytes_read));
 
             batch_buf.clear();
             std::size_t msg_count = 0;
             std::size_t start = 0;
             std::size_t pos = 0;
 
-            // Combine with leftover
-            std::string combined;
-            if (!leftover.empty()) {
-                combined = leftover + std::string(chunk);
-                chunk = combined;
-                leftover.clear();
-            }
+            // Process complete lines from accum_buf
+            const char* data = accum_buf.data();
+            std::size_t data_size = accum_buf.size();
 
-            while ((pos = chunk.find('\n', start)) != std::string_view::npos) {
-                std::string_view line = chunk.substr(start, pos - start);
-                start = pos + 1;
+            while (start < data_size) {
+                // Find newline using memchr (faster than string::find for raw memory)
+                const char* nl = static_cast<const char*>(
+                    std::memchr(data + start, '\n', data_size - start));
+                if (!nl) break;
 
-                if (line.empty()) continue;
-                if (!line.empty() && line.back() == '\r') {
-                    line = line.substr(0, line.size() - 1);
+                pos = static_cast<std::size_t>(nl - data);
+                std::size_t line_len = pos - start;
+
+                // Strip trailing \r if present
+                if (line_len > 0 && data[start + line_len - 1] == '\r') {
+                    line_len--;
                 }
-                if (line.empty()) continue;
 
-                // Format PUB command
-                fmt::format_to(std::back_inserter(batch_buf),
-                    "PUB {} {}\r\n", m_topic, line.size());
-                batch_buf.append(line.data(), line.size());
-                batch_buf.append("\r\n");
-                msg_count++;
+                if (line_len > 0) {
+                    // Format PUB command - append directly from accum_buf
+                    append_pub_header(batch_buf, line_len);
+                    batch_buf.append(data + start, line_len);
+                    batch_buf.append("\r\n", 2);
+                    msg_count++;
+                }
+
+                start = pos + 1;
             }
 
-            if (start < chunk.size()) {
-                leftover = std::string(chunk.substr(start));
+            // Remove processed data from accum_buf
+            if (start > 0) {
+                if (start < accum_buf.size()) {
+                    // Move remaining data to beginning
+                    std::memmove(accum_buf.data(), accum_buf.data() + start, accum_buf.size() - start);
+                    accum_buf.resize(accum_buf.size() - start);
+                } else {
+                    accum_buf.clear();
+                }
             }
 
             if (msg_count > 0) {
                 m_queue.push({std::move(batch_buf), msg_count});
-                batch_buf = std::string();
+                batch_buf.clear();
                 batch_buf.reserve(m_batch_size * 2);
             }
         }
 
-        // Handle final leftover
-        if (!leftover.empty()) {
+        // Handle final leftover in accum_buf
+        if (!accum_buf.empty()) {
             batch_buf.clear();
-            fmt::format_to(std::back_inserter(batch_buf),
-                "PUB {} {}\r\n", m_topic, leftover.size());
-            batch_buf.append(leftover);
-            batch_buf.append("\r\n");
+            append_pub_header(batch_buf, accum_buf.size());
+            batch_buf.append(accum_buf);
+            batch_buf.append("\r\n", 2);
             m_queue.push({std::move(batch_buf), 1});
+        }
+
+        if (close_fd) {
+            ::close(input_fd);
         }
 
         m_console->info("Reader thread finished");
@@ -2493,10 +2582,12 @@ private:
     nats_asio::connect_config m_conf;
     std::optional<nats_asio::ssl_config> m_ssl_conf;
     std::string m_topic;
+    std::string m_pub_prefix;  // Pre-built "PUB <topic> " for fast formatting
     int m_num_writers;
     int m_stats_interval;
     std::size_t m_batch_size;
     int m_flush_timeout_ms;
+    std::string m_file_path;
     std::atomic<std::size_t> m_counter;
     std::atomic<std::size_t> m_bytes_read{0};
     std::atomic<std::size_t> m_pending_writes;
@@ -3179,7 +3270,8 @@ int main(int argc, char* argv[]) {
                                                                    num_connections, stats_interval,
                                                                    static_cast<std::size_t>(batch_size_val),
                                                                    static_cast<std::size_t>(max_queue_val),
-                                                                   flush_timeout_val);
+                                                                   flush_timeout_val,
+                                                                   src_cfg.file_path);
                 // Run batch publisher (blocks until done)
                 batch_pub_ptr->run();
                 return 0;
