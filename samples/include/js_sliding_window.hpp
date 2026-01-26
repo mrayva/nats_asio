@@ -43,12 +43,20 @@ namespace nats_tool {
 // JetStream Sliding Window ACK Tracking
 // ============================================================================
 
-// Per-stream statistics
+// Per-stream statistics (internal, with atomics)
 struct stream_stats {
     std::atomic<std::size_t> acked{0};
     std::atomic<std::size_t> failed{0};
     std::atomic<std::size_t> timeouts{0};
     std::atomic<std::size_t> retries{0};
+};
+
+// Per-stream statistics snapshot (for returning values)
+struct stream_stats_snapshot {
+    std::size_t acked = 0;
+    std::size_t failed = 0;
+    std::size_t timeouts = 0;
+    std::size_t retries = 0;
 };
 
 // Represents an in-flight message awaiting ACK
@@ -204,18 +212,24 @@ public:
     }
 
     // Per-stream metrics
-    std::map<std::string, stream_stats> get_stream_stats() const {
+    std::map<std::string, stream_stats_snapshot> get_stream_stats() const {
         std::lock_guard<std::mutex> lock(m_stats_mutex);
-        std::map<std::string, stream_stats> result;
+        std::map<std::string, stream_stats_snapshot> result;
         for (const auto& [stream, stats_ptr] : m_stream_stats) {
-            stream_stats copy;
-            copy.acked.store(stats_ptr->acked.load(std::memory_order_relaxed));
-            copy.failed.store(stats_ptr->failed.load(std::memory_order_relaxed));
-            copy.timeouts.store(stats_ptr->timeouts.load(std::memory_order_relaxed));
-            copy.retries.store(stats_ptr->retries.load(std::memory_order_relaxed));
-            result[stream] = std::move(copy);
+            stream_stats_snapshot snapshot;
+            snapshot.acked = stats_ptr->acked.load(std::memory_order_relaxed);
+            snapshot.failed = stats_ptr->failed.load(std::memory_order_relaxed);
+            snapshot.timeouts = stats_ptr->timeouts.load(std::memory_order_relaxed);
+            snapshot.retries = stats_ptr->retries.load(std::memory_order_relaxed);
+            result[stream] = snapshot;
         }
         return result;
+    }
+
+    // Helper to get or create stream stats (acquires lock)
+    std::shared_ptr<stream_stats> get_or_create_stream_stats(const std::string& stream) {
+        std::lock_guard<std::mutex> lock(m_stats_mutex);
+        return get_or_create_stream_stats_locked(stream);
     }
 
     // Wait until window has space
@@ -237,12 +251,6 @@ private:
             return stats;
         }
         return it->second;
-    }
-
-    // Helper to get or create stream stats (acquires lock)
-    std::shared_ptr<stream_stats> get_or_create_stream_stats(const std::string& stream) {
-        std::lock_guard<std::mutex> lock(m_stats_mutex);
-        return get_or_create_stream_stats_locked(stream);
     }
 
     std::size_t m_window_size;

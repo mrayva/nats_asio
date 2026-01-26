@@ -22,6 +22,7 @@
 #include <nats_asio/compression.hpp>
 #include <nats_asio/http_reader.hpp>
 #include <nats_asio/input_reader.hpp>
+#include <nats_asio/multi_file_reader.hpp>
 #include <simdjson.h>
 #include <thread>
 #include <tuple>
@@ -44,6 +45,7 @@ using nats_asio::zstd_compressor;
 using nats_asio::input_source_config;
 using nats_asio::async_http_reader;
 using nats_asio::async_input_reader;
+using nats_asio::async_multi_file_reader;
 
 using nats_tool::output_mode;
 using nats_tool::input_format;
@@ -701,6 +703,44 @@ public:
                     co_await timer.async_wait(asio::use_awaitable);
                 }
             }
+        } else if (m_src_cfg.is_multi_file()) {
+            // Multi-file reader with glob patterns
+            auto patterns = m_src_cfg.get_patterns();
+            m_multi_file_reader = std::make_unique<async_multi_file_reader>(
+                m_ioc, patterns, m_src_cfg.follow, m_src_cfg.poll_interval_ms, m_log);
+
+            if (!m_multi_file_reader->init()) {
+                m_log->error("Failed to initialize multi-file reader");
+                m_ioc.stop();
+                co_return;
+            }
+
+            m_log->info("Reading from {} file(s) matching patterns", m_multi_file_reader->file_count());
+
+            // Read from multiple files
+            for (;;) {
+                auto [line, file_path, eof, error] = co_await m_multi_file_reader->read_line();
+
+                if (error) {
+                    m_log->error("Multi-file read error");
+                    break;
+                }
+
+                if (eof && !m_multi_file_reader->is_follow_mode()) {
+                    // EOF reached on all files and not in follow mode
+                    break;
+                }
+
+                if (line.empty()) continue;
+
+                co_await process_and_publish(line);
+
+                if (m_sleep_ms > 0) {
+                    asio::steady_timer timer(co_await asio::this_coro::executor);
+                    timer.expires_after(std::chrono::milliseconds(m_sleep_ms));
+                    co_await timer.async_wait(asio::use_awaitable);
+                }
+            }
         } else {
             // Initialize input reader (file/stdin)
             if (!m_input_reader.init()) {
@@ -709,7 +749,7 @@ public:
                 co_return;
             }
 
-            // Read from stdin or file
+            // Read from stdin or single file
             for (;;) {
                 auto [line, eof, error] = co_await m_input_reader.read_line();
 
@@ -980,6 +1020,7 @@ private:
     std::size_t m_msg_number = 0;
     async_input_reader m_input_reader;
     std::unique_ptr<async_http_reader> m_http_reader;
+    std::unique_ptr<async_multi_file_reader> m_multi_file_reader;
 
     // JetStream sliding window ACK tracking
     std::size_t m_js_window_size;
@@ -1589,7 +1630,7 @@ int main(int argc, char* argv[]) {
         ("compress", "Compress payloads with zstd (pub/batch_pub mode)")
         ("decompress", "Decompress zstd payloads (grub mode)")
         ("compress_level", "Compression level 1-22 (default: 3)", cxxopts::value<int>())
-        ("file", "Read input from file instead of stdin", cxxopts::value<std::string>())
+        ("file", "Read input from file(s)/glob pattern (repeatable, supports wildcards)", cxxopts::value<std::vector<std::string>>())
         ("follow,f", "Follow mode - continuously read new data (like tail -f)")
         ("poll_interval", "Poll interval in ms for follow mode (default: 100)", cxxopts::value<int>())
         ("http", "HTTP URL to read streaming data from (e.g., Feldera output)", cxxopts::value<std::string>())
@@ -1922,7 +1963,11 @@ int main(int argc, char* argv[]) {
         // Parse input source options (file vs stdin, follow mode, HTTP)
         input_source_config src_cfg;
         if (result.count("file")) {
-            src_cfg.file_path = result["file"].as<std::string>();
+            src_cfg.file_patterns = result["file"].as<std::vector<std::string>>();
+            // For backward compatibility, also set file_path if single pattern
+            if (src_cfg.file_patterns.size() == 1) {
+                src_cfg.file_path = src_cfg.file_patterns[0];
+            }
         }
         src_cfg.follow = result.count("follow") > 0;
         if (result.count("poll_interval")) {

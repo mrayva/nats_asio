@@ -45,7 +45,9 @@ A comprehensive command-line tool for NATS operations with extensive JetStream s
 
 #### Input Sources
 - **stdin**: Default input
-- **File**: Read from file with optional follow mode (`--file`, `--follow`)
+- **File**: Read from single file with optional follow mode (`--file`, `--follow`)
+- **Multiple files**: Glob patterns with wildcard support (`--file "*.log"`, repeatable)
+- **Watch mode**: Detect new files matching patterns in real-time (`--file "*.log" --follow`)
 - **HTTP/HTTPS**: Stream data from HTTP endpoints (`--http`, `--http_header`, `--http_body`)
 
 #### Input Formats
@@ -159,11 +161,22 @@ cat data.csv | ./nats_tool pub \
 
 ### File Input with Follow Mode
 ```bash
-# Read from file
+# Read from single file
 ./nats_tool pub --js --topic logs --file /var/log/app.log
 
 # Follow mode (like tail -f)
 ./nats_tool pub --js --topic logs --file /var/log/app.log --follow
+
+# Read from multiple files with glob pattern
+./nats_tool pub --js --topic logs --file "/var/log/app*.log"
+
+# Multiple patterns (multiple --file options)
+./nats_tool pub --js --topic logs \
+  --file "/var/log/app/*.log" \
+  --file "/var/log/nginx/*.log"
+
+# Watch for new files matching pattern (log shipper mode)
+./nats_tool pub --js --topic logs --file "/var/log/*.log" --follow
 ```
 
 ### Subscribing
@@ -237,6 +250,7 @@ This fork includes numerous performance improvements:
 
 ### nats_tool Utilities
 - `async_input_reader`: Async file/stdin reader with follow mode
+- `async_multi_file_reader`: Multi-file reader with glob patterns and watch mode
 - `async_http_reader`: HTTP/HTTPS streaming client
 - `js_sliding_window`: JetStream ACK batching with retry logic
 - `js_ack_processor`: Background ACK processing and timeout handling

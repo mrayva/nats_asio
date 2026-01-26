@@ -48,9 +48,10 @@ namespace nats_asio {
 // ============================================================================
 
 struct input_source_config {
-    std::string file_path;              // Empty = use stdin (unless http_url is set)
-    bool follow = false;                // Continuously read new data (like tail -f)
-    int poll_interval_ms = 100;         // Poll interval for follow mode
+    std::string file_path;                      // Single file (deprecated, use file_patterns)
+    std::vector<std::string> file_patterns;     // Glob patterns for multiple files
+    bool follow = false;                        // Continuously read new data (like tail -f)
+    int poll_interval_ms = 100;                 // Poll interval for follow mode
 
     // HTTP source options
     std::string http_url;               // HTTP URL to fetch from (empty = not HTTP)
@@ -59,6 +60,23 @@ struct input_source_config {
     std::vector<std::pair<std::string, std::string>> http_headers;  // Custom headers
     int http_timeout_ms = 30000;        // Connection timeout
     bool http_insecure = false;         // Skip SSL verification
+
+    // Helper to check if using multiple file patterns
+    bool is_multi_file() const {
+        return !file_patterns.empty() || file_path.find('*') != std::string::npos ||
+               file_path.find('?') != std::string::npos;
+    }
+
+    // Get all patterns (including single file_path for backward compat)
+    std::vector<std::string> get_patterns() const {
+        if (!file_patterns.empty()) {
+            return file_patterns;
+        }
+        if (!file_path.empty()) {
+            return {file_path};
+        }
+        return {};
+    }
 };
 
 // ============================================================================
