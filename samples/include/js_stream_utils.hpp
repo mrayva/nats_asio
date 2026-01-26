@@ -100,12 +100,8 @@ inline asio::awaitable<bool> ensure_stream_for_subject(
     }
 
     // Create or update stream
-    std::string create_subject = stream_exists
-        ? "$JS.API.STREAM.UPDATE." + stream_name
-        : "$JS.API.STREAM.CREATE." + stream_name;
-
     if (!stream_exists) {
-        // Default stream configuration
+        // Default stream configuration for new streams
         stream_config = {
             {"name", stream_name},
             {"subjects", {subject}},
@@ -119,7 +115,16 @@ inline asio::awaitable<bool> ensure_stream_for_subject(
             {"num_replicas", 1}
         };
         log->info("Creating new stream '{}' for subject '{}'", stream_name, subject);
+    } else {
+        // For updates, subjects were already added above
+        // Ensure name is set correctly
+        stream_config["name"] = stream_name;
+        log->info("Updating stream '{}' to add subject '{}'", stream_name, subject);
     }
+
+    std::string create_subject = stream_exists
+        ? "$JS.API.STREAM.UPDATE." + stream_name
+        : "$JS.API.STREAM.CREATE." + stream_name;
 
     std::string create_payload = stream_config.dump();
     std::span<const char> create_span(create_payload.data(), create_payload.size());

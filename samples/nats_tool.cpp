@@ -616,7 +616,7 @@ public:
                 js_window_size, m_js_timeout, m_log);
 
             // Start ACK processor for first connection
-            if (!m_connections.empty()) {
+            if (!m_connections.empty() && m_js_window) {
                 m_ack_processor = std::make_unique<nats_tool::js_ack_processor>(
                     ioc, m_connections[0], m_js_window, m_log);
                 m_ack_processor->start();
@@ -652,7 +652,7 @@ public:
 
             // Brief delay after stream creation to let NATS stabilize
             asio::steady_timer timer(co_await asio::this_coro::executor);
-            timer.expires_after(std::chrono::milliseconds(100));
+            timer.expires_after(std::chrono::milliseconds(200));
             co_await timer.async_wait(asio::use_awaitable);
         }
 
@@ -832,50 +832,51 @@ private:
             auto msg = std::make_shared<std::string>(payload);
             auto subj = std::make_shared<std::string>(subject);
 
-            // Get nonce and track message
-            std::string nonce = m_js_window->get_next_nonce();
-            m_js_window->track_message(nonce, subject, payload);
+            // Get nonce and track message - use shared_ptr like other variables
+            auto nonce = std::make_shared<std::string>(m_js_window->get_next_nonce());
+            m_js_window->track_message(*nonce, subject, payload);
 
-            // Capture window for lambda
-            auto window = m_js_window;
-
-            // Spawn coroutine to publish with nonce tracking
+            // Spawn coroutine to publish with nonce tracking (like old code)
             asio::co_spawn(
                 m_ioc,
-                [this, conn, subj, msg, nonce, window]() -> asio::awaitable<void> {
+                [this, conn, subj, msg, nonce]() -> asio::awaitable<void> {
+                    auto window = m_js_window;  // Get window from member variable
                     std::span<const char> payload_span(msg->data(), msg->size());
+
                     nats_asio::status s;
-
-                    // Publish with nonce in headers for ACK tracking
-                    nats_asio::headers_t headers_with_nonce = m_headers;
-                    headers_with_nonce.emplace_back("Nats-Msg-Id", nonce);
-
+                    nats_asio::js_pub_ack ack_response;
                     try {
-                        auto [ack, status] = co_await conn->js_publish(
-                            *subj, payload_span, headers_with_nonce, m_js_timeout, true);
-                        s = status;
+                        // Don't send Nats-Msg-Id header - it causes disconnects
+                        // Use nonce only for internal tracking
+                        if (m_headers.empty()) {
+                            auto [ack, status] = co_await conn->js_publish(
+                                *subj, payload_span, m_js_timeout, true);
+                            s = status;
+                            ack_response = ack;
+                        } else {
+                            auto [ack, status] = co_await conn->js_publish(
+                                *subj, payload_span, m_headers, m_js_timeout, true);
+                            s = status;
+                            ack_response = ack;
+                        }
 
                         if (s.ok()) {
-                            if (!ack.stream.empty()) {
-                                window->mark_acked(nonce);
+                            if (!ack_response.stream.empty()) {
+                                window->mark_acked(*nonce);
                                 m_counter++;
                             } else {
-                                m_log->warn("Publish OK but empty ACK for subject '{}' (nonce: {})",
-                                           *subj, nonce);
                                 // Still mark as acked to avoid timeout
-                                window->mark_acked(nonce);
+                                window->mark_acked(*nonce);
                                 m_counter++;
                             }
                         } else {
-                            m_log->error("Publish failed for subject '{}': {} (nonce: {})",
-                                       *subj, s.error(), nonce);
                             // Remove from window on failure (not counted as acked)
-                            window->mark_acked(nonce, false);
+                            window->mark_acked(*nonce, false);
                         }
                     } catch (const std::exception& e) {
                         m_log->error("Exception during publish for subject '{}': {} (nonce: {})",
-                                   *subj, e.what(), nonce);
-                        window->mark_acked(nonce, false);
+                                   *subj, e.what(), *nonce);
+                        window->mark_acked(*nonce, false);
                     }
                     co_return;
                 },

@@ -60,7 +60,8 @@ public:
     js_sliding_window(std::size_t window_size, std::chrono::milliseconds ack_timeout,
                       std::shared_ptr<spdlog::logger> log)
         : m_window_size(window_size), m_ack_timeout(ack_timeout), m_log(std::move(log)),
-          m_next_nonce(1), m_in_flight_count(0), m_acked_count(0), m_timeout_count(0) {}
+          m_next_nonce(1), m_in_flight_count(0), m_acked_count(0), m_timeout_count(0),
+          m_failed_count(0) {}
 
     // Check if window is full (blocks if need backpressure)
     bool is_full() const {
@@ -91,15 +92,19 @@ public:
         }
     }
 
-    // Mark message as ACKed
-    bool mark_acked(const std::string& nonce) {
+    // Mark message as ACKed or failed
+    bool mark_acked(const std::string& nonce, bool success = true) {
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_in_flight.find(nonce);
         if (it != m_in_flight.end()) {
-            it->second.acked = true;
+            it->second.acked = success;
             m_in_flight.erase(it);
             m_in_flight_count.fetch_sub(1, std::memory_order_relaxed);
-            m_acked_count.fetch_add(1, std::memory_order_relaxed);
+            if (success) {
+                m_acked_count.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                m_failed_count.fetch_add(1, std::memory_order_relaxed);
+            }
             return true;
         }
         return false;
@@ -141,6 +146,10 @@ public:
         return m_timeout_count.load(std::memory_order_relaxed);
     }
 
+    std::size_t failed_count() const {
+        return m_failed_count.load(std::memory_order_relaxed);
+    }
+
     std::size_t window_size() const {
         return m_window_size;
     }
@@ -163,6 +172,7 @@ private:
     std::atomic<std::size_t> m_in_flight_count;
     std::atomic<std::size_t> m_acked_count;
     std::atomic<std::size_t> m_timeout_count;
+    std::atomic<std::size_t> m_failed_count;
 
     std::mutex m_mutex;
     std::unordered_map<std::string, in_flight_msg> m_in_flight;
