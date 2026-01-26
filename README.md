@@ -49,6 +49,7 @@ A comprehensive command-line tool for NATS operations with extensive JetStream s
 - **Multiple files**: Glob patterns with wildcard support (`--file "*.log"`, repeatable)
 - **Watch mode**: Detect new files matching patterns in real-time (`--file "*.log" --follow`)
 - **Compressed files**: Automatic decompression of gzip (.gz) and zstd (.zst) files
+- **ZIP archives**: Automatic extraction of all files from .zip archives
 - **HTTP/HTTPS**: Stream data from HTTP endpoints (`--http`, `--http_header`, `--http_body`)
 
 #### Input Formats
@@ -82,6 +83,7 @@ nlohmann_json
 simdjson
 zlib (for gzip decompression)
 zstd (for zstd decompression)
+libzip (for ZIP archive extraction)
 ```
 
 ### nats_tool
@@ -203,6 +205,18 @@ cat data.csv | ./nats_tool pub \
   --file "/var/log/current/*.log" \
   --file "/var/log/archive/*.gz" \
   --file "/var/log/archive/*.zst"
+
+# ZIP archives - extracts all files automatically
+./nats_tool pub --js --topic data --file /path/to/archive.zip
+
+# Multiple ZIP archives
+./nats_tool pub --js --topic data --file "/archives/*.zip"
+
+# Mixed: ZIP archives + compressed files
+./nats_tool pub --js --topic logs \
+  --file "/var/log/*.zip" \
+  --file "/var/log/*.gz" \
+  --file "/var/log/*.log"
 ```
 
 ### Subscribing
@@ -278,6 +292,7 @@ This fork includes numerous performance improvements:
 - `async_input_reader`: Async file/stdin reader with follow mode
 - `async_multi_file_reader`: Multi-file reader with glob patterns and watch mode
 - `decompression_reader`: Streaming decompressor for gzip/zstd files
+- `zip_extractor`: ZIP archive extraction to temporary directory
 - `async_http_reader`: HTTP/HTTPS streaming client
 - `js_sliding_window`: JetStream ACK batching with retry logic
 - `js_ack_processor`: Background ACK processing and timeout handling

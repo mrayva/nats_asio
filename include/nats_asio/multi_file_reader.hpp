@@ -26,6 +26,7 @@ SOFTWARE.
 #pragma once
 
 #include "decompression_reader.hpp"
+#include "zip_extractor.hpp"
 #include <asio/awaitable.hpp>
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
@@ -288,12 +289,42 @@ private:
 
             for (size_t i = 0; i < glob_result.gl_pathc; ++i) {
                 std::string path = glob_result.gl_pathv[i];
-                current_paths.insert(path);
 
-                // Check if this is a new file
-                if (m_files.find(path) == m_files.end()) {
-                    if (open_file(path)) {
-                        m_log->info("Started tracking file: {}", path);
+                // Check if this is a zip file
+                if (is_zip_file(path) || is_zip_file_magic(path)) {
+                    // Check if we've already extracted this zip
+                    if (m_extracted_zips.find(path) == m_extracted_zips.end()) {
+                        m_log->info("Detected zip archive: {}", path);
+                        auto extracted = extract_zip_to_temp(path, m_log);
+
+                        if (!extracted.empty()) {
+                            // Track this zip as extracted
+                            m_extracted_zips.insert(path);
+
+                            // Add cleanup handler
+                            m_zip_cleanups.push_back(
+                                std::make_unique<zip_temp_cleanup>(path, m_log));
+
+                            // Add all extracted files to current paths and open them
+                            for (const auto& extracted_path : extracted) {
+                                current_paths.insert(extracted_path);
+                                if (m_files.find(extracted_path) == m_files.end()) {
+                                    if (open_file(extracted_path)) {
+                                        m_log->info("Started tracking extracted file: {}", extracted_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Regular file
+                    current_paths.insert(path);
+
+                    // Check if this is a new file
+                    if (m_files.find(path) == m_files.end()) {
+                        if (open_file(path)) {
+                            m_log->info("Started tracking file: {}", path);
+                        }
                     }
                 }
             }
@@ -435,6 +466,8 @@ private:
     std::shared_ptr<spdlog::logger> m_log;
 
     std::map<std::string, tracked_file> m_files;  // path -> file state
+    std::set<std::string> m_extracted_zips;       // zip files already extracted
+    std::vector<std::unique_ptr<zip_temp_cleanup>> m_zip_cleanups;  // cleanup handlers
 };
 
 } // namespace nats_asio

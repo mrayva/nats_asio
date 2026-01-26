@@ -43,6 +43,7 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(asio CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
+find_package(libzip CONFIG REQUIRED)
 
 add_library(nats_asio INTERFACE)
 add_library(nats_asio::nats_asio ALIAS nats_asio)
@@ -76,6 +77,7 @@ target_link_libraries(nats_asio
         asio::asio
         OpenSSL::SSL
         ZLIB::ZLIB
+        libzip::zip
 )
 
 target_compile_features(nats_asio INTERFACE cxx_std_20)
