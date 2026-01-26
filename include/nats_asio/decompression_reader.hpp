@@ -232,11 +232,7 @@ private:
                 return {0, true, true};
             }
 
-            // Check if we have decompressed data
-            if (m_zstream->avail_out < buffer_size) {
-                ssize_t decompressed = buffer_size - m_zstream->avail_out;
-                return {decompressed, false, false};
-            }
+            // Continue loop to fill buffer completely
         }
 
         return {static_cast<ssize_t>(buffer_size), false, false};
@@ -287,10 +283,7 @@ private:
                 return {static_cast<ssize_t>(output.pos), true, false};
             }
 
-            // Check if we have decompressed data
-            if (output.pos > 0) {
-                return {static_cast<ssize_t>(output.pos), false, false};
-            }
+            // Continue loop to fill buffer completely
         }
 
         return {static_cast<ssize_t>(output.pos), false, false};
