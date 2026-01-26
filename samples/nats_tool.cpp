@@ -649,6 +649,11 @@ public:
                 m_ioc.stop();
                 co_return;
             }
+
+            // Brief delay after stream creation to let NATS stabilize
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(100));
+            co_await timer.async_wait(asio::use_awaitable);
         }
 
         if (m_count > 0 && !m_data.empty()) {
@@ -739,8 +744,9 @@ public:
                 timer.expires_after(std::chrono::milliseconds(50));
                 co_await timer.async_wait(asio::use_awaitable);
             }
-            m_log->info("Sliding window stats: acked={}, timeouts={}",
-                       m_js_window->acked_count(), m_js_window->timeout_count());
+            m_log->info("Sliding window stats: acked={}, failed={}, timeouts={}",
+                       m_js_window->acked_count(), m_js_window->failed_count(),
+                       m_js_window->timeout_count());
         } else {
             // Use regular in-flight tracking
             m_log->info("Input complete, waiting for {} in-flight publishes", m_in_flight.load());
@@ -844,26 +850,32 @@ private:
                     nats_asio::headers_t headers_with_nonce = m_headers;
                     headers_with_nonce.emplace_back("Nats-Msg-Id", nonce);
 
-                    auto [ack, status] = co_await conn->js_publish(
-                        *subj, payload_span, headers_with_nonce, m_js_timeout, true);
-                    s = status;
+                    try {
+                        auto [ack, status] = co_await conn->js_publish(
+                            *subj, payload_span, headers_with_nonce, m_js_timeout, true);
+                        s = status;
 
-                    if (s.ok()) {
-                        if (!ack.stream.empty()) {
-                            window->mark_acked(nonce);
-                            m_counter++;
+                        if (s.ok()) {
+                            if (!ack.stream.empty()) {
+                                window->mark_acked(nonce);
+                                m_counter++;
+                            } else {
+                                m_log->warn("Publish OK but empty ACK for subject '{}' (nonce: {})",
+                                           *subj, nonce);
+                                // Still mark as acked to avoid timeout
+                                window->mark_acked(nonce);
+                                m_counter++;
+                            }
                         } else {
-                            m_log->warn("Publish OK but empty ACK for subject '{}' (nonce: {})",
-                                       *subj, nonce);
-                            // Still mark as acked to avoid timeout
-                            window->mark_acked(nonce);
-                            m_counter++;
+                            m_log->error("Publish failed for subject '{}': {} (nonce: {})",
+                                       *subj, s.error(), nonce);
+                            // Remove from window on failure (not counted as acked)
+                            window->mark_acked(nonce, false);
                         }
-                    } else {
-                        m_log->error("Publish failed for subject '{}': {} (nonce: {})",
-                                   *subj, s.error(), nonce);
-                        // Remove from window on failure
-                        window->mark_acked(nonce);
+                    } catch (const std::exception& e) {
+                        m_log->error("Exception during publish for subject '{}': {} (nonce: {})",
+                                   *subj, e.what(), nonce);
+                        window->mark_acked(nonce, false);
                     }
                     co_return;
                 },
