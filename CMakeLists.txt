@@ -49,6 +49,9 @@ add_library(nats_asio::nats_asio ALIAS nats_asio)
 set(NATS_ASIO_HEADERS
     include/nats_asio/interface.hpp
     include/nats_asio/nats_asio.hpp
+    include/nats_asio/compression.hpp
+    include/nats_asio/http_reader.hpp
+    include/nats_asio/input_reader.hpp
 )
 
 target_sources(nats_asio INTERFACE
