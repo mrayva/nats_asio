@@ -38,6 +38,7 @@
 #include "include/worker.hpp"
 #include "include/batch_publisher.hpp"
 #include "include/js_sliding_window.hpp"
+#include "include/js_stream_utils.hpp"
 
 using nats_asio::zstd_compressor;
 using nats_asio::input_source_config;
@@ -597,14 +598,17 @@ public:
               int count = 0, int sleep_ms = 0, const std::string& data = {},
               const input_config& in_cfg = {},
               const input_source_config& src_cfg = {},
-              std::size_t js_window_size = 1000)
+              std::size_t js_window_size = 1000,
+              const std::string& js_stream = "",
+              bool js_create_stream = false)
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
           m_topic(topic), m_next_conn(0), m_in_flight(0), m_max_in_flight(max_in_flight),
           m_jetstream(jetstream), m_js_timeout(std::chrono::milliseconds(js_timeout_ms)),
           m_wait_for_ack(wait_for_ack), m_headers(headers), m_reply_to(reply_to),
           m_count(count), m_sleep_ms(sleep_ms), m_data(data), m_input_cfg(in_cfg),
           m_src_cfg(src_cfg), m_input_reader(ioc, src_cfg, console),
-          m_js_window_size(js_window_size) {
+          m_js_window_size(js_window_size), m_js_stream(js_stream),
+          m_js_create_stream(js_create_stream) {
 
         // Initialize sliding window for JetStream if enabled
         if (m_jetstream && m_wait_for_ack) {
@@ -628,6 +632,23 @@ public:
             asio::steady_timer timer(co_await asio::this_coro::executor);
             timer.expires_after(std::chrono::milliseconds(100));
             co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        // Ensure JetStream stream exists if requested
+        if (m_jetstream && m_js_create_stream && !m_js_stream.empty()) {
+            std::string stream_name = m_js_stream;
+            m_log->info("Ensuring JetStream stream '{}' exists for subject '{}'",
+                       stream_name, m_topic);
+
+            auto conn = get_next_connection();
+            bool stream_ok = co_await nats_tool::ensure_stream_for_subject(
+                conn, stream_name, m_topic, m_log, m_js_timeout);
+
+            if (!stream_ok) {
+                m_log->error("Failed to ensure stream '{}' - aborting publish", stream_name);
+                m_ioc.stop();
+                co_return;
+            }
         }
 
         if (m_count > 0 && !m_data.empty()) {
@@ -709,11 +730,25 @@ public:
         }
 
         // Wait for all in-flight publishes to complete
-        m_log->info("Input complete, waiting for {} in-flight publishes", m_in_flight.load());
-        while (m_in_flight > 0) {
-            asio::steady_timer timer(co_await asio::this_coro::executor);
-            timer.expires_after(std::chrono::milliseconds(50));
-            co_await timer.async_wait(asio::use_awaitable);
+        if (m_jetstream && m_wait_for_ack && m_js_window) {
+            // Use sliding window tracking
+            m_log->info("Input complete, waiting for {} in-flight publishes (sliding window)",
+                       m_js_window->in_flight_count());
+            while (m_js_window->in_flight_count() > 0) {
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(50));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+            m_log->info("Sliding window stats: acked={}, timeouts={}",
+                       m_js_window->acked_count(), m_js_window->timeout_count());
+        } else {
+            // Use regular in-flight tracking
+            m_log->info("Input complete, waiting for {} in-flight publishes", m_in_flight.load());
+            while (m_in_flight > 0) {
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(50));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
         }
 
         m_log->info("All publishes complete, stopping");
@@ -809,26 +844,26 @@ private:
                     nats_asio::headers_t headers_with_nonce = m_headers;
                     headers_with_nonce.emplace_back("Nats-Msg-Id", nonce);
 
-                    if (m_headers.empty()) {
-                        auto [ack, status] = co_await conn->js_publish(
-                            *subj, payload_span, headers_with_nonce, m_js_timeout, true);
-                        s = status;
-                        if (s.ok() && !ack.stream.empty()) {
-                            window->mark_acked(nonce);
-                        }
-                    } else {
-                        auto [ack, status] = co_await conn->js_publish(
-                            *subj, payload_span, headers_with_nonce, m_js_timeout, true);
-                        s = status;
-                        if (s.ok() && !ack.stream.empty()) {
-                            window->mark_acked(nonce);
-                        }
-                    }
+                    auto [ack, status] = co_await conn->js_publish(
+                        *subj, payload_span, headers_with_nonce, m_js_timeout, true);
+                    s = status;
 
-                    if (s.failed()) {
-                        m_log->error("publish failed: {}", s.error());
+                    if (s.ok()) {
+                        if (!ack.stream.empty()) {
+                            window->mark_acked(nonce);
+                            m_counter++;
+                        } else {
+                            m_log->warn("Publish OK but empty ACK for subject '{}' (nonce: {})",
+                                       *subj, nonce);
+                            // Still mark as acked to avoid timeout
+                            window->mark_acked(nonce);
+                            m_counter++;
+                        }
                     } else {
-                        m_counter++;
+                        m_log->error("Publish failed for subject '{}': {} (nonce: {})",
+                                   *subj, s.error(), nonce);
+                        // Remove from window on failure
+                        window->mark_acked(nonce);
                     }
                     co_return;
                 },
@@ -936,6 +971,8 @@ private:
     std::size_t m_js_window_size;
     std::shared_ptr<nats_tool::js_sliding_window> m_js_window;
     std::unique_ptr<nats_tool::js_ack_processor> m_ack_processor;
+    std::string m_js_stream;
+    bool m_js_create_stream;
 };
 
 // Requester - sends requests and waits for replies
@@ -1498,7 +1535,8 @@ int main(int argc, char* argv[]) {
         ("no_ack", "Fire-and-forget JetStream publish, don't wait for ack (with --js)")
         ("js_timeout", "JetStream publish timeout in ms (default: 5000)", cxxopts::value<int>())
         ("js_window", "JetStream ACK sliding window size (default: 1000)", cxxopts::value<int>())
-        ("stream", "JetStream stream name (js_grub/js_fetch mode)", cxxopts::value<std::string>())
+        ("stream", "JetStream stream name (pub/js_grub/js_fetch mode)", cxxopts::value<std::string>())
+        ("create_stream", "Auto-create/update JetStream stream to include subject (pub mode with --js)")
         ("consumer", "JetStream consumer name (js_grub/js_fetch mode)", cxxopts::value<std::string>())
         ("durable", "Durable consumer name (js_grub mode)", cxxopts::value<std::string>())
         ("batch", "Batch size for js_fetch mode (default: 10)", cxxopts::value<int>())
@@ -2130,10 +2168,12 @@ int main(int argc, char* argv[]) {
                 int js_timeout_ms = result.count("js_timeout") ? result["js_timeout"].as<int>() : 5000;
                 bool wait_for_ack = result.count("no_ack") == 0;  // default: wait for ack
                 int js_window_size = result.count("js_window") ? result["js_window"].as<int>() : 1000;
+                std::string js_stream = result.count("stream") ? result["stream"].as<std::string>() : "default";
+                bool js_create_stream = result.count("create_stream") > 0;
                 pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
                                                        max_in_flight, use_jetstream, js_timeout_ms, wait_for_ack,
                                                        headers, custom_reply_to, pub_count, pub_sleep_ms, pub_data,
-                                                       in_cfg, src_cfg, js_window_size);
+                                                       in_cfg, src_cfg, js_window_size, js_stream, js_create_stream);
             }
         } else if (m == mode::benchmarker) {
             int bench_count = result.count("count") ? result["count"].as<int>() : 100000;
