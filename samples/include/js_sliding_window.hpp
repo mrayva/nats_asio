@@ -43,6 +43,14 @@ namespace nats_tool {
 // JetStream Sliding Window ACK Tracking
 // ============================================================================
 
+// Per-stream statistics
+struct stream_stats {
+    std::atomic<std::size_t> acked{0};
+    std::atomic<std::size_t> failed{0};
+    std::atomic<std::size_t> timeouts{0};
+    std::atomic<std::size_t> retries{0};
+};
+
 // Represents an in-flight message awaiting ACK
 struct in_flight_msg {
     std::string nonce;                                       // Message nonce for ACK tracking
@@ -51,6 +59,7 @@ struct in_flight_msg {
     std::string payload;                                     // Payload for retry (optional)
     int retry_count = 0;                                     // Number of retries
     bool acked = false;                                      // Whether ACK received
+    std::string stream;                                      // Stream name for metrics
 };
 
 // Sliding window tracker for JetStream publish ACKs
@@ -58,10 +67,10 @@ struct in_flight_msg {
 class js_sliding_window {
 public:
     js_sliding_window(std::size_t window_size, std::chrono::milliseconds ack_timeout,
-                      std::shared_ptr<spdlog::logger> log)
+                      std::shared_ptr<spdlog::logger> log, int max_retries = 3)
         : m_window_size(window_size), m_ack_timeout(ack_timeout), m_log(std::move(log)),
-          m_next_nonce(1), m_in_flight_count(0), m_acked_count(0), m_timeout_count(0),
-          m_failed_count(0) {}
+          m_max_retries(max_retries), m_next_nonce(1), m_in_flight_count(0), m_acked_count(0),
+          m_timeout_count(0), m_failed_count(0), m_retry_count(0) {}
 
     // Check if window is full (blocks if need backpressure)
     bool is_full() const {
@@ -76,7 +85,7 @@ public:
 
     // Track a sent message
     void track_message(const std::string& nonce, const std::string& subject,
-                      const std::string& payload = "") {
+                      const std::string& payload = "", const std::string& stream = "") {
         in_flight_msg msg;
         msg.nonce = nonce;
         msg.sent_time = std::chrono::steady_clock::now();
@@ -84,6 +93,7 @@ public:
         msg.payload = payload;
         msg.acked = false;
         msg.retry_count = 0;
+        msg.stream = stream;
 
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -94,20 +104,36 @@ public:
 
     // Mark message as ACKed or failed
     bool mark_acked(const std::string& nonce, bool success = true) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        auto it = m_in_flight.find(nonce);
-        if (it != m_in_flight.end()) {
-            it->second.acked = success;
-            m_in_flight.erase(it);
-            m_in_flight_count.fetch_sub(1, std::memory_order_relaxed);
-            if (success) {
-                m_acked_count.fetch_add(1, std::memory_order_relaxed);
+        std::string stream_name;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_in_flight.find(nonce);
+            if (it != m_in_flight.end()) {
+                it->second.acked = success;
+                stream_name = it->second.stream;
+                m_in_flight.erase(it);
+                m_in_flight_count.fetch_sub(1, std::memory_order_relaxed);
+                if (success) {
+                    m_acked_count.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    m_failed_count.fetch_add(1, std::memory_order_relaxed);
+                }
             } else {
-                m_failed_count.fetch_add(1, std::memory_order_relaxed);
+                return false;
             }
-            return true;
         }
-        return false;
+
+        // Update per-stream stats
+        if (!stream_name.empty()) {
+            auto stats = get_or_create_stream_stats(stream_name);
+            if (success) {
+                stats->acked.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                stats->failed.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        return true;
     }
 
     // Check for timed out messages and return them for retry
@@ -122,6 +148,13 @@ public:
 
             if (elapsed > m_ack_timeout) {
                 timed_out.push_back(it->second);
+
+                // Update per-stream timeout stats
+                if (!it->second.stream.empty()) {
+                    auto stats = get_or_create_stream_stats_locked(it->second.stream);
+                    stats->timeouts.fetch_add(1, std::memory_order_relaxed);
+                }
+
                 it = m_in_flight.erase(it);
                 m_in_flight_count.fetch_sub(1, std::memory_order_relaxed);
                 m_timeout_count.fetch_add(1, std::memory_order_relaxed);
@@ -150,8 +183,39 @@ public:
         return m_failed_count.load(std::memory_order_relaxed);
     }
 
+    std::size_t retry_count() const {
+        return m_retry_count.load(std::memory_order_relaxed);
+    }
+
     std::size_t window_size() const {
         return m_window_size;
+    }
+
+    int max_retries() const {
+        return m_max_retries;
+    }
+
+    std::chrono::milliseconds ack_timeout() const {
+        return m_ack_timeout;
+    }
+
+    void increment_retry_count() {
+        m_retry_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Per-stream metrics
+    std::map<std::string, stream_stats> get_stream_stats() const {
+        std::lock_guard<std::mutex> lock(m_stats_mutex);
+        std::map<std::string, stream_stats> result;
+        for (const auto& [stream, stats_ptr] : m_stream_stats) {
+            stream_stats copy;
+            copy.acked.store(stats_ptr->acked.load(std::memory_order_relaxed));
+            copy.failed.store(stats_ptr->failed.load(std::memory_order_relaxed));
+            copy.timeouts.store(stats_ptr->timeouts.load(std::memory_order_relaxed));
+            copy.retries.store(stats_ptr->retries.load(std::memory_order_relaxed));
+            result[stream] = std::move(copy);
+        }
+        return result;
     }
 
     // Wait until window has space
@@ -164,18 +228,40 @@ public:
     }
 
 private:
+    // Helper to get or create stream stats (requires external lock)
+    std::shared_ptr<stream_stats> get_or_create_stream_stats_locked(const std::string& stream) {
+        auto it = m_stream_stats.find(stream);
+        if (it == m_stream_stats.end()) {
+            auto stats = std::make_shared<stream_stats>();
+            m_stream_stats[stream] = stats;
+            return stats;
+        }
+        return it->second;
+    }
+
+    // Helper to get or create stream stats (acquires lock)
+    std::shared_ptr<stream_stats> get_or_create_stream_stats(const std::string& stream) {
+        std::lock_guard<std::mutex> lock(m_stats_mutex);
+        return get_or_create_stream_stats_locked(stream);
+    }
+
     std::size_t m_window_size;
     std::chrono::milliseconds m_ack_timeout;
     std::shared_ptr<spdlog::logger> m_log;
+    int m_max_retries;
 
     std::atomic<std::size_t> m_next_nonce;
     std::atomic<std::size_t> m_in_flight_count;
     std::atomic<std::size_t> m_acked_count;
     std::atomic<std::size_t> m_timeout_count;
     std::atomic<std::size_t> m_failed_count;
+    std::atomic<std::size_t> m_retry_count;
 
     std::mutex m_mutex;
     std::unordered_map<std::string, in_flight_msg> m_in_flight;
+
+    mutable std::mutex m_stats_mutex;
+    std::unordered_map<std::string, std::shared_ptr<stream_stats>> m_stream_stats;
 };
 
 // ============================================================================
@@ -202,6 +288,40 @@ public:
     }
 
 private:
+    asio::awaitable<void> retry_message(in_flight_msg msg) {
+        // Re-track the message with updated retry count
+        m_window->track_message(msg.nonce, msg.subject, msg.payload, msg.stream);
+
+        // Publish the message (without headers to avoid Nats-Msg-Id issue)
+        std::span<const char> payload_span(msg.payload.data(), msg.payload.size());
+
+        try {
+            auto [ack, status] = co_await m_conn->js_publish(
+                msg.subject, payload_span, m_window->ack_timeout(), true);
+
+            if (status.ok()) {
+                m_window->mark_acked(msg.nonce);
+                m_window->increment_retry_count();
+
+                // Update per-stream retry stats
+                if (!msg.stream.empty()) {
+                    auto stats = m_window->get_or_create_stream_stats(msg.stream);
+                    stats->retries.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                m_log->info("Retry successful (nonce: {})", msg.nonce);
+            } else {
+                m_log->error("Retry failed for nonce {}: {}", msg.nonce, status.error());
+                m_window->mark_acked(msg.nonce, false);
+            }
+        } catch (const std::exception& e) {
+            m_log->error("Exception during retry for nonce {}: {}", msg.nonce, e.what());
+            m_window->mark_acked(msg.nonce, false);
+        }
+
+        co_return;
+    }
+
     asio::awaitable<void> process_acks() {
         m_log->info("JetStream ACK processor started (sliding window size: {})",
                     m_window->window_size());
@@ -214,9 +334,23 @@ private:
             // Check for timed out messages
             auto timed_out = m_window->check_timeouts();
             if (!timed_out.empty()) {
-                m_log->warn("Detected {} timed out messages (timeout: {}ms)",
-                           timed_out.size(), m_window->window_size());
-                // Could implement retry logic here
+                m_log->warn("Detected {} timed out messages, checking retry eligibility",
+                           timed_out.size());
+
+                // Retry eligible messages
+                for (auto& msg : timed_out) {
+                    if (msg.retry_count < m_window->max_retries()) {
+                        msg.retry_count++;
+                        m_log->info("Retrying message (nonce: {}, attempt: {}/{})",
+                                   msg.nonce, msg.retry_count, m_window->max_retries());
+                        // Spawn retry coroutine
+                        asio::co_spawn(m_ioc, retry_message(msg), asio::detached);
+                    } else {
+                        m_log->error("Message exceeded max retries (nonce: {}, retries: {})",
+                                   msg.nonce, msg.retry_count);
+                        // Message exhausted retries, don't track it anymore (already removed)
+                    }
+                }
             }
 
             // Sleep briefly before next check
