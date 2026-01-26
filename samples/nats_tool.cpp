@@ -2204,7 +2204,10 @@ public:
 
     bool pop(batch_item& item, std::chrono::milliseconds timeout) {
         if (m_queue.wait_dequeue_timed(item, timeout)) {
-            m_size.fetch_sub(1, std::memory_order_relaxed);
+            // Only decrement size for non-sentinel items
+            if (item.msg_count > 0) {
+                m_size.fetch_sub(1, std::memory_order_relaxed);
+            }
             return true;
         }
         return false;
@@ -2212,7 +2215,7 @@ public:
 
     void set_done() {
         m_done.store(true, std::memory_order_release);
-        // Enqueue a sentinel to wake up waiting consumers
+        // Enqueue a sentinel to wake up waiting consumers (msg_count=0 identifies it)
         m_queue.enqueue(batch_item{"", 0});
     }
 
