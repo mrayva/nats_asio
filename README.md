@@ -48,6 +48,7 @@ A comprehensive command-line tool for NATS operations with extensive JetStream s
 - **File**: Read from single file with optional follow mode (`--file`, `--follow`)
 - **Multiple files**: Glob patterns with wildcard support (`--file "*.log"`, repeatable)
 - **Watch mode**: Detect new files matching patterns in real-time (`--file "*.log" --follow`)
+- **Compressed files**: Automatic decompression of gzip (.gz) and zstd (.zst) files
 - **HTTP/HTTPS**: Stream data from HTTP endpoints (`--http`, `--http_header`, `--http_body`)
 
 #### Input Formats
@@ -79,13 +80,14 @@ spdlog
 openssl
 nlohmann_json
 simdjson
+zlib (for gzip decompression)
+zstd (for zstd decompression)
 ```
 
 ### nats_tool
 ```
 cxxopts
 mimalloc
-zstd
 ```
 
 ### Tests
@@ -179,6 +181,30 @@ cat data.csv | ./nats_tool pub \
 ./nats_tool pub --js --topic logs --file "/var/log/*.log" --follow
 ```
 
+### Compressed File Input
+```bash
+# Automatic decompression - detects .gz files
+./nats_tool pub --js --topic logs --file /var/log/app.log.gz
+
+# Automatic decompression - detects .zst files
+./nats_tool pub --js --topic logs --file /var/log/app.log.zst
+
+# Mixed compressed and uncompressed files
+./nats_tool pub --js --topic logs --file "/var/log/*.log*"
+
+# Glob pattern matching compressed archives
+./nats_tool pub --js --topic archive --file "/var/log/archive/*.gz"
+
+# Detection by magic bytes (works even without .gz/.zst extension)
+./nats_tool pub --js --topic data --file /data/compressed_file
+
+# Multiple patterns with compression
+./nats_tool pub --js --topic logs \
+  --file "/var/log/current/*.log" \
+  --file "/var/log/archive/*.gz" \
+  --file "/var/log/archive/*.zst"
+```
+
 ### Subscribing
 ```bash
 # Standard subscribe
@@ -251,6 +277,7 @@ This fork includes numerous performance improvements:
 ### nats_tool Utilities
 - `async_input_reader`: Async file/stdin reader with follow mode
 - `async_multi_file_reader`: Multi-file reader with glob patterns and watch mode
+- `decompression_reader`: Streaming decompressor for gzip/zstd files
 - `async_http_reader`: HTTP/HTTPS streaming client
 - `js_sliding_window`: JetStream ACK batching with retry logic
 - `js_ack_processor`: Background ACK processing and timeout handling

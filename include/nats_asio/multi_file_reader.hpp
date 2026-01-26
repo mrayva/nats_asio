@@ -25,6 +25,7 @@ SOFTWARE.
 
 #pragma once
 
+#include "decompression_reader.hpp"
 #include <asio/awaitable.hpp>
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
@@ -57,6 +58,8 @@ public:
         std::string buffer;
         bool eof_reached = false;
         bool has_error = false;
+        std::unique_ptr<decompression_reader> decompressor;
+        compression_format format = compression_format::none;
     };
 
     async_multi_file_reader(asio::io_context& ioc, std::vector<std::string> patterns,
@@ -196,19 +199,38 @@ private:
 
         // Try to read more data
         char read_buf[8192];
-        ssize_t bytes_read = ::read(file.fd, read_buf, sizeof(read_buf));
+        ssize_t bytes_read = 0;
+        bool eof = false;
+        bool error = false;
 
-        if (bytes_read < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // No data available right now
-                return std::make_tuple(false, "", false);
+        if (file.decompressor) {
+            // Decompressed read
+            auto [bytes, is_eof, is_error] = file.decompressor->read(read_buf, sizeof(read_buf));
+            bytes_read = bytes;
+            eof = is_eof;
+            error = is_error;
+        } else {
+            // Regular read
+            bytes_read = ::read(file.fd, read_buf, sizeof(read_buf));
+            if (bytes_read < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // No data available right now
+                    return std::make_tuple(false, "", false);
+                }
+                error = true;
+            } else if (bytes_read == 0) {
+                eof = true;
             }
-            m_log->error("Read error on {}: {}", file.path, strerror(errno));
+        }
+
+        if (error) {
+            m_log->error("Read error on {}: {}", file.path,
+                        file.decompressor ? "decompression error" : strerror(errno));
             file.has_error = true;
             return std::make_tuple(false, "", true);
         }
 
-        if (bytes_read == 0) {
+        if (bytes_read == 0 && eof) {
             // EOF reached
             if (!file.buffer.empty()) {
                 std::string line = std::move(file.buffer);
@@ -221,7 +243,14 @@ private:
             return std::make_tuple(false, "", true);
         }
 
-        file.position += bytes_read;
+        if (bytes_read == 0) {
+            // No data available right now
+            return std::make_tuple(false, "", false);
+        }
+
+        if (!file.decompressor) {
+            file.position += bytes_read;
+        }
         file.buffer.append(read_buf, bytes_read);
 
         // Check for complete line again
@@ -312,8 +341,29 @@ private:
         file.eof_reached = false;
         file.has_error = false;
 
+        // Detect compression format
+        compression_format fmt = detect_compression_from_filename(path);
+        if (fmt == compression_format::none) {
+            // Try magic bytes detection
+            char magic[4];
+            ssize_t bytes = ::read(fd, magic, sizeof(magic));
+            if (bytes == sizeof(magic)) {
+                fmt = detect_compression(magic, sizeof(magic));
+            }
+            // Reset file position
+            ::lseek(fd, 0, SEEK_SET);
+        }
+
+        if (fmt != compression_format::none) {
+            m_log->debug("Detected {} compressed file: {}",
+                        fmt == compression_format::gzip ? "gzip" : "zstd", path);
+            file.decompressor = std::make_unique<decompression_reader>(fd, fmt, m_log);
+            file.format = fmt;
+        }
+
         // For follow mode, start at end of file (like tail -f)
-        if (m_follow) {
+        // Note: Follow mode not fully supported for compressed files
+        if (m_follow && !file.decompressor) {
             file.position = ::lseek(fd, 0, SEEK_END);
             if (file.position < 0) file.position = 0;
         }

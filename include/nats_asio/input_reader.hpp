@@ -24,6 +24,7 @@ SOFTWARE.
 
 #pragma once
 
+#include "decompression_reader.hpp"
 #include "http_reader.hpp"  // For input_source_config
 #include <asio/as_tuple.hpp>
 #include <asio/awaitable.hpp>
@@ -73,10 +74,35 @@ public:
             m_stream = std::make_unique<asio::posix::stream_descriptor>(m_ioc, m_fd);
             m_is_stdin = false;
 
+            // Detect compression format
+            compression_format fmt = detect_compression_from_filename(m_config.file_path);
+            if (fmt == compression_format::none) {
+                // Try magic bytes detection
+                char magic[4];
+                ssize_t bytes = ::read(m_fd, magic, sizeof(magic));
+                if (bytes == sizeof(magic)) {
+                    fmt = detect_compression(magic, sizeof(magic));
+                }
+                // Reset file position
+                ::lseek(m_fd, 0, SEEK_SET);
+            }
+
+            if (fmt != compression_format::none) {
+                m_log->info("Detected {} compressed file: {}",
+                           fmt == compression_format::gzip ? "gzip" : "zstd",
+                           m_config.file_path);
+                m_decompressor = std::make_unique<decompression_reader>(m_fd, fmt, m_log);
+            }
+
             // For follow mode, seek to end of file to start reading new data
+            // Note: Follow mode not supported for compressed files
             if (m_config.follow) {
-                m_file_pos = ::lseek(m_fd, 0, SEEK_END);
-                if (m_file_pos < 0) m_file_pos = 0;
+                if (m_decompressor) {
+                    m_log->warn("Follow mode not supported for compressed files, ignoring --follow");
+                } else {
+                    m_file_pos = ::lseek(m_fd, 0, SEEK_END);
+                    if (m_file_pos < 0) m_file_pos = 0;
+                }
             }
         }
         return true;
@@ -108,6 +134,35 @@ public:
             if (m_config.follow && !m_is_stdin) {
                 // Follow mode for files - poll for new data
                 co_return co_await read_line_follow_mode(read_buf, sizeof(read_buf));
+            } else if (m_decompressor) {
+                // Decompressed read
+                auto [bytes_read, eof, error] = m_decompressor->read(read_buf, sizeof(read_buf));
+
+                if (error) {
+                    m_log->error("Decompression error");
+                    co_return std::make_tuple("", true, true);
+                }
+
+                if (bytes_read == 0 && eof) {
+                    // EOF - return any remaining data in buffer
+                    if (!m_buffer.empty()) {
+                        std::string line = std::move(m_buffer);
+                        m_buffer.clear();
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        co_return std::make_tuple(std::move(line), true, false);
+                    }
+                    co_return std::make_tuple("", true, false);
+                }
+
+                if (bytes_read == 0) {
+                    // No data available, yield briefly
+                    asio::steady_timer timer(co_await asio::this_coro::executor);
+                    timer.expires_after(std::chrono::milliseconds(1));
+                    co_await timer.async_wait(asio::use_awaitable);
+                    continue;
+                }
+
+                m_buffer.append(read_buf, bytes_read);
             } else {
                 // Normal read (stdin or non-follow file)
                 auto [ec, bytes_read] = co_await m_stream->async_read_some(
@@ -211,6 +266,7 @@ private:
     input_source_config m_config;
     std::shared_ptr<spdlog::logger> m_log;
     std::unique_ptr<asio::posix::stream_descriptor> m_stream;
+    std::unique_ptr<decompression_reader> m_decompressor;
     int m_fd = -1;
     bool m_is_stdin = false;
     std::string m_buffer;

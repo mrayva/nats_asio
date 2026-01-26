@@ -42,6 +42,7 @@ find_package(simdjson CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(asio CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 
 add_library(nats_asio INTERFACE)
 add_library(nats_asio::nats_asio ALIAS nats_asio)
@@ -74,6 +75,7 @@ target_link_libraries(nats_asio
         spdlog::spdlog
         asio::asio
         OpenSSL::SSL
+        ZLIB::ZLIB
 )
 
 target_compile_features(nats_asio INTERFACE cxx_std_20)
