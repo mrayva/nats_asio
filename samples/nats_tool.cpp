@@ -154,6 +154,7 @@ int main(int argc, char* argv[]) {
         ("stats_interval", "stat interval seconds", cxxopts::value<int>(stats_interval))
         ("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
         ("n,connections", "Number of connections for pub mode (default: 1)", cxxopts::value<int>(num_connections))
+        ("threads", "Number of threads to run io_context (default: 1, use 0 for hardware_concurrency)", cxxopts::value<int>())
         ("max_in_flight", "Max in-flight publishes for pub mode (default: 1000)", cxxopts::value<int>(max_in_flight))
         ("batch_pub", "Use high-performance batch publishing (pub mode)")
         ("batch_size", "Batch read size in bytes for batch_pub mode (default: 65536)", cxxopts::value<int>())
@@ -455,6 +456,7 @@ int main(int argc, char* argv[]) {
         }
 
         asio::io_context ioc;
+        auto strand = asio::make_strand(ioc);  // Serialize operations for thread safety
         std::shared_ptr<grubber> grub_ptr;
         std::shared_ptr<generator> gen_ptr;
         std::shared_ptr<publisher> pub_ptr;
@@ -859,7 +861,53 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        ioc.run();
+        // Multi-threaded io_context support
+        int num_threads = 1;
+        if (result.count("threads")) {
+            num_threads = result["threads"].as<int>();
+            if (num_threads == 0) {
+                num_threads = std::thread::hardware_concurrency();
+            }
+            if (num_threads < 1) {
+                num_threads = 1;
+            }
+
+            // Check if current mode supports multi-threading
+            if (num_threads > 1) {
+                bool thread_safe = (m == mode::benchmarker || m == mode::generator);
+                if (!thread_safe && (m == mode::publisher || m == mode::grubber ||
+                                     m == mode::js_grubber || m == mode::js_fetcher)) {
+                    console->warn("--threads > 1 not yet supported for this mode (requires strand support), using single thread");
+                    console->warn("For high-throughput JetStream with ACKs, this requires additional work on publisher threading");
+                    num_threads = 1;
+                }
+            }
+        }
+
+        if (num_threads > 1) {
+            console->info("Running io_context on {} threads", num_threads);
+            std::vector<std::thread> thread_pool;
+            thread_pool.reserve(num_threads - 1);
+
+            // Start worker threads
+            for (int i = 0; i < num_threads - 1; ++i) {
+                thread_pool.emplace_back([&ioc]() {
+                    ioc.run();
+                });
+            }
+
+            // Run on main thread too
+            ioc.run();
+
+            // Wait for all threads to finish
+            for (auto& t : thread_pool) {
+                if (t.joinable()) {
+                    t.join();
+                }
+            }
+        } else {
+            ioc.run();
+        }
 
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
