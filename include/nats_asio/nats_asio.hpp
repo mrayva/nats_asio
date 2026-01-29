@@ -2042,13 +2042,13 @@ public:
     connection(aio& io, const on_connected_cb& connected_cb,
                const on_disconnected_cb& disconnected_cb, const on_error_cb& error_cb,
                const std::shared_ptr<ssl::context>& ctx)
-        : m_sid(0), m_max_payload(0), m_io(io), m_is_connected(false), m_stop_flag(false),
+        : m_sid(0), m_max_payload(0), m_io(io), m_strand(asio::make_strand(io)), m_is_connected(false), m_stop_flag(false),
           m_connected_cb(connected_cb), m_disconnected_cb(disconnected_cb), m_error_cb(error_cb),
           m_ssl_ctx(ctx), m_socket(io, *ctx.get()) {}
 
     connection(aio& io, const on_connected_cb& connected_cb,
                const on_disconnected_cb& disconnected_cb, const on_error_cb& error_cb)
-        : m_sid(0), m_max_payload(0), m_io(io), m_is_connected(false), m_stop_flag(false),
+        : m_sid(0), m_max_payload(0), m_io(io), m_strand(asio::make_strand(io)), m_is_connected(false), m_stop_flag(false),
           m_connected_cb(connected_cb), m_disconnected_cb(disconnected_cb), m_error_cb(error_cb),
           m_socket(io) {}
 
@@ -2057,7 +2057,7 @@ public:
 
     virtual void start(const connect_config& conf) override {
         asio::co_spawn(
-            asio::make_strand(m_io), [this, conf]() -> awaitable<void> { return run(conf); },
+            m_strand, [this, conf]() -> awaitable<void> { return run(conf); },
             asio::detached);
     }
 
@@ -2113,8 +2113,11 @@ public:
 
         // 2. Unsubscribe all subscriptions
         std::vector<isubscription_sptr> subs_to_remove;
-        for (auto& [sid, sub] : m_subs) {
-            subs_to_remove.push_back(sub);
+        {
+            std::lock_guard<std::mutex> lock(m_subs_mutex);
+            for (auto& [sid, sub] : m_subs) {
+                subs_to_remove.push_back(sub);
+            }
         }
 
         for (auto& sub : subs_to_remove) {
@@ -2480,7 +2483,10 @@ public:
         }
 
         auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
-        m_subs.emplace(sid, sub);
+        {
+            std::lock_guard<std::mutex> lock(m_subs_mutex);
+            m_subs.emplace(sid, sub);
+        }
 
         co_return std::pair<isubscription_sptr, status>{sub, status()};
     }
@@ -2506,7 +2512,10 @@ public:
         }
 
         auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
-        m_subs.emplace(sid, sub);
+        {
+            std::lock_guard<std::mutex> lock(m_subs_mutex);
+            m_subs.emplace(sid, sub);
+        }
 
         co_return std::pair<isubscription_sptr, status>{sub, status()};
     }
@@ -2532,7 +2541,10 @@ public:
         }
 
         auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
-        m_subs.emplace(sid, sub);
+        {
+            std::lock_guard<std::mutex> lock(m_subs_mutex);
+            m_subs.emplace(sid, sub);
+        }
 
         co_return std::pair<isubscription_sptr, status>{sub, status()};
     }
@@ -4004,13 +4016,18 @@ private:
             co_return;
         }
 
-        auto it = m_subs.find(sid_u);
-        if (it == m_subs.end()) {
-            co_return;
+        subscription_sptr sub;
+        {
+            std::lock_guard<std::mutex> lock(m_subs_mutex);
+            auto it = m_subs.find(sid_u);
+            if (it == m_subs.end()) {
+                co_return;
+            }
+            sub = it->second;  // Copy shared_ptr while holding lock
         }
 
-        if (it->second->is_cancelled()) {
-            co_await unsubscribe_impl(it->second);
+        if (sub->is_cancelled()) {
+            co_await unsubscribe_impl(sub);
             co_return;  // Don't deliver message to cancelled subscription
         }
 
@@ -4018,7 +4035,7 @@ private:
         std::span<const char> payload_span(static_cast<const char*>(b.data()), n);
 
         // Check callback type and dispatch appropriately
-        if (it->second->has_zero_copy_callback()) {
+        if (sub->has_zero_copy_callback()) {
             // Zero-copy path for MSG (no headers)
             message_view msg_view;
             msg_view.subject = subject;
@@ -4028,14 +4045,14 @@ private:
             // No headers for regular MSG
             msg_view.payload = payload_span;
 
-            co_await it->second->zero_copy_callback()(msg_view);
+            co_await sub->zero_copy_callback()(msg_view);
         } else {
-            co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+            co_await sub->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
         }
 
         // Check for auto-unsubscribe after delivering message
-        if (it->second->increment_and_check()) {
-            co_await unsubscribe_impl(it->second);
+        if (sub->increment_and_check()) {
+            co_await unsubscribe_impl(sub);
         }
         co_return;
     }
@@ -4063,13 +4080,18 @@ private:
             co_return;
         }
 
-        auto it = m_subs.find(sid_u);
-        if (it == m_subs.end()) {
-            co_return;
+        subscription_sptr sub;
+        {
+            std::lock_guard<std::mutex> lock(m_subs_mutex);
+            auto it = m_subs.find(sid_u);
+            if (it == m_subs.end()) {
+                co_return;
+            }
+            sub = it->second;  // Copy shared_ptr while holding lock
         }
 
-        if (it->second->is_cancelled()) {
-            co_await unsubscribe_impl(it->second);
+        if (sub->is_cancelled()) {
+            co_await unsubscribe_impl(sub);
             co_return;
         }
 
@@ -4083,7 +4105,7 @@ private:
         std::span<const char> payload_span(data_ptr + header_len, payload_len);
 
         // Check callback type and dispatch appropriately
-        if (it->second->has_zero_copy_callback()) {
+        if (sub->has_zero_copy_callback()) {
             // Zero-copy path - no allocations, references internal buffers
             message_view msg_view;
             msg_view.subject = subject;
@@ -4094,8 +4116,8 @@ private:
             msg_view.headers = lazy_headers_view(headers_sv);  // Lazy parsing - only parsed when accessed
             msg_view.payload = payload_span;
 
-            co_await it->second->zero_copy_callback()(msg_view);
-        } else if (it->second->has_headers_callback()) {
+            co_await sub->zero_copy_callback()(msg_view);
+        } else if (sub->has_headers_callback()) {
             // Build full message with headers (copies data)
             message msg;
             msg.subject = std::string(subject);
@@ -4107,15 +4129,15 @@ private:
             msg.headers = parse_headers(headers_sv);
             msg.payload.assign(payload_span.begin(), payload_span.end());
 
-            co_await it->second->headers_callback()(msg);
+            co_await sub->headers_callback()(msg);
         } else {
             // Fall back to regular callback (without headers)
-            co_await it->second->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+            co_await sub->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
         }
 
         // Check for auto-unsubscribe after delivering message
-        if (it->second->increment_and_check()) {
-            co_await unsubscribe_impl(it->second);
+        if (sub->increment_and_check()) {
+            co_await unsubscribe_impl(sub);
         }
         co_return;
     }
@@ -4312,12 +4334,16 @@ private:
 
     awaitable<status> unsubscribe_impl(const isubscription_sptr& p) {
         auto sid = p->sid();
-        auto it = m_subs.find(sid);
 
-        if (it == m_subs.end()) {
-            co_return status(fmt::format("subscription not found {}", sid));
+        {
+            std::lock_guard<std::mutex> lock(m_subs_mutex);
+            auto it = m_subs.find(sid);
+
+            if (it == m_subs.end()) {
+                co_return status(fmt::format("subscription not found {}", sid));
+            }
+            m_subs.erase(it);
         }
-        m_subs.erase(it);
 
         std::string unsub_payload(fmt::format(fmt::runtime(protocol::unsub_fmt), sid));
         try {
@@ -4507,11 +4533,13 @@ private:
     std::atomic<uint64_t> m_sid;
     std::size_t m_max_payload;
     aio& m_io;
+    asio::strand<aio::executor_type> m_strand;
 
     std::atomic<bool> m_is_connected;
     std::atomic<bool> m_stop_flag;
     std::atomic<bool> m_draining{false};
 
+    mutable std::mutex m_subs_mutex;
     std::unordered_map<uint64_t, subscription_sptr> m_subs;
     on_connected_cb m_connected_cb;
     on_disconnected_cb m_disconnected_cb;

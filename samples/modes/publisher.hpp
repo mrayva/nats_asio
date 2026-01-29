@@ -90,6 +90,8 @@ public:
             }
         }
 
+        m_log->debug("Publisher constructor complete, starting read_and_publish on strand");
+
         // Bind to strand for thread-safe execution
         asio::co_spawn(m_strand, read_and_publish(), asio::detached);
     }
@@ -456,8 +458,8 @@ private:
     nats_asio::iconnection_sptr get_next_connection() {
         std::size_t attempts = 0;
         while (attempts < m_connections.size()) {
-            auto conn = m_connections[m_next_conn % m_connections.size()];
-            m_next_conn++;
+            auto idx = m_next_conn.fetch_add(1, std::memory_order_relaxed) % m_connections.size();
+            auto conn = m_connections[idx];
             if (conn->is_connected()) {
                 return conn;
             }
@@ -469,7 +471,7 @@ private:
 
     std::vector<nats_asio::iconnection_sptr> m_connections;
     std::string m_topic;
-    std::size_t m_next_conn;
+    std::atomic<std::size_t> m_next_conn;
     std::atomic<int> m_in_flight;
     int m_max_in_flight;
     bool m_jetstream;
