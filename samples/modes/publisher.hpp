@@ -74,7 +74,8 @@ public:
           m_count(count), m_sleep_ms(sleep_ms), m_data(data), m_input_cfg(in_cfg),
           m_src_cfg(src_cfg), m_input_reader(ioc, src_cfg, console),
           m_js_window_size(js_window_size), m_js_stream(js_stream),
-          m_js_create_stream(js_create_stream), m_js_max_retries(js_max_retries) {
+          m_js_create_stream(js_create_stream), m_js_max_retries(js_max_retries),
+          m_strand(asio::make_strand(ioc)) {
 
         // Initialize sliding window for JetStream if enabled
         if (m_jetstream && m_wait_for_ack) {
@@ -89,7 +90,8 @@ public:
             }
         }
 
-        asio::co_spawn(ioc, read_and_publish(), asio::detached);
+        // Bind to strand for thread-safe execution
+        asio::co_spawn(m_strand, read_and_publish(), asio::detached);
     }
 
     asio::awaitable<void> read_and_publish() {
@@ -492,6 +494,9 @@ private:
     std::string m_js_stream;
     bool m_js_create_stream;
     int m_js_max_retries;
+
+    // Strand for thread-safe multi-threaded execution
+    asio::strand<asio::io_context::executor_type> m_strand;
 };
 
 } // namespace nats_tool

@@ -30,6 +30,7 @@ SOFTWARE.
 #include <asio/io_context.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
+#include <atomic>
 #include <memory>
 #include <spdlog/spdlog.h>
 #include <string>
@@ -74,14 +75,14 @@ public:
                 co_return;
             }
 
-            m_log->info("Stats: {} events/sec", m_counter / m_stats_interval);
-            m_counter = 0;
+            auto count = m_counter.exchange(0, std::memory_order_relaxed);
+            m_log->info("Stats: {} events/sec", count / m_stats_interval);
         }
     }
 
 protected:
     int m_stats_interval;
-    std::size_t m_counter;
+    std::atomic<std::size_t> m_counter;
     asio::io_context& m_ioc;
     std::shared_ptr<spdlog::logger> m_log;
 };

@@ -874,11 +874,10 @@ int main(int argc, char* argv[]) {
 
             // Check if current mode supports multi-threading
             if (num_threads > 1) {
-                bool thread_safe = (m == mode::benchmarker || m == mode::generator);
-                if (!thread_safe && (m == mode::publisher || m == mode::grubber ||
+                bool thread_safe = (m == mode::benchmarker || m == mode::generator || m == mode::publisher);
+                if (!thread_safe && (m == mode::grubber ||
                                      m == mode::js_grubber || m == mode::js_fetcher)) {
                     console->warn("--threads > 1 not yet supported for this mode (requires strand support), using single thread");
-                    console->warn("For high-throughput JetStream with ACKs, this requires additional work on publisher threading");
                     num_threads = 1;
                 }
             }

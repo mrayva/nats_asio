@@ -94,7 +94,7 @@ public:
             }
         }
 
-        m_log->info("Requester finished, {} requests sent", m_counter);
+        m_log->info("Requester finished, {} requests sent", m_counter.load());
         m_ioc.stop();
         co_return;
     }
