@@ -40,6 +40,7 @@
 #include "include/batch_publisher.hpp"
 #include "include/js_sliding_window.hpp"
 #include "include/js_stream_utils.hpp"
+#include "include/zerialize_json.hpp"
 
 using nats_asio::zstd_compressor;
 using nats_asio::input_source_config;
@@ -184,6 +185,9 @@ int main(int argc, char* argv[]) {
         ("raw", "Output raw payload only (grub/js_grub mode)")
         ("dump", "Dump messages to file (grub/js_grub mode)", cxxopts::value<std::string>())
         ("json", "Output messages as JSON (grub/js_grub mode)")
+        ("format", "Binary format for deserialization: msgpack, cbor, flexbuffers, zera (grub/js_grub mode)", cxxopts::value<std::string>())
+        ("max_bad_messages", "Exit after N failed deserializations (default: 0 = disabled)", cxxopts::value<std::size_t>())
+        ("max_bad_percentage", "Exit if bad message percentage exceeds threshold (default: 0 = disabled)", cxxopts::value<double>())
         ("translate", "Transform payload through external command (supports {{Subject}})", cxxopts::value<std::string>())
         ("data", "Payload data for req/reply mode (if not provided, reads from stdin)", cxxopts::value<std::string>())
         ("timeout", "Request timeout in ms for req mode (default: 5000)", cxxopts::value<int>())
@@ -577,8 +581,34 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Parse binary format options
+        std::optional<nats_tool::binary_format> binary_fmt;
+        std::size_t max_bad_messages = 0;
+        double max_bad_percentage = 0.0;
+
+        if (result.count("format")) {
+            std::string fmt_str = result["format"].as<std::string>();
+            binary_fmt = nats_tool::parse_format(fmt_str);
+            if (!binary_fmt) {
+                console->error("Invalid format '{}'. Valid formats: msgpack, cbor, flexbuffers, zera", fmt_str);
+                return 1;
+            }
+        }
+
+        if (result.count("max_bad_messages")) {
+            max_bad_messages = result["max_bad_messages"].as<std::size_t>();
+        }
+
+        if (result.count("max_bad_percentage")) {
+            max_bad_percentage = result["max_bad_percentage"].as<double>();
+            if (max_bad_percentage < 0.0 || max_bad_percentage > 100.0) {
+                console->error("max_bad_percentage must be between 0 and 100");
+                return 1;
+            }
+        }
+
         if (m == mode::grubber) {
-            grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file, translate_cmd, show_timestamp);
+            grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file, translate_cmd, show_timestamp, binary_fmt, max_bad_messages, max_bad_percentage);
         } else if (m == mode::js_grubber) {
             js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, out_mode, auto_ack, dump_file, translate_cmd);
         } else if (m == mode::kv_watcher) {

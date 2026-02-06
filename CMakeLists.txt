@@ -45,6 +45,16 @@ find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(libzip CONFIG REQUIRED)
 
+# Fetch zerialize for binary format deserialization
+include(FetchContent)
+FetchContent_Declare(
+    zerialize
+    GIT_REPOSITORY https://github.com/colinator/zerialize.git
+    GIT_TAG        main
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(zerialize)
+
 add_library(nats_asio INTERFACE)
 add_library(nats_asio::nats_asio ALIAS nats_asio)
 
@@ -96,6 +106,7 @@ if(NATS_ASIO_BUILD_SAMPLES)
             cxxopts::cxxopts
             mimalloc
             simdjson::simdjson
+            zerialize
             $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
     )
 
