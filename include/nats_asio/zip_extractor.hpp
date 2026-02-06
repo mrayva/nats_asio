@@ -75,9 +75,10 @@ inline std::vector<std::string> extract_zip_to_temp(
     int err = 0;
     zip_t* archive = zip_open(zip_path.c_str(), ZIP_RDONLY, &err);
     if (!archive) {
-        char errstr[256];
-        zip_error_to_str(errstr, sizeof(errstr), err, errno);
-        log->error("Failed to open zip archive {}: {}", zip_path, errstr);
+        zip_error_t zerr;
+        zip_error_init_with_code(&zerr, err);
+        log->error("Failed to open zip archive {}: {}", zip_path, zip_error_strerror(&zerr));
+        zip_error_fini(&zerr);
         return extracted_files;
     }
 

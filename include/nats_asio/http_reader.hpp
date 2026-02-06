@@ -189,42 +189,11 @@ public:
             co_return std::make_tuple("", true, true);
         }
 
-        // Check if we have a complete line in buffer
-        auto newline_pos = m_buffer.find('\n');
-        if (newline_pos != std::string::npos) {
-            std::string line = m_buffer.substr(0, newline_pos);
-            m_buffer.erase(0, newline_pos + 1);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            co_return std::make_tuple(std::move(line), false, false);
-        }
-
-        // Read more data
         char read_buf[8192];
-        try {
-            size_t bytes_read;
-            if (m_use_ssl) {
-                bytes_read = co_await m_ssl_socket->async_read_some(
-                    asio::buffer(read_buf, sizeof(read_buf)), asio::use_awaitable);
-            } else {
-                bytes_read = co_await m_socket->async_read_some(
-                    asio::buffer(read_buf, sizeof(read_buf)), asio::use_awaitable);
-            }
 
-            if (bytes_read == 0) {
-                // Connection closed
-                if (!m_buffer.empty()) {
-                    std::string line = std::move(m_buffer);
-                    m_buffer.clear();
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
-                    co_return std::make_tuple(std::move(line), true, false);
-                }
-                co_return std::make_tuple("", true, false);
-            }
-
-            m_buffer.append(read_buf, bytes_read);
-
-            // Check for complete line again
-            newline_pos = m_buffer.find('\n');
+        for (;;) {
+            // Check if we have a complete line in buffer
+            auto newline_pos = m_buffer.find('\n');
             if (newline_pos != std::string::npos) {
                 std::string line = m_buffer.substr(0, newline_pos);
                 m_buffer.erase(0, newline_pos + 1);
@@ -232,21 +201,43 @@ public:
                 co_return std::make_tuple(std::move(line), false, false);
             }
 
-            // No complete line yet, continue reading
-            co_return co_await read_line();
-
-        } catch (const asio::system_error& e) {
-            if (e.code() == asio::error::eof) {
-                if (!m_buffer.empty()) {
-                    std::string line = std::move(m_buffer);
-                    m_buffer.clear();
-                    if (!line.empty() && line.back() == '\r') line.pop_back();
-                    co_return std::make_tuple(std::move(line), true, false);
+            // Read more data
+            try {
+                size_t bytes_read;
+                if (m_use_ssl) {
+                    bytes_read = co_await m_ssl_socket->async_read_some(
+                        asio::buffer(read_buf, sizeof(read_buf)), asio::use_awaitable);
+                } else {
+                    bytes_read = co_await m_socket->async_read_some(
+                        asio::buffer(read_buf, sizeof(read_buf)), asio::use_awaitable);
                 }
-                co_return std::make_tuple("", true, false);
+
+                if (bytes_read == 0) {
+                    // Connection closed
+                    if (!m_buffer.empty()) {
+                        std::string line = std::move(m_buffer);
+                        m_buffer.clear();
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        co_return std::make_tuple(std::move(line), true, false);
+                    }
+                    co_return std::make_tuple("", true, false);
+                }
+
+                m_buffer.append(read_buf, bytes_read);
+
+            } catch (const asio::system_error& e) {
+                if (e.code() == asio::error::eof) {
+                    if (!m_buffer.empty()) {
+                        std::string line = std::move(m_buffer);
+                        m_buffer.clear();
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
+                        co_return std::make_tuple(std::move(line), true, false);
+                    }
+                    co_return std::make_tuple("", true, false);
+                }
+                m_log->error("HTTP read error: {}", e.what());
+                co_return std::make_tuple("", true, true);
             }
-            m_log->error("HTTP read error: {}", e.what());
-            co_return std::make_tuple("", true, true);
         }
     }
 

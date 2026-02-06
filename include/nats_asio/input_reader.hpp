@@ -53,6 +53,14 @@ public:
                        std::shared_ptr<spdlog::logger> log)
         : m_ioc(ioc), m_config(config), m_log(std::move(log)) {}
 
+    ~async_input_reader() {
+        m_decompressor.reset();
+        m_stream.reset();  // stream_descriptor closes the fd it owns
+    }
+
+    async_input_reader(const async_input_reader&) = delete;
+    async_input_reader& operator=(const async_input_reader&) = delete;
+
     // Initialize the reader - must be called before reading
     bool init() {
         if (m_config.file_path.empty()) {

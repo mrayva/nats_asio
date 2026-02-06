@@ -427,34 +427,45 @@ private:
 
     // Check for file rotations (inode changes)
     void check_file_rotations() {
+        std::vector<std::string> deleted_paths;
+        std::vector<std::string> rotated_paths;
+
         for (auto& [path, file] : m_files) {
             if (file.has_error) continue;
 
             struct stat st;
             if (::stat(path.c_str(), &st) < 0) {
-                // File was deleted
                 m_log->info("File deleted: {}", path);
-                close_file(path);
+                deleted_paths.push_back(path);
                 continue;
             }
 
-            // Check if inode changed (rotation)
             if (st.st_ino != file.inode) {
                 m_log->info("File rotated: {} (inode {} -> {})", path, file.inode, st.st_ino);
-                // Close old fd and reopen
-                ::close(file.fd);
-                if (!open_file(path)) {
-                    m_log->error("Failed to reopen rotated file: {}", path);
-                }
+                rotated_paths.push_back(path);
                 continue;
             }
 
-            // Check if file was truncated
             if (st.st_size < file.position) {
                 m_log->info("File truncated: {}", path);
                 file.position = 0;
                 ::lseek(file.fd, 0, SEEK_SET);
                 file.eof_reached = false;
+            }
+        }
+
+        for (const auto& path : deleted_paths) {
+            close_file(path);
+        }
+
+        for (const auto& path : rotated_paths) {
+            auto it = m_files.find(path);
+            if (it != m_files.end()) {
+                ::close(it->second.fd);
+                m_files.erase(it);
+            }
+            if (!open_file(path)) {
+                m_log->error("Failed to reopen rotated file: {}", path);
             }
         }
     }

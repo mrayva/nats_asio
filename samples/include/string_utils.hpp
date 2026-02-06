@@ -157,8 +157,15 @@ inline std::string translate_payload(const std::string& cmd, std::string_view su
     int stdin_pipe[2];
     int stdout_pipe[2];
 
-    if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0) {
-        log->error("translate: failed to create pipes");
+    if (pipe(stdin_pipe) < 0) {
+        log->error("translate: failed to create stdin pipe");
+        return std::string(payload.data(), payload.size());
+    }
+
+    if (pipe(stdout_pipe) < 0) {
+        log->error("translate: failed to create stdout pipe");
+        close(stdin_pipe[0]);
+        close(stdin_pipe[1]);
         return std::string(payload.data(), payload.size());
     }
 
@@ -190,13 +197,20 @@ inline std::string translate_payload(const std::string& cmd, std::string_view su
     close(stdin_pipe[0]);   // Close read end of stdin pipe
     close(stdout_pipe[1]);  // Close write end of stdout pipe
 
-    // Write payload to child's stdin
-    ssize_t written = write(stdin_pipe[1], payload.data(), payload.size());
-    close(stdin_pipe[1]);  // Signal EOF to child
-
-    if (written < 0) {
-        log->error("translate: write to child failed");
+    // Write payload to child's stdin (handle partial writes)
+    const char* write_ptr = payload.data();
+    std::size_t remaining = payload.size();
+    while (remaining > 0) {
+        ssize_t written = write(stdin_pipe[1], write_ptr, remaining);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            log->error("translate: write to child failed: {}", strerror(errno));
+            break;
+        }
+        write_ptr += written;
+        remaining -= static_cast<std::size_t>(written);
     }
+    close(stdin_pipe[1]);  // Signal EOF to child
 
     // Read output from child's stdout
     std::string result;
