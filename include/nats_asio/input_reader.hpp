@@ -92,7 +92,10 @@ public:
                     fmt = detect_compression(magic, sizeof(magic));
                 }
                 // Reset file position
-                ::lseek(m_fd, 0, SEEK_SET);
+                if (::lseek(m_fd, 0, SEEK_SET) < 0) {
+                    m_log->error("Failed to reset file position: {}", m_config.file_path);
+                    return false;
+                }
             }
 
             if (fmt != compression_format::none) {

@@ -103,7 +103,7 @@ public:
 
     bool is_done() const {
         return m_done.load(std::memory_order_acquire) &&
-               m_size.load(std::memory_order_relaxed) == 0;
+               m_size.load(std::memory_order_acquire) == 0;
     }
 
     std::size_t size() const {

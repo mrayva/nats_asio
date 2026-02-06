@@ -118,16 +118,22 @@ inline std::vector<std::string> extract_zip_to_temp(
             continue;
         }
 
-        // Create output file path (flatten directory structure)
+        // Create output file path (flatten directory structure, deduplicate)
         std::string filename = std::filesystem::path(name).filename().string();
         if (filename.empty()) {
-            // Use the full path as filename if no filename component
             filename = std::string(name);
             std::replace(filename.begin(), filename.end(), '/', '_');
             std::replace(filename.begin(), filename.end(), '\\', '_');
         }
 
+        // Deduplicate: if filename already exists, prepend parent dir
         std::filesystem::path output_path = temp_dir / filename;
+        if (std::filesystem::exists(output_path)) {
+            std::string unique_name = std::string(name);
+            std::replace(unique_name.begin(), unique_name.end(), '/', '_');
+            std::replace(unique_name.begin(), unique_name.end(), '\\', '_');
+            output_path = temp_dir / unique_name;
+        }
 
         // Read and write file
         std::ofstream out(output_path, std::ios::binary);

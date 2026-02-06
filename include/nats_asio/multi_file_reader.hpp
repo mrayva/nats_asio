@@ -382,7 +382,11 @@ private:
                 fmt = detect_compression(magic, sizeof(magic));
             }
             // Reset file position
-            ::lseek(fd, 0, SEEK_SET);
+            if (::lseek(fd, 0, SEEK_SET) < 0) {
+                m_log->error("Failed to reset file position for {}: {}", path, strerror(errno));
+                ::close(fd);
+                return false;
+            }
         }
 
         if (fmt != compression_format::none) {
