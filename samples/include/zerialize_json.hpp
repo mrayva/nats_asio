@@ -90,6 +90,38 @@ inline std::optional<std::string> deserialize_to_json(
     return std::nullopt; // Should not reach here
 }
 
+// Serialize JSON string to binary format
+// Returns nullopt on error (malformed JSON)
+inline std::optional<std::vector<std::byte>> serialize_from_json(
+    const std::string& json_str,
+    binary_format format,
+    std::shared_ptr<spdlog::logger> log = nullptr) {
+
+    try {
+        // Parse JSON string
+        auto doc = zerialize::from_json_string(json_str);
+
+        // Serialize to binary format
+        switch (format) {
+            case binary_format::msgpack:
+                return zerialize::to_msgpack(doc);
+            case binary_format::cbor:
+                return zerialize::to_cbor(doc);
+            case binary_format::flexbuffers:
+                return zerialize::to_flexbuffers(doc);
+            case binary_format::zera:
+                return zerialize::to_zera(doc);
+        }
+    } catch (const std::exception& e) {
+        if (log) {
+            log->debug("Failed to serialize JSON: {}", e.what());
+        }
+        return std::nullopt;
+    }
+
+    return std::nullopt; // Should not reach here
+}
+
 // Error tracking for deserializer
 class deserializer_stats {
 public:

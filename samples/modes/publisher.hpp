@@ -28,6 +28,7 @@ SOFTWARE.
 #include "../include/worker.hpp"
 #include "../include/string_utils.hpp"
 #include "../include/fast_json_parser.hpp"
+#include "../include/zerialize_json.hpp"
 #include "../include/js_sliding_window.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <nats_asio/compression.hpp>

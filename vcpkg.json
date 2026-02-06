@@ -7,7 +7,11 @@
     "fmt",
     "gtl",
     "inja",
-    "libzip",
+    {
+      "name": "libzip",
+      "default-features": false,
+      "features": ["bzip2"]
+    },
     "magic-enum",
     "mimalloc",
 	"nlohmann-json",
@@ -15,7 +19,6 @@
 	"spdlog",
     "stringzilla",
     "asio",
-    "openssl",
     "zstd",
 	"gtest"
   ]
