@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(nats_asio 
+set(VCPKG_OVERLAY_TRIPLETS "${CMAKE_CURRENT_SOURCE_DIR}/triplets" CACHE STRING "")
+
+project(nats_asio
     VERSION 0.1.0
     DESCRIPTION "Header-only C++ NATS client using standalone Asio"
     LANGUAGES CXX
@@ -109,6 +111,7 @@ if(NATS_ASIO_BUILD_SAMPLES)
             zerialize
             $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
     )
+    target_compile_definitions(nats_tool PRIVATE FLATBUFFERS_LOCALE_INDEPENDENT=0)
 
     set_target_properties(nats_tool PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin

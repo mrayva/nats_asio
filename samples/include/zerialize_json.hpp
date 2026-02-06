@@ -25,6 +25,11 @@ SOFTWARE.
 #pragma once
 
 #include <zerialize/zerialize.hpp>
+#include <zerialize/protocols/json.hpp>
+#include <zerialize/protocols/msgpack.hpp>
+#include <zerialize/protocols/cbor.hpp>
+#include <zerialize/protocols/flex.hpp>
+#include <zerialize/protocols/zera.hpp>
 #include <span>
 #include <string>
 #include <optional>
@@ -57,27 +62,29 @@ inline std::optional<std::string> deserialize_to_json(
     std::shared_ptr<spdlog::logger> log = nullptr) {
 
     try {
-        // Convert span to vector for zerialize
-        std::vector<std::byte> data(payload.size());
-        std::memcpy(data.data(), payload.data(), payload.size());
+        auto bytes = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
 
-        // Deserialize based on format
         switch (format) {
             case binary_format::msgpack: {
-                auto doc = zerialize::from_msgpack(data);
-                return zerialize::to_json_string(doc);
+                zerialize::MsgPack::Deserializer src(bytes);
+                auto json = zerialize::translate<zerialize::JSON>(src);
+                return json.to_string(false);
             }
             case binary_format::cbor: {
-                auto doc = zerialize::from_cbor(data);
-                return zerialize::to_json_string(doc);
+                zerialize::CBOR::Deserializer src(bytes);
+                auto json = zerialize::translate<zerialize::JSON>(src);
+                return json.to_string(false);
             }
             case binary_format::flexbuffers: {
-                auto doc = zerialize::from_flexbuffers(data);
-                return zerialize::to_json_string(doc);
+                zerialize::Flex::Deserializer src(bytes);
+                auto json = zerialize::translate<zerialize::JSON>(src);
+                return json.to_string(false);
             }
             case binary_format::zera: {
-                auto doc = zerialize::from_zera(data);
-                return zerialize::to_json_string(doc);
+                zerialize::Zera::Deserializer src(bytes);
+                auto json = zerialize::translate<zerialize::JSON>(src);
+                return json.to_string(false);
             }
         }
     } catch (const std::exception& e) {
@@ -98,19 +105,31 @@ inline std::optional<std::vector<std::byte>> serialize_from_json(
     std::shared_ptr<spdlog::logger> log = nullptr) {
 
     try {
-        // Parse JSON string
-        auto doc = zerialize::from_json_string(json_str);
+        zerialize::json::JsonDeserializer json_doc{std::string_view{json_str}};
 
-        // Serialize to binary format
+        auto to_bytes = [](zerialize::ZBuffer&& buf) -> std::vector<std::byte> {
+            auto vec = buf.to_vector_copy();
+            std::vector<std::byte> result(vec.size());
+            std::memcpy(result.data(), vec.data(), vec.size());
+            return result;
+        };
+
+        auto serialize_as = [&]<class DstP>() -> zerialize::ZBuffer {
+            typename DstP::RootSerializer rs{};
+            typename DstP::Serializer w{rs};
+            zerialize::write_value(json_doc, w);
+            return rs.finish();
+        };
+
         switch (format) {
             case binary_format::msgpack:
-                return zerialize::to_msgpack(doc);
+                return to_bytes(serialize_as.template operator()<zerialize::MsgPack>());
             case binary_format::cbor:
-                return zerialize::to_cbor(doc);
+                return to_bytes(serialize_as.template operator()<zerialize::CBOR>());
             case binary_format::flexbuffers:
-                return zerialize::to_flexbuffers(doc);
+                return to_bytes(serialize_as.template operator()<zerialize::Flex>());
             case binary_format::zera:
-                return zerialize::to_zera(doc);
+                return to_bytes(serialize_as.template operator()<zerialize::Zera>());
         }
     } catch (const std::exception& e) {
         if (log) {
