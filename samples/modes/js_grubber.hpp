@@ -27,6 +27,7 @@ SOFTWARE.
 
 #include "../include/worker.hpp"
 #include "../include/string_utils.hpp"
+#include "../include/zerialize_json.hpp"
 #include "common.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <asio/awaitable.hpp>
@@ -44,9 +45,12 @@ class js_grubber : public worker {
 public:
     js_grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
                output_mode mode, bool auto_ack, const std::string& dump_file = {},
-               const std::string& translate_cmd = {})
+               const std::string& translate_cmd = {},
+               std::optional<binary_format> format = std::nullopt,
+               std::size_t max_bad_messages = 0, double max_bad_percentage = 0.0)
         : worker(ioc, console, stats_interval), m_output_mode(mode), m_auto_ack(auto_ack),
-          m_translate_cmd(translate_cmd) {
+          m_translate_cmd(translate_cmd), m_format(format),
+          m_deserializer_stats(max_bad_messages, max_bad_percentage) {
         if (!dump_file.empty()) {
             m_dump_file = std::make_unique<std::ofstream>(dump_file, std::ios::binary);
             if (!m_dump_file->is_open()) {
@@ -84,6 +88,31 @@ public:
                 *out << '\n';
                 break;
             case output_mode::json: {
+                // If binary format specified, deserialize to JSON
+                if (m_format) {
+                    auto json_result = deserialize_to_json(output_payload, *m_format, m_log);
+                    if (json_result) {
+                        m_deserializer_stats.record_success();
+                        *out << "{\"subject\":\"" << subject << "\""
+                             << ",\"stream\":\"" << msg.stream << "\""
+                             << ",\"seq\":" << msg.stream_sequence
+                             << ",\"payload\":" << *json_result << "}\n";
+                    } else {
+                        bool should_exit = m_deserializer_stats.record_failure();
+                        m_log->warn("Failed to deserialize message on subject '{}' (bad: {}/{}, {:.2f}%)",
+                                   std::string(subject),
+                                   m_deserializer_stats.bad_messages(),
+                                   m_deserializer_stats.total_messages(),
+                                   m_deserializer_stats.bad_percentage());
+                        if (should_exit) {
+                            m_log->error("Error threshold exceeded - exiting");
+                            m_ioc.stop();
+                        }
+                    }
+                    break;
+                }
+
+                // No binary format - escape payload as string (original behavior)
                 std::string escaped;
                 escaped.reserve(output_payload.size());
                 for (char c : output_payload) {
@@ -138,6 +167,8 @@ private:
     output_mode m_output_mode;
     bool m_auto_ack;
     std::string m_translate_cmd;
+    std::optional<binary_format> m_format;
+    deserializer_stats m_deserializer_stats;
     std::unique_ptr<std::ofstream> m_dump_file;
 };
 

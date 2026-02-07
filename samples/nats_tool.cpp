@@ -185,7 +185,7 @@ int main(int argc, char* argv[]) {
         ("raw", "Output raw payload only (grub/js_grub mode)")
         ("dump", "Dump messages to file (grub/js_grub mode)", cxxopts::value<std::string>())
         ("json", "Output messages as JSON (grub/js_grub mode)")
-        ("format", "Binary format for deserialization: msgpack, cbor, flexbuffers, zera (grub/js_grub mode)", cxxopts::value<std::string>())
+        ("format", "Binary format: msgpack, cbor, flexbuffers, zera (grub/js_grub/js_fetch/pub mode)", cxxopts::value<std::string>())
         ("max_bad_messages", "Exit after N failed deserializations (default: 0 = disabled)", cxxopts::value<std::size_t>())
         ("max_bad_percentage", "Exit if bad message percentage exceeds threshold (default: 0 = disabled)", cxxopts::value<double>())
         ("translate", "Transform payload through external command (supports {{Subject}})", cxxopts::value<std::string>())
@@ -610,7 +610,7 @@ int main(int argc, char* argv[]) {
         if (m == mode::grubber) {
             grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file, translate_cmd, show_timestamp, binary_fmt, max_bad_messages, max_bad_percentage);
         } else if (m == mode::js_grubber) {
-            js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, out_mode, auto_ack, dump_file, translate_cmd);
+            js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, out_mode, auto_ack, dump_file, translate_cmd, binary_fmt, max_bad_messages, max_bad_percentage);
         } else if (m == mode::kv_watcher) {
             kv_watch_ptr = std::make_shared<kv_watcher_handler>(ioc, console, stats_interval, print_to_stdout);
         }
@@ -839,8 +839,8 @@ int main(int argc, char* argv[]) {
                 pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
                                                        max_in_flight, use_jetstream, js_timeout_ms, wait_for_ack,
                                                        headers, custom_reply_to, pub_count, pub_sleep_ms, pub_data,
-                                                       in_cfg, src_cfg, js_window_size, js_stream, js_create_stream,
-                                                       js_max_retries);
+                                                       in_cfg, src_cfg, binary_fmt, js_window_size, js_stream,
+                                                       js_create_stream, js_max_retries);
             }
         } else if (m == mode::benchmarker) {
             int bench_count = result.count("count") ? result["count"].as<int>() : 100000;
@@ -872,7 +872,9 @@ int main(int argc, char* argv[]) {
             } else if (m == mode::js_fetcher) {
                 js_fetch_ptr = std::make_shared<js_fetcher>(ioc, console, conn, js_stream,
                                                             js_consumer, stats_interval, print_to_stdout,
-                                                            batch_size, fetch_interval_ms);
+                                                            batch_size, fetch_interval_ms,
+                                                            out_mode, binary_fmt, max_bad_messages,
+                                                            max_bad_percentage, dump_file, translate_cmd);
             } else if (m == mode::kv_publisher) {
                 kv_pub_ptr = std::make_shared<kv_publisher>(ioc, console, conn, kv_bucket,
                                                             stats_interval, max_in_flight,

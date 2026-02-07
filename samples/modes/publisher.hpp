@@ -64,6 +64,7 @@ public:
               int count = 0, int sleep_ms = 0, const std::string& data = {},
               const input_config& in_cfg = {},
               const input_source_config& src_cfg = {},
+              std::optional<binary_format> format = std::nullopt,
               std::size_t js_window_size = 1000,
               const std::string& js_stream = "",
               bool js_create_stream = false,
@@ -73,7 +74,7 @@ public:
           m_jetstream(jetstream), m_js_timeout(std::chrono::milliseconds(js_timeout_ms)),
           m_wait_for_ack(wait_for_ack), m_headers(headers), m_reply_to(reply_to),
           m_count(count), m_sleep_ms(sleep_ms), m_data(data), m_input_cfg(in_cfg),
-          m_src_cfg(src_cfg), m_input_reader(ioc, src_cfg, console),
+          m_src_cfg(src_cfg), m_format(format), m_input_reader(ioc, src_cfg, console),
           m_js_window_size(js_window_size), m_js_stream(js_stream),
           m_js_create_stream(js_create_stream), m_js_max_retries(js_max_retries),
           m_strand(asio::make_strand(ioc)) {
@@ -324,6 +325,19 @@ private:
         // Apply {{Count}} placeholder to subject
         subject = apply_count_template(subject, ++m_msg_number);
 
+        // Serialize to binary format if configured
+        if (m_format) {
+            auto binary_result = serialize_from_json(payload, *m_format, m_log);
+            if (binary_result) {
+                std::string binary_payload(reinterpret_cast<const char*>(binary_result->data()),
+                                          binary_result->size());
+                co_await publish_message(subject, binary_payload);
+                co_return;
+            } else {
+                m_log->warn("Failed to serialize payload to binary format, publishing as-is");
+            }
+        }
+
         co_await publish_message(subject, payload);
     }
 
@@ -485,6 +499,7 @@ private:
     std::string m_data;
     input_config m_input_cfg;
     input_source_config m_src_cfg;
+    std::optional<binary_format> m_format;
     std::size_t m_msg_number = 0;
     async_input_reader m_input_reader;
     std::unique_ptr<async_http_reader> m_http_reader;
