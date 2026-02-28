@@ -116,7 +116,7 @@ TEST(payload_messages, info_with_overflow) {
     EXPECT_CALL(m, on_info(info_msg)).WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
 
     async_process([&]() -> asio::awaitable<void> {
-        std::stringstream ss(payload);
+        std::stringstream ss(payload_over);
         auto s = co_await protocol_parser::parse_header(header, ss, m);
         EXPECT_EQ(false, s.failed());
         co_return;
@@ -181,7 +181,8 @@ TEST(payload_messages, on_message_binary) {
         .WillOnce(testing::InvokeWithoutArgs(make_ready_awaitable));
 
     async_process([&]() -> asio::awaitable<void> {
-        std::stringstream ss2(payload_header);
+        std::string payload_data(buffer.begin(), buffer.end());
+        std::stringstream ss2(payload_data);
         auto s1 = co_await protocol_parser::parse_header(header, ss2, m);
         EXPECT_EQ(false, s1.failed());
     });

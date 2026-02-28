@@ -49,6 +49,8 @@ find_package(libzip CONFIG REQUIRED)
 
 # Fetch zerialize for binary format deserialization
 include(FetchContent)
+# zerialize vendors jsoncons; disable jsoncons tests to avoid third-party -Werror breakages.
+set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
 FetchContent_Declare(
     zerialize
     GIT_REPOSITORY https://github.com/colinator/zerialize.git
@@ -64,8 +66,11 @@ set(NATS_ASIO_HEADERS
     include/nats_asio/interface.hpp
     include/nats_asio/nats_asio.hpp
     include/nats_asio/compression.hpp
+    include/nats_asio/decompression_reader.hpp
     include/nats_asio/http_reader.hpp
     include/nats_asio/input_reader.hpp
+    include/nats_asio/multi_file_reader.hpp
+    include/nats_asio/zip_extractor.hpp
 )
 
 target_sources(nats_asio INTERFACE
@@ -123,7 +128,10 @@ if(NATS_ASIO_BUILD_TESTS)
     enable_testing()
     find_package(GTest CONFIG REQUIRED)
     
-    add_executable(parser_test tests/check1.cpp)
+    add_executable(parser_test
+        tests/check1.cpp
+        tests/check2.cpp
+    )
     target_link_libraries(parser_test 
         PRIVATE 
             nats_asio::nats_asio
