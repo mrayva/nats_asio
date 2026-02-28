@@ -3246,6 +3246,19 @@ private:
         string_view subject, std::span<const char> payload,
         const headers_t& headers, std::chrono::milliseconds timeout, bool wait_for_ack) {
 
+        // Fire-and-forget mode: queue writes for coalesced flushing to maximize throughput.
+        // Headers are not supported by publish_queued(), so keep HPUB on the regular async path.
+        if (!wait_for_ack && headers.empty()) {
+            auto queued = publish_queued(subject, payload, optional<string_view>{});
+            if (queued.ok()) {
+                co_return std::pair<js_pub_ack, status>{{}, queued};
+            }
+
+            // Fallback to direct publish when queue is full or unavailable.
+            auto direct = co_await publish(subject, payload, optional<string_view>{});
+            co_return std::pair<js_pub_ack, status>{{}, direct};
+        }
+
         if (!m_strand.running_in_this_thread()) {
             auto subject_copy = std::string(subject);
             auto payload_copy =
