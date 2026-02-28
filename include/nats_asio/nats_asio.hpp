@@ -3052,11 +3052,119 @@ public:
     }
 
 private:
+    struct js_ack_wait_state {
+        bool ready = false;
+        js_pub_ack ack;
+        status ack_status;
+        std::shared_ptr<asio::steady_timer> wake_timer;
+    };
+
     // Shared state for request-reply pattern
     struct request_state {
         std::atomic<bool> received{false};
         message response;
     };
+
+    status parse_js_pub_ack_payload(string_view payload_sv, js_pub_ack& ack) {
+        fast_json parser;
+        if (!parser.parse(payload_sv)) {
+            return status(fmt::format("failed to parse pub ack: {}", parser.error()));
+        }
+
+        if (parser.contains("error")) {
+            auto err_desc = parser.get_error_description();
+            return status(err_desc.empty() ? "unknown JetStream error"
+                                           : std::string(err_desc));
+        }
+
+        if (parser.contains("stream")) {
+            ack.stream = std::string(parser.get_string("stream"));
+        } else {
+            ack.stream.clear();
+        }
+        ack.sequence = parser.get_uint("seq", 0);
+        if (parser.contains("domain")) {
+            ack.domain = std::string(parser.get_string("domain"));
+        } else {
+            ack.domain = std::nullopt;
+        }
+        ack.duplicate = parser.get_bool("duplicate", false);
+        return status();
+    }
+
+    void fail_pending_js_ack_waiters(const status& s) {
+        for (auto& [token, wait_state] : m_js_ack_waiters) {
+            wait_state->ack_status = s;
+            wait_state->ready = true;
+            if (wait_state->wake_timer) {
+                wait_state->wake_timer->cancel();
+            }
+        }
+        m_js_ack_waiters.clear();
+    }
+
+    asio::awaitable<status> ensure_js_ack_router() {
+        if (!m_js_ack_subscription && !m_js_ack_inbox_base.empty()) {
+            m_js_ack_inbox_base.clear();
+        }
+
+        if (m_js_ack_subscription && !m_js_ack_inbox_base.empty()) {
+            co_return status();
+        }
+
+        m_js_ack_inbox_base = generate_inbox();
+        std::string subject_filter = m_js_ack_inbox_base;
+        subject_filter += ".*";
+
+        auto [sub, sub_status] = co_await subscribe(
+            subject_filter,
+            [this](string_view subj, optional<string_view> /*reply*/,
+                   std::span<const char> data) -> asio::awaitable<void> {
+                if (m_js_ack_inbox_base.empty()) {
+                    co_return;
+                }
+
+                const std::string_view prefix(m_js_ack_inbox_base);
+                if (subj.size() <= prefix.size() + 1 || subj.substr(0, prefix.size()) != prefix ||
+                    subj[prefix.size()] != '.') {
+                    co_return;
+                }
+
+                uint64_t token = 0;
+                auto token_sv = subj.substr(prefix.size() + 1);
+                if (!parse_int(token_sv, token)) {
+                    co_return;
+                }
+
+                auto it = m_js_ack_waiters.find(token);
+                if (it == m_js_ack_waiters.end()) {
+                    co_return;
+                }
+
+                auto wait_state = it->second;
+                m_js_ack_waiters.erase(it);
+
+                js_pub_ack ack;
+                wait_state->ack_status = parse_js_pub_ack_payload(
+                    string_view(data.data(), data.size()), ack);
+                if (wait_state->ack_status.ok()) {
+                    wait_state->ack = std::move(ack);
+                }
+                wait_state->ready = true;
+                if (wait_state->wake_timer) {
+                    wait_state->wake_timer->cancel();
+                }
+                co_return;
+            });
+
+        if (sub_status.failed()) {
+            m_js_ack_inbox_base.clear();
+            co_return sub_status;
+        }
+
+        m_js_ack_subscription = sub;
+        co_return status();
+    }
 
     // Request implementation
     asio::awaitable<std::pair<message, status>> request_impl(
@@ -3138,6 +3246,24 @@ private:
         string_view subject, std::span<const char> payload,
         const headers_t& headers, std::chrono::milliseconds timeout, bool wait_for_ack) {
 
+        if (!m_strand.running_in_this_thread()) {
+            auto subject_copy = std::string(subject);
+            auto payload_copy =
+                std::make_shared<std::vector<char>>(payload.begin(), payload.end());
+            auto headers_copy = headers;
+
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, subject_copy = std::move(subject_copy), payload_copy,
+                 headers_copy = std::move(headers_copy), timeout,
+                 wait_for_ack]() -> asio::awaitable<std::pair<js_pub_ack, status>> {
+                    std::span<const char> payload_span(payload_copy->data(), payload_copy->size());
+                    co_return co_await js_publish_impl(
+                        subject_copy, payload_span, headers_copy, timeout, wait_for_ack);
+                },
+                asio::use_awaitable);
+        }
+
         // Fire-and-forget mode: just publish without waiting for reply
         if (!wait_for_ack) {
             status pub_status;
@@ -3149,37 +3275,51 @@ private:
             co_return std::pair<js_pub_ack, status>{{}, pub_status};
         }
 
-        // Use request-reply pattern for acknowledged publish
-        auto [response, req_status] = co_await request_impl(subject, payload, headers, timeout);
-
-        if (req_status.failed()) {
-            co_return std::pair<js_pub_ack, status>{{}, req_status};
+        auto router_status = co_await ensure_js_ack_router();
+        if (router_status.failed()) {
+            co_return std::pair<js_pub_ack, status>{{}, router_status};
         }
 
-        // Parse JetStream pub ack from response using simdjson
-        js_pub_ack ack;
-        fast_json parser;
-        string_view payload_sv(response.payload.data(), response.payload.size());
+        uint64_t token = ++m_js_ack_next_token;
+        std::string reply_subject = m_js_ack_inbox_base;
+        reply_subject.push_back('.');
+        reply_subject += std::to_string(token);
 
-        if (!parser.parse(payload_sv)) {
-            co_return std::pair<js_pub_ack, status>{{}, status(fmt::format("failed to parse pub ack: {}", parser.error()))};
+        auto wait_state = std::make_shared<js_ack_wait_state>();
+        m_js_ack_waiters.emplace(token, wait_state);
+
+        status pub_status;
+        if (headers.empty()) {
+            pub_status = co_await publish(subject, payload, optional<string_view>{reply_subject});
+        } else {
+            pub_status = co_await publish(subject, payload, headers, optional<string_view>{reply_subject});
         }
 
-        if (parser.contains("error")) {
-            auto err_desc = parser.get_error_description();
-            co_return std::pair<js_pub_ack, status>{{}, status(err_desc.empty() ? "unknown JetStream error" : std::string(err_desc))};
+        if (pub_status.failed()) {
+            m_js_ack_waiters.erase(token);
+            co_return std::pair<js_pub_ack, status>{{}, pub_status};
         }
 
-        if (parser.contains("stream")) {
-            ack.stream = std::string(parser.get_string("stream"));
-        }
-        ack.sequence = parser.get_uint("seq", 0);
-        if (parser.contains("domain")) {
-            ack.domain = std::string(parser.get_string("domain"));
-        }
-        ack.duplicate = parser.get_bool("duplicate", false);
+        wait_state->wake_timer =
+            std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+        wait_state->wake_timer->expires_after(timeout);
+        auto [ec] = co_await wait_state->wake_timer->async_wait(
+            asio::as_tuple(asio::use_awaitable));
 
-        co_return std::pair<js_pub_ack, status>{std::move(ack), status()};
+        if (!wait_state->ready) {
+            auto it = m_js_ack_waiters.find(token);
+            if (it != m_js_ack_waiters.end()) {
+                m_js_ack_waiters.erase(token);
+            }
+            if (ec && ec != asio::error::operation_aborted) {
+                co_return std::pair<js_pub_ack, status>{{}, status(ec.message())};
+            }
+            co_return std::pair<js_pub_ack, status>{
+                {}, status(error_code::ack_timeout, "JetStream publish ack timeout")};
+        }
+
+        co_return std::pair<js_pub_ack, status>{std::move(wait_state->ack),
+                                                std::move(wait_state->ack_status)};
     }
 
     // Create consumer via JetStream API
@@ -4445,6 +4585,11 @@ private:
             }
 
             if (should_disconnect) {
+                fail_pending_js_ack_waiters(
+                    status(error_code::connection_closed, "connection disconnected"));
+                m_js_ack_subscription.reset();
+                m_js_ack_inbox_base.clear();
+
                 m_is_connected = false;
                 asio::error_code ec;
                 m_socket.close(ec);
@@ -4666,6 +4811,13 @@ private:
 
     mutable std::mutex m_subs_mutex;
     std::unordered_map<uint64_t, subscription_sptr> m_subs;
+
+    // Persistent JetStream publish ACK router (reply subject wildcard + token correlation)
+    isubscription_sptr m_js_ack_subscription;
+    std::string m_js_ack_inbox_base;
+    uint64_t m_js_ack_next_token{0};
+    std::unordered_map<uint64_t, std::shared_ptr<js_ack_wait_state>> m_js_ack_waiters;
+
     on_connected_cb m_connected_cb;
     on_disconnected_cb m_disconnected_cb;
     on_error_cb m_error_cb;
