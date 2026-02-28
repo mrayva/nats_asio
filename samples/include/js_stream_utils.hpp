@@ -50,9 +50,9 @@ inline asio::awaitable<bool> ensure_stream_for_subject(
     // First, try to get stream info
     std::string info_subject = "$JS.API.STREAM.INFO." + stream_name;
 
-    nlohmann::json info_request = {{"name", stream_name}};
-    std::string info_payload = info_request.dump();
-    std::span<const char> info_span(info_payload.data(), info_payload.size());
+    // STREAM.INFO.<name> does not require a "name" request body on recent servers.
+    // Sending {"name": ...} triggers: json: unknown field "name".
+    constexpr std::span<const char> info_span{};
 
     auto [info_reply, info_status] = co_await conn->request(
         info_subject, info_span, timeout);

@@ -30,12 +30,14 @@ SOFTWARE.
 #include <asio/use_awaitable.hpp>
 #include <atomic>
 #include <chrono>
-#include <concurrentqueue/moodycamel/blockingconcurrentqueue.h>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <errno.h>
 #include <fcntl.h>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <nats_asio/nats_asio.hpp>
 #include <optional>
 #include <poll.h>
@@ -45,6 +47,7 @@ SOFTWARE.
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <charconv>
 
 namespace nats_tool {
 
@@ -57,63 +60,73 @@ struct batch_item {
 // High-performance lock-free batch queue using moodycamel::BlockingConcurrentQueue
 class batch_queue {
 public:
-    batch_queue() : m_queue(1024) {}  // Pre-allocate for 1024 items
-
     void set_max_size(std::size_t max_size) {
+        std::lock_guard<std::mutex> lock(m_mutex);
         m_max_size = max_size;
     }
 
     // Returns true if pushed, false if queue is full (when max_size set)
     bool push(batch_item item, std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
-        // Check size limit (approximate, lock-free check)
-        if (m_max_size > 0 && m_size.load(std::memory_order_relaxed) >= m_max_size) {
-            // Wait for space with timeout
-            auto deadline = std::chrono::steady_clock::now() + timeout;
-            while (m_size.load(std::memory_order_relaxed) >= m_max_size) {
-                if (std::chrono::steady_clock::now() >= deadline || m_done.load(std::memory_order_relaxed)) {
-                    return false;
-                }
-                std::this_thread::yield();
+        std::unique_lock<std::mutex> lock(m_mutex);
+        if (m_done) {
+            return false;
+        }
+
+        if (m_max_size > 0) {
+            auto ok = m_can_push.wait_for(lock, timeout, [this] {
+                return m_done || m_queue.size() < m_max_size;
+            });
+            if (!ok || m_done) {
+                return false;
             }
         }
 
-        if (m_queue.enqueue(std::move(item))) {
-            m_size.fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
-        return false;
+        m_queue.emplace_back(std::move(item));
+        lock.unlock();
+        m_can_pop.notify_one();
+        return true;
     }
 
     bool pop(batch_item& item, std::chrono::milliseconds timeout) {
-        if (m_queue.wait_dequeue_timed(item, timeout)) {
-            // Only decrement size for non-sentinel items
-            if (item.msg_count > 0) {
-                m_size.fetch_sub(1, std::memory_order_relaxed);
-            }
-            return true;
+        std::unique_lock<std::mutex> lock(m_mutex);
+        auto ok = m_can_pop.wait_for(lock, timeout, [this] {
+            return m_done || !m_queue.empty();
+        });
+
+        if (!ok || m_queue.empty()) {
+            return false;
         }
-        return false;
+
+        item = std::move(m_queue.front());
+        m_queue.pop_front();
+        lock.unlock();
+        m_can_push.notify_one();
+        return true;
     }
 
     void set_done() {
-        m_done.store(true, std::memory_order_release);
-        // Enqueue a sentinel to wake up waiting consumers (msg_count=0 identifies it)
-        m_queue.enqueue(batch_item{"", 0});
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_done = true;
+        m_can_pop.notify_all();
+        m_can_push.notify_all();
     }
 
     bool is_done() const {
-        return m_done.load(std::memory_order_acquire) &&
-               m_size.load(std::memory_order_acquire) == 0;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_done && m_queue.empty();
     }
 
     std::size_t size() const {
-        return m_size.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.size();
     }
 
 private:
-    moodycamel::BlockingConcurrentQueue<batch_item> m_queue;
-    std::atomic<std::size_t> m_size{0};
-    std::atomic<bool> m_done{false};
+    mutable std::mutex m_mutex;
+    std::condition_variable m_can_push;
+    std::condition_variable m_can_pop;
+    std::deque<batch_item> m_queue;
+    bool m_done{false};
     std::size_t m_max_size = 0;  // 0 = unlimited
 };
 
@@ -221,6 +234,52 @@ public:
     }
 
 private:
+    // Validate that a buffer is a concatenation of well-formed
+    // "PUB <subject> <size>\\r\\n<payload>\\r\\n" frames.
+    static bool validate_pub_batch(const std::string& data) {
+        std::size_t off = 0;
+        while (off < data.size()) {
+            if (data.size() - off < 8) {  // minimum: "PUB a 1\r\nx\r\n"
+                return false;
+            }
+            if (data.compare(off, 4, "PUB ") != 0) {
+                return false;
+            }
+
+            auto header_end = data.find("\r\n", off);
+            if (header_end == std::string::npos || header_end <= off + 5) {
+                return false;
+            }
+
+            auto last_space = data.rfind(' ', header_end);
+            if (last_space == std::string::npos || last_space <= off + 4) {
+                return false;
+            }
+
+            std::size_t payload_size = 0;
+            auto size_begin = data.data() + last_space + 1;
+            auto size_end = data.data() + header_end;
+            auto [ptr, ec] = std::from_chars(size_begin, size_end, payload_size);
+            if (ec != std::errc{} || ptr != size_end) {
+                return false;
+            }
+
+            std::size_t payload_begin = header_end + 2;
+            if (payload_begin + payload_size + 2 > data.size()) {
+                return false;
+            }
+
+            std::size_t payload_end = payload_begin + payload_size;
+            if (data[payload_end] != '\r' || data[payload_end + 1] != '\n') {
+                return false;
+            }
+
+            off = payload_end + 2;
+        }
+
+        return off == data.size();
+    }
+
     void reader_thread() {
         // Open file or use stdin
         int input_fd = STDIN_FILENO;
@@ -427,6 +486,12 @@ private:
             asio::co_spawn(ioc,
                 [this, &conn, data = std::move(item.data), count = item.msg_count,
                  &write_done]() mutable -> asio::awaitable<void> {
+                    if (!validate_pub_batch(data)) {
+                        m_console->error("Skipping malformed batch payload ({} bytes)", data.size());
+                        write_done.set_value(true);
+                        co_return;
+                    }
+
                     std::span<const char> batch_span(data.data(), data.size());
                     auto s = co_await conn->write_raw(batch_span);
                     if (s.failed()) {
