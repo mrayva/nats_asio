@@ -2143,6 +2143,27 @@ public:
 
     virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                             optional<string_view> reply_to) override {
+        if (!m_strand.running_in_this_thread()) {
+            auto subject_copy = std::string(subject);
+            auto payload_copy =
+                std::make_shared<std::vector<char>>(payload.begin(), payload.end());
+            auto reply_to_copy = reply_to ? std::optional<std::string>(std::string(*reply_to))
+                                          : std::nullopt;
+
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, subject_copy = std::move(subject_copy), payload_copy,
+                 reply_to_copy = std::move(reply_to_copy)]() -> asio::awaitable<status> {
+                    std::span<const char> payload_span(payload_copy->data(), payload_copy->size());
+                    optional<string_view> reply_to_view = std::nullopt;
+                    if (reply_to_copy.has_value()) {
+                        reply_to_view = string_view(*reply_to_copy);
+                    }
+                    co_return co_await publish(subject_copy, payload_span, reply_to_view);
+                },
+                asio::use_awaitable);
+        }
+
         // Record start time for latency tracking
         auto start_time = std::chrono::steady_clock::now();
 
@@ -2275,6 +2296,17 @@ public:
 
     // Write pre-formatted NATS protocol data directly
     virtual asio::awaitable<status> write_raw(std::span<const char> data) override {
+        if (!m_strand.running_in_this_thread()) {
+            auto data_copy = std::make_shared<std::vector<char>>(data.begin(), data.end());
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, data_copy]() -> asio::awaitable<status> {
+                    std::span<const char> data_span(data_copy->data(), data_copy->size());
+                    co_return co_await write_raw(data_span);
+                },
+                asio::use_awaitable);
+        }
+
         if (!m_is_connected) {
             co_return status(error_code::not_connected);
         }
@@ -2291,6 +2323,26 @@ public:
     // Write multiple buffers using scatter-gather I/O (writev)
     virtual asio::awaitable<status> write_raw_iov(
         std::span<const std::span<const char>> buffers) override {
+        if (!m_strand.running_in_this_thread()) {
+            auto copied_buffers = std::make_shared<std::vector<std::string>>();
+            copied_buffers->reserve(buffers.size());
+            for (const auto& buf : buffers) {
+                copied_buffers->emplace_back(buf.data(), buf.size());
+            }
+
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, copied_buffers]() -> asio::awaitable<status> {
+                    std::vector<std::span<const char>> spans;
+                    spans.reserve(copied_buffers->size());
+                    for (const auto& b : *copied_buffers) {
+                        spans.emplace_back(b.data(), b.size());
+                    }
+                    co_return co_await write_raw_iov(spans);
+                },
+                asio::use_awaitable);
+        }
+
         if (!m_is_connected) {
             co_return status(error_code::not_connected);
         }
@@ -2352,7 +2404,7 @@ public:
         // Start auto-flush coroutine if not running and interval > 0
         if (m_write_queue.flush_interval().count() > 0 &&
             !m_flush_running.exchange(true, std::memory_order_acq_rel)) {
-            asio::co_spawn(m_io, auto_flush_loop(), asio::detached);
+            asio::co_spawn(m_strand, auto_flush_loop(), asio::detached);
         }
 
         return status();
@@ -2360,6 +2412,12 @@ public:
 
     // Flush the write queue - sends all queued messages in a single write
     virtual asio::awaitable<status> flush() override {
+        if (!m_strand.running_in_this_thread()) {
+            co_return co_await asio::co_spawn(
+                m_strand, [this]() -> asio::awaitable<status> { co_return co_await flush(); },
+                asio::use_awaitable);
+        }
+
         if (!m_is_connected) {
             co_return status(error_code::not_connected);
         }
@@ -2460,11 +2518,31 @@ public:
     }
 
     virtual asio::awaitable<status> unsubscribe(const isubscription_sptr& p) override {
+        if (!m_strand.running_in_this_thread()) {
+            auto sub = p;
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, sub]() -> asio::awaitable<status> { co_return co_await unsubscribe(sub); },
+                asio::use_awaitable);
+        }
+
         co_return co_await unsubscribe_impl(p);
     }
 
     virtual asio::awaitable<std::pair<isubscription_sptr, status>>
     subscribe(string_view subject, on_message_cb cb, subscribe_options opts = {}) override {
+        if (!m_strand.running_in_this_thread()) {
+            auto subject_copy = std::string(subject);
+            auto cb_copy = std::move(cb);
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, subject_copy = std::move(subject_copy), cb = std::move(cb_copy),
+                 opts]() mutable -> asio::awaitable<std::pair<isubscription_sptr, status>> {
+                    co_return co_await subscribe(subject_copy, std::move(cb), opts);
+                },
+                asio::use_awaitable);
+        }
+
         if (!m_is_connected) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
                                                             status(error_code::not_connected)};
@@ -2494,6 +2572,18 @@ public:
     // Subscribe with headers callback (for JetStream HMSG messages)
     virtual asio::awaitable<std::pair<isubscription_sptr, status>>
     subscribe(string_view subject, on_message_with_headers_cb cb, subscribe_options opts = {}) override {
+        if (!m_strand.running_in_this_thread()) {
+            auto subject_copy = std::string(subject);
+            auto cb_copy = std::move(cb);
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, subject_copy = std::move(subject_copy), cb = std::move(cb_copy),
+                 opts]() mutable -> asio::awaitable<std::pair<isubscription_sptr, status>> {
+                    co_return co_await subscribe(subject_copy, std::move(cb), opts);
+                },
+                asio::use_awaitable);
+        }
+
         if (!m_is_connected) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
                                                             status(error_code::not_connected)};
@@ -2523,6 +2613,18 @@ public:
     // Zero-copy subscribe - callback receives references to internal buffers
     virtual asio::awaitable<std::pair<isubscription_sptr, status>>
     subscribe(string_view subject, on_message_zero_copy_cb cb, subscribe_options opts = {}) override {
+        if (!m_strand.running_in_this_thread()) {
+            auto subject_copy = std::string(subject);
+            auto cb_copy = std::move(cb);
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, subject_copy = std::move(subject_copy), cb = std::move(cb_copy),
+                 opts]() mutable -> asio::awaitable<std::pair<isubscription_sptr, status>> {
+                    co_return co_await subscribe(subject_copy, std::move(cb), opts);
+                },
+                asio::use_awaitable);
+        }
+
         if (!m_is_connected) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
                                                             status(error_code::not_connected)};
@@ -2553,6 +2655,29 @@ public:
     virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                             const headers_t& headers,
                                             optional<string_view> reply_to = {}) override {
+        if (!m_strand.running_in_this_thread()) {
+            auto subject_copy = std::string(subject);
+            auto payload_copy =
+                std::make_shared<std::vector<char>>(payload.begin(), payload.end());
+            auto headers_copy = headers;
+            auto reply_to_copy = reply_to ? std::optional<std::string>(std::string(*reply_to))
+                                          : std::nullopt;
+
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, subject_copy = std::move(subject_copy), payload_copy,
+                 headers_copy = std::move(headers_copy),
+                 reply_to_copy = std::move(reply_to_copy)]() -> asio::awaitable<status> {
+                    std::span<const char> payload_span(payload_copy->data(), payload_copy->size());
+                    optional<string_view> reply_to_view = std::nullopt;
+                    if (reply_to_copy.has_value()) {
+                        reply_to_view = string_view(*reply_to_copy);
+                    }
+                    co_return co_await publish(subject_copy, payload_span, headers_copy, reply_to_view);
+                },
+                asio::use_awaitable);
+        }
+
         // Record start time for latency tracking
         auto start_time = std::chrono::steady_clock::now();
 
@@ -2789,7 +2914,7 @@ public:
                 co_return;
             };
 
-            asio::co_spawn(m_io, publish_task(), asio::detached);
+            asio::co_spawn(m_strand, publish_task(), asio::detached);
         }
 
         // Wait for all publishes to complete with timeout
@@ -4293,7 +4418,7 @@ private:
                 // Start ping loop if configured
                 if (m_ping_interval_ms > 0 &&
                     !m_ping_loop_running.exchange(true, std::memory_order_acq_rel)) {
-                    asio::co_spawn(m_io, ping_loop(), asio::detached);
+                    asio::co_spawn(m_strand, ping_loop(), asio::detached);
                 }
 
                 // Drain offline queue if we have queued messages
