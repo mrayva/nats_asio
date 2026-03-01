@@ -461,6 +461,18 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Precompute requested thread count (used for pub-mode shard auto-selection).
+        int requested_threads_hint = 1;
+        if (result.count("threads")) {
+            requested_threads_hint = result["threads"].as<int>();
+            if (requested_threads_hint == 0) {
+                requested_threads_hint = std::thread::hardware_concurrency();
+            }
+            if (requested_threads_hint < 1) {
+                requested_threads_hint = 1;
+            }
+        }
+
         asio::io_context ioc;
         auto strand = asio::make_strand(ioc);  // Serialize operations for thread safety
         std::shared_ptr<grubber> grub_ptr;
@@ -830,10 +842,20 @@ int main(int argc, char* argv[]) {
             } else {
                 // Standard publisher mode - multiple connections supported
                 console->info("Creating {} connections for pub mode", num_connections);
-                int io_shards = result.count("io_shards") ? result["io_shards"].as<int>() : 0;
-                if (io_shards < 0) {
+                int io_shards = result.count("io_shards") ? result["io_shards"].as<int>() : -1;
+                if (result.count("io_shards") && io_shards < 0) {
                     console->error("--io_shards must be >= 0");
                     return 1;
+                }
+                if (io_shards < 0) {
+                    // Auto mode: if user requested multiple threads/connections, shard by thread hint.
+                    if (requested_threads_hint > 1 && num_connections > 1) {
+                        io_shards = std::min(num_connections, requested_threads_hint);
+                        console->info("Auto-selected --io_shards={} from threads={} connections={}",
+                                      io_shards, requested_threads_hint, num_connections);
+                    } else {
+                        io_shards = 0;
+                    }
                 }
 
                 if (io_shards > 0) {
