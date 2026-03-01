@@ -46,7 +46,6 @@ SOFTWARE.
 #include <memory>
 #include <chrono>
 #include <mutex>
-#include <unordered_map>
 #include <random>
 
 namespace nats_tool {
@@ -371,8 +370,6 @@ private:
                 co_return;
             }
 
-            auto subj = std::make_shared<std::string>(subject);
-            auto msg = std::make_shared<std::string>(payload);
             auto token = m_ack_conns[conn_idx].next_token++;
             std::string reply = m_ack_conns[conn_idx].inbox_base;
             reply.push_back('.');
@@ -383,8 +380,8 @@ private:
             task.conn_idx = conn_idx;
             task.token = token;
             task.reply_subject = std::move(reply);
-            task.subject = std::move(subj);
-            task.payload = std::move(msg);
+            task.subject = subject;
+            task.payload = payload;
             task.retry_count = 0;
             schedule_ack_publish(std::move(task));
             co_return;
@@ -535,15 +532,22 @@ private:
         std::size_t conn_idx = 0;
         uint64_t token = 0;
         std::string reply_subject;
-        std::shared_ptr<std::string> subject;
-        std::shared_ptr<std::string> payload;
+        std::string subject;
+        std::string payload;
         int retry_count = 0;
     };
 
-    struct ack_pending_entry {
+    struct ack_pending_slot {
+        bool active = false;
+        uint64_t token = 0;
         ack_publish_task task;
         std::chrono::steady_clock::time_point sent_at;
     };
+
+    std::size_t ack_slot_index(std::size_t conn_idx, uint64_t token) const {
+        const auto& slots = m_ack_pending_slots[conn_idx];
+        return static_cast<std::size_t>(token % slots.size());
+    }
 
     std::string build_ack_inbox_base(std::size_t conn_idx) {
         std::uniform_int_distribution<uint64_t> dist;
@@ -581,12 +585,13 @@ private:
 
         {
             std::lock_guard<std::mutex> lock(m_ack_pending_mutexes[conn_idx]);
-            auto& pending = m_ack_pending_maps[conn_idx];
-            auto it = pending.find(token);
-            if (it == pending.end()) {
+            auto& slots = m_ack_pending_slots[conn_idx];
+            auto idx = ack_slot_index(conn_idx, token);
+            auto& slot = slots[idx];
+            if (!slot.active || slot.token != token) {
                 return;  // Timed out or already handled.
             }
-            pending.erase(it);
+            slot.active = false;
         }
         m_ack_pending.fetch_sub(1, std::memory_order_relaxed);
         if (success) {
@@ -603,16 +608,25 @@ private:
         }
         {
             std::lock_guard<std::mutex> lock(m_ack_pending_mutexes[task.conn_idx]);
-            m_ack_pending_maps[task.conn_idx][task.token] =
-                ack_pending_entry{task, std::chrono::steady_clock::now()};
+            auto& slots = m_ack_pending_slots[task.conn_idx];
+            auto idx = ack_slot_index(task.conn_idx, task.token);
+            auto& slot = slots[idx];
+            if (slot.active && slot.token != task.token) {
+                m_ack_failures.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            slot.active = true;
+            slot.token = task.token;
+            slot.task = task;
+            slot.sent_at = std::chrono::steady_clock::now();
         }
         m_ack_pending.fetch_add(1, std::memory_order_relaxed);
         m_in_flight.fetch_add(1, std::memory_order_relaxed);
 
         if (m_headers.empty()) {
-            std::span<const char> payload_span(task.payload->data(), task.payload->size());
+            std::span<const char> payload_span(task.payload.data(), task.payload.size());
             std::optional<nats_asio::string_view> reply_to(task.reply_subject);
-            auto s = task.conn->publish_queued(*task.subject, payload_span, reply_to);
+            auto s = task.conn->publish_queued(task.subject, payload_span, reply_to);
             if (s.failed()) {
                 handle_ack_publish_failure(std::move(task));
             }
@@ -631,10 +645,11 @@ private:
         bool removed = false;
         {
             std::lock_guard<std::mutex> lock(m_ack_pending_mutexes[task.conn_idx]);
-            auto& pending = m_ack_pending_maps[task.conn_idx];
-            auto it = pending.find(task.token);
-            if (it != pending.end()) {
-                pending.erase(it);
+            auto& slots = m_ack_pending_slots[task.conn_idx];
+            auto idx = ack_slot_index(task.conn_idx, task.token);
+            auto& slot = slots[idx];
+            if (slot.active && slot.token == task.token) {
+                slot.active = false;
                 removed = true;
             }
         }
@@ -663,14 +678,14 @@ private:
             auto task = std::move(queue.front());
             queue.pop_front();
 
-            std::span<const char> payload_span(task.payload->data(), task.payload->size());
+            std::span<const char> payload_span(task.payload.data(), task.payload.size());
             std::optional<nats_asio::string_view> reply_to(task.reply_subject);
 
             nats_asio::status s;
             if (m_headers.empty()) {
-                s = co_await task.conn->publish(*task.subject, payload_span, reply_to);
+                s = co_await task.conn->publish(task.subject, payload_span, reply_to);
             } else {
-                s = co_await task.conn->publish(*task.subject, payload_span, m_headers, reply_to);
+                s = co_await task.conn->publish(task.subject, payload_span, m_headers, reply_to);
             }
 
             if (s.failed()) {
@@ -687,14 +702,20 @@ private:
     asio::awaitable<nats_asio::status> init_js_ack_pipeline() {
         m_ack_conns.clear();
         m_ack_conns.resize(m_connections.size());
-        m_ack_pending_maps.clear();
-        m_ack_pending_maps.resize(m_connections.size());
+        m_ack_pending_slots.clear();
+        m_ack_pending_slots.resize(m_connections.size());
         m_ack_pending_mutexes.clear();
         m_ack_pending_mutexes.resize(m_connections.size());
         m_ack_send_queues.clear();
         m_ack_send_queues.resize(m_connections.size());
         m_ack_sender_running.clear();
         m_ack_sender_running.resize(m_connections.size(), false);
+
+        auto slot_count = std::max<std::size_t>(4096, m_js_window_size * 4);
+        for (auto& slots : m_ack_pending_slots) {
+            slots.clear();
+            slots.resize(slot_count);
+        }
 
         for (std::size_t i = 0; i < m_connections.size(); ++i) {
             auto& state = m_ack_conns[i];
@@ -727,13 +748,16 @@ private:
 
             auto now = std::chrono::steady_clock::now();
             std::vector<ack_publish_task> retry_tasks;
-            for (std::size_t i = 0; i < m_ack_pending_maps.size(); ++i) {
+            for (std::size_t i = 0; i < m_ack_pending_slots.size(); ++i) {
                 std::lock_guard<std::mutex> lock(m_ack_pending_mutexes[i]);
-                auto& pending = m_ack_pending_maps[i];
-                for (auto it = pending.begin(); it != pending.end();) {
-                    if (now - it->second.sent_at > m_js_timeout) {
-                        auto task = it->second.task;
-                        it = pending.erase(it);
+                auto& slots = m_ack_pending_slots[i];
+                for (auto& slot : slots) {
+                    if (!slot.active) {
+                        continue;
+                    }
+                    if (now - slot.sent_at > m_js_timeout) {
+                        auto task = slot.task;
+                        slot.active = false;
                         m_ack_pending.fetch_sub(1, std::memory_order_relaxed);
                         if (task.retry_count < m_js_max_retries) {
                             task.retry_count++;
@@ -742,8 +766,6 @@ private:
                         } else {
                             m_ack_failures.fetch_add(1, std::memory_order_relaxed);
                         }
-                    } else {
-                        ++it;
                     }
                 }
             }
@@ -786,7 +808,7 @@ private:
     std::atomic<int> m_ack_pending{0};
     std::atomic<bool> m_ack_pipeline_stop{false};
     std::vector<ack_conn_state> m_ack_conns;
-    std::vector<std::unordered_map<uint64_t, ack_pending_entry>> m_ack_pending_maps;
+    std::vector<std::vector<ack_pending_slot>> m_ack_pending_slots;
     std::deque<std::mutex> m_ack_pending_mutexes;
     std::vector<std::deque<ack_publish_task>> m_ack_send_queues;
     std::vector<bool> m_ack_sender_running;
