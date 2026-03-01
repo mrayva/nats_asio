@@ -1000,10 +1000,26 @@ int main(int argc, char* argv[]) {
             ioc.run();
         }
 
+        // Explicitly release mode handlers before tearing down publisher shard io_contexts.
+        // This guarantees connection/socket destruction happens while shard reactors are alive.
+        pub_ptr.reset();
+        batch_pub_ptr.reset();
+        bench_ptr.reset();
+        gen_ptr.reset();
+        grub_ptr.reset();
+        js_grub_ptr.reset();
+        js_fetch_ptr.reset();
+        kv_pub_ptr.reset();
+        kv_watch_ptr.reset();
+        req_ptr.reset();
+        reply_ptr.reset();
+
         // Stop and join dedicated publisher io_context shards (if enabled).
         for (const auto& c : pub_connections) {
             c->stop();
         }
+        pub_connections.clear();
+        conn.reset();
         for (auto& guard : pub_io_shard_guards) {
             guard.reset();
         }
