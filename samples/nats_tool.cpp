@@ -10,6 +10,7 @@
 #include <sstream>
 #include <asio/as_tuple.hpp>
 #include <asio/detached.hpp>
+#include <asio/executor_work_guard.hpp>
 #include <asio/posix/stream_descriptor.hpp>
 #include <asio/read_until.hpp>
 #include <asio/ssl.hpp>
@@ -156,6 +157,7 @@ int main(int argc, char* argv[]) {
         ("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
         ("n,connections", "Number of connections for pub mode (default: 1)", cxxopts::value<int>(num_connections))
         ("threads", "Number of threads to run io_context (default: 1, use 0 for hardware_concurrency)", cxxopts::value<int>())
+        ("io_shards", "Dedicated io_context shards for pub-mode connections (default: 0 = disabled)", cxxopts::value<int>())
         ("max_in_flight", "Max in-flight publishes for pub mode (default: 1000)", cxxopts::value<int>(max_in_flight))
         ("batch_pub", "Use high-performance batch publishing (pub mode)")
         ("batch_size", "Batch read size in bytes for batch_pub mode (default: 65536)", cxxopts::value<int>())
@@ -474,6 +476,9 @@ int main(int argc, char* argv[]) {
         std::shared_ptr<kv_watcher_handler> kv_watch_ptr;
         nats_asio::iconnection_sptr conn;
         std::vector<nats_asio::iconnection_sptr> pub_connections;
+        std::vector<std::shared_ptr<asio::io_context>> pub_io_shards;
+        std::vector<asio::executor_work_guard<asio::io_context::executor_type>> pub_io_shard_guards;
+        std::vector<std::thread> pub_io_shard_threads;
 
         // Parse timestamp option
         bool show_timestamp = result.count("timestamp") > 0;
@@ -616,9 +621,9 @@ int main(int argc, char* argv[]) {
         }
 
         // Helper to create a connection
-        auto make_connection = [&](int conn_id = -1) {
+        auto make_connection = [&](asio::io_context& connection_ioc, int conn_id = -1) {
             return nats_asio::create_connection(
-                ioc,
+                connection_ioc,
                 [&, conn_id](nats_asio::iconnection& /*c*/) -> asio::awaitable<void> {
                     if (conn_id >= 0) {
                         console->info("connection {} connected", conn_id);
@@ -825,10 +830,43 @@ int main(int argc, char* argv[]) {
             } else {
                 // Standard publisher mode - multiple connections supported
                 console->info("Creating {} connections for pub mode", num_connections);
-                for (int i = 0; i < num_connections; i++) {
-                    auto c = make_connection(i);
-                    c->start(conf);
-                    pub_connections.push_back(c);
+                int io_shards = result.count("io_shards") ? result["io_shards"].as<int>() : 0;
+                if (io_shards < 0) {
+                    console->error("--io_shards must be >= 0");
+                    return 1;
+                }
+
+                if (io_shards > 0) {
+                    int shard_count = std::min(io_shards, num_connections);
+                    if (shard_count < 1) {
+                        shard_count = 1;
+                    }
+                    console->info("Using {} dedicated io_context shard(s) for pub-mode connections",
+                                  shard_count);
+
+                    pub_io_shards.reserve(shard_count);
+                    pub_io_shard_guards.reserve(shard_count);
+                    pub_io_shard_threads.reserve(shard_count);
+
+                    for (int s = 0; s < shard_count; ++s) {
+                        auto shard = std::make_shared<asio::io_context>();
+                        pub_io_shard_guards.emplace_back(asio::make_work_guard(*shard));
+                        pub_io_shard_threads.emplace_back([shard]() { shard->run(); });
+                        pub_io_shards.push_back(std::move(shard));
+                    }
+
+                    for (int i = 0; i < num_connections; i++) {
+                        auto& shard = *pub_io_shards[static_cast<std::size_t>(i) % pub_io_shards.size()];
+                        auto c = make_connection(shard, i);
+                        c->start(conf);
+                        pub_connections.push_back(c);
+                    }
+                } else {
+                    for (int i = 0; i < num_connections; i++) {
+                        auto c = make_connection(ioc, i);
+                        c->start(conf);
+                        pub_connections.push_back(c);
+                    }
                 }
                 int js_timeout_ms = result.count("js_timeout") ? result["js_timeout"].as<int>() : 5000;
                 bool wait_for_ack = result.count("no_ack") == 0;  // default: wait for ack
@@ -853,7 +891,7 @@ int main(int argc, char* argv[]) {
             // Create connections for benchmark (use --connections option)
             std::vector<nats_asio::iconnection_sptr> bench_connections;
             for (int i = 0; i < num_connections; i++) {
-                auto c = make_connection(i);
+                auto c = make_connection(ioc, i);
                 c->start(conf);
                 bench_connections.push_back(c);
             }
@@ -863,7 +901,7 @@ int main(int argc, char* argv[]) {
                                                        bench_count, bench_size, use_js, bench_rtt, bench_timeout, bench_batch);
             asio::co_spawn(ioc, bench_ptr->run(), asio::detached);
         } else {
-            conn = make_connection();
+            conn = make_connection(ioc);
             conn->start(conf);
 
             if (m == mode::generator) {
@@ -938,6 +976,22 @@ int main(int argc, char* argv[]) {
             }
         } else {
             ioc.run();
+        }
+
+        // Stop and join dedicated publisher io_context shards (if enabled).
+        for (const auto& c : pub_connections) {
+            c->stop();
+        }
+        for (auto& guard : pub_io_shard_guards) {
+            guard.reset();
+        }
+        for (auto& shard_ioc : pub_io_shards) {
+            shard_ioc->stop();
+        }
+        for (auto& t : pub_io_shard_threads) {
+            if (t.joinable()) {
+                t.join();
+            }
         }
 
     } catch (const std::exception& e) {
