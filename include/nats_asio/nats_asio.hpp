@@ -2224,11 +2224,10 @@ public:
 
         size_t total_bytes = header->size() + payload.size() + protocol::crlf.size();
 
-        try {
-            co_await asio::async_write(m_socket, *buffers, asio::use_awaitable);
-        } catch (const std::system_error& e) {
+        auto write_status = co_await guarded_socket_write(*buffers, "publish");
+        if (write_status.failed()) {
             m_circuit_breaker.record_failure();
-            co_return status(e.code().message());
+            co_return write_status;
         }
 
         // Record success for circuit breaker
@@ -2311,10 +2310,10 @@ public:
             co_return status(error_code::not_connected);
         }
 
-        try {
-            co_await asio::async_write(m_socket, asio::buffer(data.data(), data.size()), asio::use_awaitable);
-        } catch (const std::system_error& e) {
-            co_return status(e.code().message());
+        auto write_status =
+            co_await guarded_socket_write(asio::buffer(data.data(), data.size()), "write_raw");
+        if (write_status.failed()) {
+            co_return write_status;
         }
 
         co_return status();
@@ -2358,10 +2357,9 @@ public:
             asio_buffers.emplace_back(asio::buffer(buf.data(), buf.size()));
         }
 
-        try {
-            co_await asio::async_write(m_socket, asio_buffers, asio::use_awaitable);
-        } catch (const std::system_error& e) {
-            co_return status(e.code().message());
+        auto write_status = co_await guarded_socket_write(asio_buffers, "write_raw_iov");
+        if (write_status.failed()) {
+            co_return write_status;
         }
 
         co_return status();
@@ -2436,13 +2434,7 @@ public:
         }
 
         // Write all messages in a single syscall
-        try {
-            co_await asio::async_write(m_socket, asio::buffer(batch), asio::use_awaitable);
-        } catch (const std::system_error& e) {
-            co_return status(e.code().message());
-        }
-
-        co_return status();
+        co_return co_await guarded_socket_write(asio::buffer(batch), "flush");
     }
 
     // Configure write coalescing behavior
@@ -2553,11 +2545,10 @@ public:
                                   ? fmt::format(fmt::runtime(protocol::sub_fmt), subject, opts.queue_group.value(), sid)
                                   : fmt::format(fmt::runtime(protocol::sub_fmt), subject, "", sid);
 
-        try {
-            co_await asio::async_write(m_socket, asio::buffer(payload), asio::use_awaitable);
-        } catch (const std::system_error& e) {
+        auto write_status = co_await guarded_socket_write(asio::buffer(payload), "subscribe");
+        if (write_status.failed()) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
-                                                            status(e.code().message())};
+                                                            write_status};
         }
 
         auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
@@ -2594,11 +2585,11 @@ public:
                                   ? fmt::format(fmt::runtime(protocol::sub_fmt), subject, opts.queue_group.value(), sid)
                                   : fmt::format(fmt::runtime(protocol::sub_fmt), subject, "", sid);
 
-        try {
-            co_await asio::async_write(m_socket, asio::buffer(payload), asio::use_awaitable);
-        } catch (const std::system_error& e) {
+        auto write_status =
+            co_await guarded_socket_write(asio::buffer(payload), "subscribe_headers");
+        if (write_status.failed()) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
-                                                            status(e.code().message())};
+                                                            write_status};
         }
 
         auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
@@ -2635,11 +2626,11 @@ public:
                                   ? fmt::format(fmt::runtime(protocol::sub_fmt), subject, opts.queue_group.value(), sid)
                                   : fmt::format(fmt::runtime(protocol::sub_fmt), subject, "", sid);
 
-        try {
-            co_await asio::async_write(m_socket, asio::buffer(payload), asio::use_awaitable);
-        } catch (const std::system_error& e) {
+        auto write_status =
+            co_await guarded_socket_write(asio::buffer(payload), "subscribe_zero_copy");
+        if (write_status.failed()) {
             co_return std::pair<isubscription_sptr, status>{isubscription_sptr(),
-                                                            status(e.code().message())};
+                                                            write_status};
         }
 
         auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
@@ -2755,11 +2746,10 @@ public:
 
         size_t bytes_sent = cmd->size() + hdr_data->size() + payload.size() + protocol::crlf.size();
 
-        try {
-            co_await asio::async_write(m_socket, *buffers, asio::use_awaitable);
-        } catch (const std::system_error& e) {
+        auto write_status = co_await guarded_socket_write(*buffers, "publish_headers");
+        if (write_status.failed()) {
             m_circuit_breaker.record_failure();
-            co_return status(e.code().message());
+            co_return write_status;
         }
 
         m_circuit_breaker.record_success();
@@ -3052,6 +3042,47 @@ public:
     }
 
 private:
+    template <typename ConstBufferSequence>
+    asio::awaitable<status> guarded_socket_write(const ConstBufferSequence& buffers,
+                                                 string_view op_name) {
+        if (!m_strand.running_in_this_thread()) {
+            co_return status(error_code::operation_failed,
+                             "guarded_socket_write must run on strand");
+        }
+
+        while (m_write_in_progress) {
+            auto overlap_count = ++m_write_overlap_count;
+            if (m_error_cb && overlap_count <= m_write_overlap_log_limit) {
+                co_await m_error_cb(
+                    *this, fmt::format("socket write overlap detected: op={} overlap_count={}",
+                                       op_name, overlap_count));
+            }
+
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::microseconds(50));
+            auto [wait_ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            if (wait_ec && wait_ec != asio::error::operation_aborted) {
+                co_return status(wait_ec.message());
+            }
+        }
+
+        struct scoped_write_flag {
+            bool& flag;
+            explicit scoped_write_flag(bool& f) : flag(f) { flag = true; }
+            ~scoped_write_flag() { flag = false; }
+        } write_scope(m_write_in_progress);
+
+        auto [ec, bytes] =
+            co_await asio::async_write(m_socket, buffers, asio::as_tuple(asio::use_awaitable));
+        if (ec) {
+            co_return status(ec.message());
+        }
+
+        m_write_ops.fetch_add(1, std::memory_order_relaxed);
+        m_write_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        co_return status();
+    }
+
     struct js_ack_wait_state {
         bool ready = false;
         js_pub_ack ack;
@@ -4238,8 +4269,8 @@ private:
     }
 
     awaitable<void> on_ping() override {
-        co_await asio::async_write(m_socket, asio::buffer(protocol::pong.data(), protocol::pong.size()),
-                                   use_awaitable);
+        (void)co_await guarded_socket_write(
+            asio::buffer(protocol::pong.data(), protocol::pong.size()), "on_ping_pong");
         co_return;
     }
 
@@ -4466,7 +4497,11 @@ private:
             co_await m_socket.async_handshake();
 
             auto info = prepare_info(conf);
-            co_await asio::async_write(m_socket, asio::buffer(info));
+            auto write_status =
+                co_await guarded_socket_write(asio::buffer(info), "connect_info");
+            if (write_status.failed()) {
+                co_return write_status;
+            }
 
             co_return status{};
         } catch (const std::system_error& e) {
@@ -4629,12 +4664,7 @@ private:
         }
 
         std::string unsub_payload(fmt::format(fmt::runtime(protocol::unsub_fmt), sid));
-        try {
-            co_await asio::async_write(m_socket, asio::buffer(unsub_payload), use_awaitable);
-            co_return status{};
-        } catch (const std::system_error& e) {
-            co_return status(e.what());
-        }
+        co_return co_await guarded_socket_write(asio::buffer(unsub_payload), "unsubscribe");
     }
 
     // Background coroutine for automatic write queue flushing
@@ -4752,15 +4782,14 @@ private:
             }
 
             // Send PING
-            try {
-                co_await asio::async_write(m_socket,
-                    asio::buffer("PING\r\n", 6), asio::use_awaitable);
-                m_pings_outstanding.fetch_add(1, std::memory_order_acq_rel);
-                m_stats.pings_sent.fetch_add(1, std::memory_order_relaxed);
-            } catch (const std::system_error&) {
+            auto ping_status =
+                co_await guarded_socket_write(asio::buffer("PING\r\n", 6), "ping_loop");
+            if (ping_status.failed()) {
                 // Connection error - will be handled by main read loop
                 break;
             }
+            m_pings_outstanding.fetch_add(1, std::memory_order_acq_rel);
+            m_stats.pings_sent.fetch_add(1, std::memory_order_relaxed);
         }
 
         m_ping_loop_running.store(false, std::memory_order_release);
@@ -4843,6 +4872,11 @@ private:
     // Write coalescing queue
     write_queue m_write_queue;
     std::atomic<bool> m_flush_running{false};
+    bool m_write_in_progress{false};
+    uint64_t m_write_overlap_count{0};
+    static constexpr uint64_t m_write_overlap_log_limit{20};
+    std::atomic<uint64_t> m_write_ops{0};
+    std::atomic<uint64_t> m_write_bytes{0};
 
     // KV prefix cache for efficient subject building
     mutable kv_prefix_cache m_kv_cache;
