@@ -267,6 +267,16 @@ public:
             }
         }
 
+        // Ensure queued writes are flushed before shutdown in no-ack JS mode.
+        if (m_jetstream && !m_wait_for_ack) {
+            for (auto& conn : m_connections) {
+                auto s = co_await conn->flush();
+                if (s.failed()) {
+                    m_log->warn("flush failed during shutdown: {}", s.error());
+                }
+            }
+        }
+
         m_log->info("All publishes complete, stopping");
         m_ioc.stop();
         co_return;
@@ -405,6 +415,30 @@ private:
                 },
                 asio::detached);
 
+            co_return;
+        }
+
+        // Hot path for JetStream fire-and-forget: avoid per-message co_spawn overhead.
+        if (m_jetstream && !m_wait_for_ack) {
+            auto conn = get_next_connection();
+            std::span<const char> payload_span(payload.data(), payload.size());
+
+            nats_asio::status s;
+            if (m_headers.empty()) {
+                auto [ack, status] =
+                    co_await conn->js_publish(subject, payload_span, m_js_timeout, false);
+                s = status;
+            } else {
+                auto [ack, status] = co_await conn->js_publish(
+                    subject, payload_span, m_headers, m_js_timeout, false);
+                s = status;
+            }
+
+            if (s.failed()) {
+                m_log->error("publish failed: {}", s.error());
+            } else {
+                m_counter++;
+            }
             co_return;
         }
 
