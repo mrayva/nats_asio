@@ -2384,19 +2384,45 @@ public:
             return status(error_code::message_too_large);
         }
 
-        // Format the complete NATS message
+        // Format the complete NATS message with manual appends to avoid fmt overhead
         std::string msg;
+        msg.reserve(subject.size() + payload.size() + (reply_to ? reply_to->size() : 0) + 32);
+        msg.append("PUB ");
+        msg.append(subject.data(), subject.size());
+        msg.push_back(' ');
         if (reply_to.has_value() && !reply_to->empty()) {
-            msg = fmt::format("PUB {} {} {}\r\n", subject, *reply_to, payload.size());
-        } else {
-            msg = fmt::format("PUB {} {}\r\n", subject, payload.size());
+            msg.append(reply_to->data(), reply_to->size());
+            msg.push_back(' ');
         }
+
+        char size_buf[32];
+        auto [size_end, size_ec] =
+            std::to_chars(size_buf, size_buf + sizeof(size_buf), payload.size());
+        if (size_ec != std::errc{}) {
+            return status(error_code::operation_failed, "failed to format payload size");
+        }
+        msg.append(size_buf, static_cast<std::size_t>(size_end - size_buf));
+        msg.append("\r\n", 2);
         msg.append(payload.data(), payload.size());
-        msg += "\r\n";
+        msg.append("\r\n", 2);
 
         // Enqueue the message
         if (!m_write_queue.enqueue(std::move(msg))) {
             return status(error_code::operation_failed, "write queue full");
+        }
+
+        // If buffer crossed high watermark, flush immediately instead of waiting
+        // for timer tick. This is the fast path for high-throughput publishing.
+        if (m_write_queue.should_flush() &&
+            !m_immediate_flush_running.exchange(true, std::memory_order_acq_rel)) {
+            asio::co_spawn(
+                m_strand,
+                [this]() -> asio::awaitable<void> {
+                    (void)co_await flush();
+                    m_immediate_flush_running.store(false, std::memory_order_release);
+                    co_return;
+                },
+                asio::detached);
         }
 
         // Start auto-flush coroutine if not running and interval > 0
@@ -4872,6 +4898,7 @@ private:
     // Write coalescing queue
     write_queue m_write_queue;
     std::atomic<bool> m_flush_running{false};
+    std::atomic<bool> m_immediate_flush_running{false};
     bool m_write_in_progress{false};
     uint64_t m_write_overlap_count{0};
     static constexpr uint64_t m_write_overlap_log_limit{20};
