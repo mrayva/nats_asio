@@ -50,6 +50,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <charconv>
 #include <concepts>
 #include <concurrentqueue/moodycamel/concurrentqueue.h>
+#include <deque>
 #include <gtl/lru_cache.hpp>
 #include <iomanip>
 #include <istream>
