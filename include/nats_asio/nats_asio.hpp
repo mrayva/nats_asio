@@ -3084,22 +3084,32 @@ private:
                                        op_name, overlap_count));
             }
 
-            asio::steady_timer timer(co_await asio::this_coro::executor);
-            timer.expires_after(std::chrono::microseconds(50));
-            auto [wait_ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            auto waiter = std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+            waiter->expires_at((std::chrono::steady_clock::time_point::max)());
+            m_write_waiters.push_back(waiter);
+
+            auto [wait_ec] = co_await waiter->async_wait(asio::as_tuple(asio::use_awaitable));
             if (wait_ec && wait_ec != asio::error::operation_aborted) {
                 co_return status(wait_ec.message());
             }
         }
 
-        struct scoped_write_flag {
-            bool& flag;
-            explicit scoped_write_flag(bool& f) : flag(f) { flag = true; }
-            ~scoped_write_flag() { flag = false; }
-        } write_scope(m_write_in_progress);
+        m_write_in_progress = true;
 
         auto [ec, bytes] =
             co_await asio::async_write(m_socket, buffers, asio::as_tuple(asio::use_awaitable));
+
+        m_write_in_progress = false;
+
+        // Wake exactly one waiter to avoid thundering-herd rescheduling on high contention.
+        if (!m_write_waiters.empty()) {
+            auto waiter = m_write_waiters.front();
+            m_write_waiters.pop_front();
+            if (waiter) {
+                waiter->cancel();
+            }
+        }
+
         if (ec) {
             co_return status(ec.message());
         }
@@ -4904,6 +4914,7 @@ private:
     static constexpr uint64_t m_write_overlap_log_limit{20};
     std::atomic<uint64_t> m_write_ops{0};
     std::atomic<uint64_t> m_write_bytes{0};
+    std::deque<std::shared_ptr<asio::steady_timer>> m_write_waiters;
 
     // KV prefix cache for efficient subject building
     mutable kv_prefix_cache m_kv_cache;
