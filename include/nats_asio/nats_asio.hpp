@@ -2414,7 +2414,8 @@ public:
 
         // If buffer crossed high watermark, flush immediately instead of waiting
         // for timer tick. This is the fast path for high-throughput publishing.
-        if (m_write_queue.should_flush() &&
+        if (m_write_queue.should_flush() && !m_write_in_progress &&
+            !m_flush_running.load(std::memory_order_acquire) &&
             !m_immediate_flush_running.exchange(true, std::memory_order_acq_rel)) {
             asio::co_spawn(
                 m_strand,
@@ -4723,8 +4724,8 @@ private:
                 break;
             }
 
-            // Flush if there's pending data
-            if (!m_write_queue.empty()) {
+            // Flush only when no other write is currently active.
+            if (!m_write_queue.empty() && !m_write_in_progress) {
                 co_await flush();
             }
 
