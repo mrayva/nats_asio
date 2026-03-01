@@ -1018,8 +1018,6 @@ int main(int argc, char* argv[]) {
         for (const auto& c : pub_connections) {
             c->stop();
         }
-        pub_connections.clear();
-        conn.reset();
         for (auto& guard : pub_io_shard_guards) {
             guard.reset();
         }
@@ -1031,6 +1029,10 @@ int main(int argc, char* argv[]) {
                 t.join();
             }
         }
+        // Only release connection ownership after shard threads are fully stopped,
+        // so detached connection coroutines cannot outlive their owning object.
+        pub_connections.clear();
+        conn.reset();
 
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
