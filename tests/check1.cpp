@@ -220,3 +220,43 @@ TEST(payload_messages, on_message_not_full) {
         EXPECT_EQ(false, s1.failed());
     });
 }
+
+TEST(protocol_parser, rejects_message_larger_than_configured_limit) {
+    parser_mock m;
+    std::string header;
+
+    async_process([&]() -> asio::awaitable<void> {
+        std::stringstream ss("MSG subject 1 11\r\n");
+        auto s = co_await protocol_parser::parse_header(header, ss, m, 10);
+        EXPECT_TRUE(s.failed());
+        co_return;
+    });
+}
+
+TEST(protocol_parser, rejects_hmessage_with_header_larger_than_total) {
+    parser_mock m;
+    std::string header;
+
+    async_process([&]() -> asio::awaitable<void> {
+        std::stringstream ss("HMSG subject 1 11 10\r\n");
+        auto s = co_await protocol_parser::parse_header(header, ss, m);
+        EXPECT_TRUE(s.failed());
+        co_return;
+    });
+}
+
+TEST(protocol_parser, rejects_invalid_command_prefixes) {
+    parser_mock m;
+    std::string header;
+
+    async_process([&]() -> asio::awaitable<void> {
+        std::stringstream info("INFOX {}\r\n");
+        auto info_status = co_await protocol_parser::parse_header(header, info, m);
+        EXPECT_TRUE(info_status.failed());
+
+        std::stringstream err("-ERRX bad\r\n");
+        auto err_status = co_await protocol_parser::parse_header(header, err, m);
+        EXPECT_TRUE(err_status.failed());
+        co_return;
+    });
+}

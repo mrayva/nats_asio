@@ -58,6 +58,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <limits>
 #include <random>
 #include <simdjson.h>
 #include <sstream>
@@ -1583,7 +1584,8 @@ struct parser_observer {
 
 struct protocol_parser {
     static asio::awaitable<status> parse_header(std::string& header, std::istream& is,
-                                                parser_observer& observer) {
+                                                parser_observer& observer,
+                                                std::size_t max_payload = 0) {
         if (!std::getline(is, header)) {
             co_return status(error_code::protocol_error);
         }
@@ -1624,6 +1626,10 @@ struct protocol_parser {
                         co_return status(error_code::parse_error);
                     }
 
+                    if (hdr_len > total_len || !valid_wire_size(total_len, max_payload)) {
+                        co_return status(error_code::invalid_message);
+                    }
+
                     if (has_reply) {
                         co_await observer.on_hmessage(results[0], results[1], results[2], hdr_len, total_len);
                     } else {
@@ -1652,6 +1658,10 @@ struct protocol_parser {
                         co_return status(error_code::parse_error);
                     }
 
+                    if (!valid_wire_size(bytes_n, max_payload)) {
+                        co_return status(error_code::invalid_message);
+                    }
+
                     if (reply_to) {
                         co_await observer.on_message(results[0], results[1], results[2], bytes_n);
                     } else {
@@ -1665,7 +1675,7 @@ struct protocol_parser {
                 break;
 
             case 'I': // INFO
-                if (v.starts_with(protocol::op_info)) {
+                if (has_optional_argument(v, protocol::op_info)) {
                     auto info_msg = (v.size() > protocol::op_info.size()) ? v.substr(protocol::op_info.size() + 1) : string_view{};
                     co_await observer.on_info(info_msg);
                     co_return status();
@@ -1690,7 +1700,7 @@ struct protocol_parser {
                 break;
 
             case '-': // -ERR
-                if (v.starts_with(protocol::op_err)) {
+                if (has_optional_argument(v, protocol::op_err)) {
                     auto err_msg = (v.size() > protocol::op_err.size()) ? v.substr(protocol::op_err.size() + 1) : string_view{};
                     co_await observer.on_error(err_msg);
                     co_return status();
@@ -1700,6 +1710,24 @@ struct protocol_parser {
 
         co_return status(error_code::invalid_message);
     }
+
+private:
+    static bool has_optional_argument(string_view value, string_view command) {
+        return value == command ||
+               (value.size() > command.size() && value.starts_with(command) &&
+                value[command.size()] == ' ');
+    }
+
+    // The connection uses signed buffer-delta arithmetic and appends CRLF.
+    static bool valid_wire_size(std::size_t payload_len, std::size_t max_payload) {
+        constexpr std::size_t max_signed =
+            static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max());
+        return (max_payload == 0 || payload_len <= max_payload) &&
+               payload_len <= std::numeric_limits<std::size_t>::max() - 2 &&
+               payload_len <= max_signed - 2;
+    }
+
+public:
 
     // SIMD-accelerated string splitting using StringZilla
     static std::vector<string_view> split_sv(string_view str, string_view delims = " ") {
@@ -4527,7 +4555,7 @@ private:
 
             std::string header;
             std::istream is(&m_buf);
-            auto s = co_await protocol_parser::parse_header(header, is, *this);
+            auto s = co_await protocol_parser::parse_header(header, is, *this, m_max_payload);
             if (s.failed()) {
                 co_return s;
             }
@@ -4662,7 +4690,7 @@ private:
                 co_await asio::async_read_until(m_socket, m_buf, std::string(protocol::crlf), asio::use_awaitable);
 
                 std::istream is(&m_buf);
-                auto s = co_await protocol_parser::parse_header(header, is, *this);
+                auto s = co_await protocol_parser::parse_header(header, is, *this, m_max_payload);
                 if (s.failed()) {
                     continue;
                 }
