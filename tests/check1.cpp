@@ -327,3 +327,91 @@ TEST(connection_lifetime, queued_start_and_stop_own_connection) {
     ioc.run();
     EXPECT_TRUE(weak_conn.expired());
 }
+
+void expect_malformed_frame_disconnects(const std::string& malformed,
+                                        string_view expected_error) {
+    asio::io_context server_ioc;
+    asio::ip::tcp::acceptor acceptor(
+        server_ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    const auto port = acceptor.local_endpoint().port();
+    std::atomic<bool> server_ok{true};
+
+    std::thread server([&] {
+        asio::error_code ec;
+        asio::ip::tcp::socket socket(server_ioc);
+        acceptor.accept(socket, ec);
+        if (ec) {
+            server_ok.store(false, std::memory_order_relaxed);
+            return;
+        }
+        acceptor.close(ec);
+
+        const std::string info = "INFO {\"max_payload\":1048576}\r\n";
+        asio::write(socket, asio::buffer(info), ec);
+        asio::streambuf connect_buf;
+        asio::read_until(socket, connect_buf, "\r\n", ec);
+        if (ec) {
+            server_ok.store(false, std::memory_order_relaxed);
+            return;
+        }
+
+        asio::write(socket, asio::buffer(malformed), ec);
+
+        std::array<char, 1> byte{};
+        socket.read_some(asio::buffer(byte), ec);
+        if (!ec) {
+            server_ok.store(false, std::memory_order_relaxed);
+        }
+    });
+
+    asio::io_context client_ioc;
+    asio::steady_timer watchdog(client_ioc);
+    std::atomic<bool> protocol_error_seen{false};
+    std::atomic<bool> disconnected{false};
+    auto conn = create_connection(
+        client_ioc,
+        [](iconnection&) -> asio::awaitable<void> { co_return; },
+        [&](iconnection& c) -> asio::awaitable<void> {
+            disconnected.store(true, std::memory_order_relaxed);
+            watchdog.cancel();
+            c.stop();
+            co_return;
+        },
+        [&](iconnection&, string_view error) -> asio::awaitable<void> {
+            if (error.find(expected_error) != string_view::npos) {
+                protocol_error_seen.store(true, std::memory_order_relaxed);
+            }
+            co_return;
+        },
+        std::nullopt);
+
+    connect_config config;
+    config.address = "127.0.0.1";
+    config.port = port;
+    config.retry_initial_delay_ms = 1;
+    config.retry_max_delay_ms = 1;
+    conn->start(config);
+
+    watchdog.expires_after(std::chrono::seconds(2));
+    watchdog.async_wait([&](const asio::error_code& ec) {
+        if (!ec) {
+            conn->stop();
+        }
+    });
+
+    client_ioc.run();
+    server.join();
+
+    EXPECT_TRUE(server_ok.load(std::memory_order_relaxed));
+    EXPECT_TRUE(protocol_error_seen.load(std::memory_order_relaxed));
+    EXPECT_TRUE(disconnected.load(std::memory_order_relaxed));
+}
+
+TEST(connection_protocol, malformed_header_disconnects) {
+    expect_malformed_frame_disconnects("BOGUS\r\n", "protocol parse failed");
+}
+
+TEST(connection_protocol, malformed_payload_terminator_disconnects) {
+    expect_malformed_frame_disconnects(
+        "MSG subject 1 3\r\nabcXX", "invalid message payload terminator");
+}

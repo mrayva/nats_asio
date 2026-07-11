@@ -4424,6 +4424,13 @@ private:
                                       use_awaitable);
         }
 
+        auto wire_data = m_buf.data();
+        const auto* wire_ptr = static_cast<const char*>(wire_data.data());
+        if (wire_ptr[n] != '\r' || wire_ptr[n + 1] != '\n') {
+            m_protocol_error = true;
+            co_return;
+        }
+
         // Update stats
         m_stats.msgs_received.fetch_add(1, std::memory_order_relaxed);
         m_stats.bytes_received.fetch_add(n, std::memory_order_relaxed);
@@ -4486,6 +4493,13 @@ private:
             co_await asio::async_read(m_socket, m_buf,
                                       asio::transfer_at_least(static_cast<std::size_t>(bytes_to_transfer)),
                                       use_awaitable);
+        }
+
+        auto wire_data = m_buf.data();
+        const auto* wire_ptr = static_cast<const char*>(wire_data.data());
+        if (wire_ptr[total_len] != '\r' || wire_ptr[total_len + 1] != '\n') {
+            m_protocol_error = true;
+            co_return;
         }
 
         // Update stats
@@ -4739,9 +4753,16 @@ private:
                 co_await asio::async_read_until(m_socket, m_buf, std::string(protocol::crlf), asio::use_awaitable);
 
                 std::istream is(&m_buf);
+                m_protocol_error = false;
                 auto s = co_await protocol_parser::parse_header(header, is, *this, m_max_payload);
-                if (s.failed()) {
-                    continue;
+                if (s.failed() || m_protocol_error) {
+                    if (m_error_cb) {
+                        auto message = s.failed()
+                            ? fmt::format("protocol parse failed: {}", s.error())
+                            : std::string("invalid message payload terminator");
+                        co_await m_error_cb(*this, message);
+                    }
+                    should_disconnect = true;
                 }
             } catch (const std::system_error&) {
                 should_disconnect = true;
@@ -4756,6 +4777,7 @@ private:
                 m_is_connected = false;
                 asio::error_code ec;
                 m_socket.close(ec);
+                m_buf.consume(m_buf.size());
 
                 if (m_disconnected_cb) {
                     co_await m_disconnected_cb(*this);
@@ -4964,6 +4986,7 @@ private:
     std::atomic<bool> m_is_connected;
     std::atomic<bool> m_stop_flag;
     std::atomic<bool> m_draining{false};
+    bool m_protocol_error{false};
 
     mutable std::mutex m_subs_mutex;
     std::unordered_map<uint64_t, subscription_sptr> m_subs;
