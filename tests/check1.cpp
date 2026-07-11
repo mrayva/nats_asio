@@ -306,3 +306,24 @@ TEST(write_queue, tracks_pending_bytes_with_concurrent_producers) {
     EXPECT_EQ(consumed_bytes, producer_count * messages_per_producer * message.size());
     EXPECT_EQ(queue.pending_bytes(), 0);
 }
+
+TEST(connection_lifetime, queued_start_and_stop_own_connection) {
+    asio::io_context ioc;
+    auto noop_connected = [](iconnection&) -> asio::awaitable<void> { co_return; };
+    auto noop_disconnected = [](iconnection&) -> asio::awaitable<void> { co_return; };
+    auto noop_error = [](iconnection&, string_view) -> asio::awaitable<void> { co_return; };
+
+    auto conn = create_connection(
+        ioc, noop_connected, noop_disconnected, noop_error, std::nullopt);
+    std::weak_ptr<iconnection> weak_conn = conn;
+
+    connect_config config;
+    conn->start(config);
+    conn->stop();
+    conn.reset();
+
+    // Queued lifecycle handlers retain ownership until the io_context runs them.
+    EXPECT_FALSE(weak_conn.expired());
+    ioc.run();
+    EXPECT_TRUE(weak_conn.expired());
+}

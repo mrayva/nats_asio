@@ -36,6 +36,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <asio/co_spawn.hpp>
 #include <asio/connect.hpp>
 #include <asio/detached.hpp>
+#include <asio/dispatch.hpp>
 #include <asio/strand.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/read.hpp>
@@ -2071,18 +2072,23 @@ inline std::string js_deliver_policy_to_string(js_deliver_policy policy) {
 }
 
 template <class SocketType>
-class connection : public iconnection, public parser_observer {
+class connection : public iconnection, public parser_observer,
+                   public std::enable_shared_from_this<connection<SocketType>> {
 public:
     connection(aio& io, const on_connected_cb& connected_cb,
                const on_disconnected_cb& disconnected_cb, const on_error_cb& error_cb,
                const std::shared_ptr<ssl::context>& ctx)
-        : m_sid(0), m_max_payload(0), m_io(io), m_strand(asio::make_strand(io)), m_is_connected(false), m_stop_flag(false),
+        : m_sid(0), m_max_payload(0), m_io(io), m_strand(asio::make_strand(io)),
+          m_reconnect_timer(io), m_ping_timer(io), m_flush_timer(io),
+          m_is_connected(false), m_stop_flag(false),
           m_connected_cb(connected_cb), m_disconnected_cb(disconnected_cb), m_error_cb(error_cb),
           m_ssl_ctx(ctx), m_socket(io, *ctx.get()) {}
 
     connection(aio& io, const on_connected_cb& connected_cb,
                const on_disconnected_cb& disconnected_cb, const on_error_cb& error_cb)
-        : m_sid(0), m_max_payload(0), m_io(io), m_strand(asio::make_strand(io)), m_is_connected(false), m_stop_flag(false),
+        : m_sid(0), m_max_payload(0), m_io(io), m_strand(asio::make_strand(io)),
+          m_reconnect_timer(io), m_ping_timer(io), m_flush_timer(io),
+          m_is_connected(false), m_stop_flag(false),
           m_connected_cb(connected_cb), m_disconnected_cb(disconnected_cb), m_error_cb(error_cb),
           m_socket(io) {}
 
@@ -2090,13 +2096,21 @@ public:
     connection& operator=(const connection&) = delete;
 
     virtual void start(const connect_config& conf) override {
+        auto self = this->shared_from_this();
         asio::co_spawn(
-            m_strand, [this, conf]() -> awaitable<void> { return run(conf); },
+            m_strand, [self, conf]() -> awaitable<void> { co_await self->run(conf); },
             asio::detached);
     }
 
     virtual void stop() noexcept override {
-        m_stop_flag = true;
+        m_stop_flag.store(true, std::memory_order_release);
+        try {
+            if (auto self = this->weak_from_this().lock()) {
+                asio::dispatch(m_strand, [self] { self->stop_on_strand(); });
+            }
+        } catch (...) {
+            // The stop flag is already visible; avoid throwing from noexcept shutdown.
+        }
     }
     [[nodiscard]] virtual bool is_connected() noexcept override {
         return m_is_connected;
@@ -2450,11 +2464,12 @@ public:
         if (m_write_queue.should_flush() &&
             !m_flush_running.load(std::memory_order_acquire) &&
             !m_immediate_flush_running.exchange(true, std::memory_order_acq_rel)) {
+            auto self = this->shared_from_this();
             asio::co_spawn(
                 m_strand,
-                [this]() -> asio::awaitable<void> {
-                    (void)co_await flush();
-                    m_immediate_flush_running.store(false, std::memory_order_release);
+                [self]() -> asio::awaitable<void> {
+                    (void)co_await self->flush();
+                    self->m_immediate_flush_running.store(false, std::memory_order_release);
                     co_return;
                 },
                 asio::detached);
@@ -2463,7 +2478,11 @@ public:
         // Start auto-flush coroutine if not running and interval > 0
         if (m_write_queue.flush_interval().count() > 0 &&
             !m_flush_running.exchange(true, std::memory_order_acq_rel)) {
-            asio::co_spawn(m_strand, auto_flush_loop(), asio::detached);
+            auto self = this->shared_from_this();
+            asio::co_spawn(
+                m_strand,
+                [self]() -> asio::awaitable<void> { co_await self->auto_flush_loop(); },
+                asio::detached);
         }
 
         return status();
@@ -2950,11 +2969,13 @@ public:
         tasks.reserve(messages.size());
 
         for (size_t i = 0; i < messages.size(); ++i) {
-            auto publish_task = [this, &messages, state, i, timeout]() -> asio::awaitable<void> {
-                const auto& msg = messages[i];
+            auto self = this->shared_from_this();
+            auto msg = messages[i];
+            auto publish_task = [self, msg = std::move(msg), state, i,
+                                 timeout]() -> asio::awaitable<void> {
                 std::span<const char> payload_span(msg.payload.data(), msg.payload.size());
 
-                auto [ack, pub_status] = co_await js_publish_impl(
+                auto [ack, pub_status] = co_await self->js_publish_impl(
                     msg.subject, payload_span, msg.headers, timeout, true);
 
                 {
@@ -3103,6 +3124,22 @@ public:
     }
 
 private:
+    void stop_on_strand() noexcept {
+        m_stop_flag.store(true, std::memory_order_release);
+        asio::error_code ec;
+        m_reconnect_timer.cancel(ec);
+        m_ping_timer.cancel(ec);
+        m_flush_timer.cancel(ec);
+        m_socket.cancel(ec);
+        m_socket.close(ec);
+
+        for (auto& waiter : m_write_waiters) {
+            if (waiter) {
+                waiter->cancel(ec);
+            }
+        }
+    }
+
     template <typename ConstBufferSequence>
     asio::awaitable<status> guarded_socket_write(const ConstBufferSequence& buffers,
                                                  string_view op_name) {
@@ -4650,9 +4687,12 @@ private:
                             std::max(1.0f, retry_delay_ms + dist(rng)));
                     }
 
-                    asio::steady_timer timer(co_await asio::this_coro::executor);
-                    timer.expires_after(std::chrono::milliseconds(actual_delay));
-                    co_await timer.async_wait(asio::use_awaitable);
+                    m_reconnect_timer.expires_after(std::chrono::milliseconds(actual_delay));
+                    auto [wait_ec] = co_await m_reconnect_timer.async_wait(
+                        asio::as_tuple(asio::use_awaitable));
+                    if (m_stop_flag || wait_ec == asio::error::operation_aborted) {
+                        co_return;
+                    }
 
                     // Exponential backoff: double delay, cap at max
                     retry_delay_ms = std::min(retry_delay_ms * 2, conf.retry_max_delay_ms);
@@ -4677,7 +4717,11 @@ private:
                 // Start ping loop if configured
                 if (m_ping_interval_ms > 0 &&
                     !m_ping_loop_running.exchange(true, std::memory_order_acq_rel)) {
-                    asio::co_spawn(m_strand, ping_loop(), asio::detached);
+                    auto self = this->shared_from_this();
+                    asio::co_spawn(
+                        m_strand,
+                        [self]() -> asio::awaitable<void> { co_await self->ping_loop(); },
+                        asio::detached);
                 }
 
                 // Drain offline queue if we have queued messages
@@ -4740,8 +4784,6 @@ private:
 
     // Background coroutine for automatic write queue flushing
     asio::awaitable<void> auto_flush_loop() {
-        asio::steady_timer timer(co_await asio::this_coro::executor);
-
         while (m_is_connected && !m_stop_flag) {
             auto interval = m_write_queue.flush_interval();
             if (interval.count() == 0) {
@@ -4750,8 +4792,8 @@ private:
             }
 
             // Wait for flush interval or until threshold exceeded
-            timer.expires_after(interval);
-            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            m_flush_timer.expires_after(interval);
+            auto [ec] = co_await m_flush_timer.async_wait(asio::as_tuple(asio::use_awaitable));
 
             if (ec || !m_is_connected || m_stop_flag) {
                 break;
@@ -4823,8 +4865,6 @@ private:
 
     // Background coroutine for ping/pong keep-alive
     asio::awaitable<void> ping_loop() {
-        asio::steady_timer timer(co_await asio::this_coro::executor);
-
         while (m_is_connected && !m_stop_flag && !m_draining.load(std::memory_order_acquire)) {
             if (m_ping_interval_ms == 0) {
                 // Ping disabled, stop the loop
@@ -4832,8 +4872,8 @@ private:
             }
 
             // Wait for ping interval
-            timer.expires_after(std::chrono::milliseconds(m_ping_interval_ms));
-            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            m_ping_timer.expires_after(std::chrono::milliseconds(m_ping_interval_ms));
+            auto [ec] = co_await m_ping_timer.async_wait(asio::as_tuple(asio::use_awaitable));
 
             if (ec || !m_is_connected || m_stop_flag || m_draining.load(std::memory_order_acquire)) {
                 break;
@@ -4848,7 +4888,7 @@ private:
                         "connection timeout: {} pings without response", outstanding));
                 }
                 // Trigger disconnect
-                m_stop_flag.store(true, std::memory_order_release);
+                stop_on_strand();
                 break;
             }
 
@@ -4917,6 +4957,9 @@ private:
     std::size_t m_max_payload;
     aio& m_io;
     asio::strand<aio::executor_type> m_strand;
+    asio::steady_timer m_reconnect_timer;
+    asio::steady_timer m_ping_timer;
+    asio::steady_timer m_flush_timer;
 
     std::atomic<bool> m_is_connected;
     std::atomic<bool> m_stop_flag;
