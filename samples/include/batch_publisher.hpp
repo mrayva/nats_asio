@@ -57,7 +57,7 @@ struct batch_item {
     std::size_t msg_count;
 };
 
-// High-performance lock-free batch queue using moodycamel::BlockingConcurrentQueue
+// Bounded batch queue with blocking producer backpressure.
 class batch_queue {
 public:
     void set_max_size(std::size_t max_size) {
@@ -65,18 +65,19 @@ public:
         m_max_size = max_size;
     }
 
-    // Returns true if pushed, false if queue is full (when max_size set)
-    bool push(batch_item item, std::chrono::milliseconds timeout = std::chrono::milliseconds(100)) {
+    // Waits for capacity so accepted input is never silently dropped.
+    // Returns false only after the queue has been closed.
+    bool push(batch_item item) {
         std::unique_lock<std::mutex> lock(m_mutex);
         if (m_done) {
             return false;
         }
 
         if (m_max_size > 0) {
-            auto ok = m_can_push.wait_for(lock, timeout, [this] {
+            m_can_push.wait(lock, [this] {
                 return m_done || m_queue.size() < m_max_size;
             });
-            if (!ok || m_done) {
+            if (m_done) {
                 return false;
             }
         }

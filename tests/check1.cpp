@@ -6,6 +6,8 @@
 #include <sstream>
 #include <thread>
 
+#include "../samples/include/batch_publisher.hpp"
+
 using namespace nats_asio;
 
 struct parser_mock : public parser_observer {
@@ -305,6 +307,30 @@ TEST(write_queue, tracks_pending_bytes_with_concurrent_producers) {
     EXPECT_FALSE(enqueue_failed.load(std::memory_order_relaxed));
     EXPECT_EQ(consumed_bytes, producer_count * messages_per_producer * message.size());
     EXPECT_EQ(queue.pending_bytes(), 0);
+}
+
+TEST(batch_queue, full_queue_blocks_without_dropping_batch) {
+    nats_tool::batch_queue queue;
+    queue.set_max_size(1);
+    ASSERT_TRUE(queue.push({"first", 1}));
+
+    std::atomic<bool> second_pushed{false};
+    std::thread producer([&] {
+        second_pushed.store(queue.push({"second", 1}), std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_FALSE(second_pushed.load(std::memory_order_acquire));
+
+    nats_tool::batch_item item;
+    ASSERT_TRUE(queue.pop(item, std::chrono::milliseconds(100)));
+    EXPECT_EQ(item.data, "first");
+
+    producer.join();
+    EXPECT_TRUE(second_pushed.load(std::memory_order_acquire));
+    ASSERT_TRUE(queue.pop(item, std::chrono::milliseconds(100)));
+    EXPECT_EQ(item.data, "second");
+    queue.set_done();
 }
 
 TEST(connection_lifetime, queued_start_and_stop_own_connection) {
