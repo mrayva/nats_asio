@@ -801,23 +801,26 @@ struct buffer_pools {
 // Write Queue - Lock-free queue for coalescing multiple writes
 // ============================================================================
 
-// Thread-safe write queue that buffers messages for batched sending
-// Uses lock-free queue for high-performance concurrent access
+// Thread-safe write queue that buffers messages for batched sending.
+// Producers may run outside the connection strand; the consumer runs on it.
 class write_queue {
 public:
     write_queue(size_t initial_capacity = 1024)
         : m_queue(initial_capacity), m_pending_bytes(0),
-          m_flush_interval(std::chrono::microseconds(1000)),  // 1ms default
+          m_flush_interval_us(1000),  // 1ms default
           m_max_pending_bytes(64 * 1024) {}  // 64KB default
 
     // Queue a pre-formatted NATS message (e.g., "PUB subject len\r\npayload\r\n")
     // Returns false if queue is full (shouldn't happen with unbounded queue)
     bool enqueue(std::string&& data) {
         size_t size = data.size();
+        // Account before enqueueing so a concurrent consumer cannot dequeue the
+        // item before its bytes are reflected in m_pending_bytes.
+        m_pending_bytes.fetch_add(size, std::memory_order_relaxed);
         if (m_queue.enqueue(std::move(data))) {
-            m_pending_bytes.fetch_add(size, std::memory_order_relaxed);
             return true;
         }
+        m_pending_bytes.fetch_sub(size, std::memory_order_relaxed);
         return false;
     }
 
@@ -853,7 +856,8 @@ public:
 
     // Check if queue should be flushed (exceeds threshold)
     bool should_flush() const noexcept {
-        return m_pending_bytes.load(std::memory_order_relaxed) >= m_max_pending_bytes;
+        return m_pending_bytes.load(std::memory_order_relaxed) >=
+               m_max_pending_bytes.load(std::memory_order_acquire);
     }
 
     // Check if queue is empty
@@ -863,26 +867,27 @@ public:
 
     // Configuration
     void set_flush_interval(std::chrono::microseconds interval) {
-        m_flush_interval = interval;
+        m_flush_interval_us.store(interval.count(), std::memory_order_release);
     }
 
     std::chrono::microseconds flush_interval() const noexcept {
-        return m_flush_interval;
+        return std::chrono::microseconds(
+            m_flush_interval_us.load(std::memory_order_acquire));
     }
 
     void set_max_pending_bytes(size_t max_bytes) {
-        m_max_pending_bytes = max_bytes;
+        m_max_pending_bytes.store(max_bytes, std::memory_order_release);
     }
 
     size_t max_pending_bytes() const noexcept {
-        return m_max_pending_bytes;
+        return m_max_pending_bytes.load(std::memory_order_acquire);
     }
 
 private:
     moodycamel::ConcurrentQueue<std::string> m_queue;
     std::atomic<size_t> m_pending_bytes;
-    std::chrono::microseconds m_flush_interval;
-    size_t m_max_pending_bytes;
+    std::atomic<int64_t> m_flush_interval_us;
+    std::atomic<size_t> m_max_pending_bytes;
 };
 
 // ============================================================================
@@ -2442,7 +2447,7 @@ public:
 
         // If buffer crossed high watermark, flush immediately instead of waiting
         // for timer tick. This is the fast path for high-throughput publishing.
-        if (m_write_queue.should_flush() && !m_write_in_progress &&
+        if (m_write_queue.should_flush() &&
             !m_flush_running.load(std::memory_order_acquire) &&
             !m_immediate_flush_running.exchange(true, std::memory_order_acq_rel)) {
             asio::co_spawn(

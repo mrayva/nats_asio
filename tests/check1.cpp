@@ -4,6 +4,7 @@
 #include <iostream>
 #include <nats_asio/nats_asio.hpp>
 #include <sstream>
+#include <thread>
 
 using namespace nats_asio;
 
@@ -259,4 +260,49 @@ TEST(protocol_parser, rejects_invalid_command_prefixes) {
         EXPECT_TRUE(err_status.failed());
         co_return;
     });
+}
+
+TEST(write_queue, tracks_pending_bytes_with_concurrent_producers) {
+    constexpr std::size_t producer_count = 4;
+    constexpr std::size_t messages_per_producer = 10'000;
+    const std::string message = "payload";
+    write_queue queue;
+    std::atomic<bool> start{false};
+    std::atomic<std::size_t> producers_remaining{producer_count};
+    std::atomic<bool> enqueue_failed{false};
+    std::vector<std::thread> producers;
+    producers.reserve(producer_count);
+
+    for (std::size_t i = 0; i < producer_count; ++i) {
+        producers.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (std::size_t n = 0; n < messages_per_producer; ++n) {
+                if (!queue.enqueue(std::string(message))) {
+                    enqueue_failed.store(true, std::memory_order_relaxed);
+                }
+            }
+            producers_remaining.fetch_sub(1, std::memory_order_release);
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    std::size_t consumed_bytes = 0;
+    while (producers_remaining.load(std::memory_order_acquire) != 0 || !queue.empty()) {
+        std::string batch;
+        queue.dequeue_all(batch);
+        consumed_bytes += batch.size();
+        if (batch.empty()) {
+            std::this_thread::yield();
+        }
+    }
+
+    for (auto& producer : producers) {
+        producer.join();
+    }
+
+    EXPECT_FALSE(enqueue_failed.load(std::memory_order_relaxed));
+    EXPECT_EQ(consumed_bytes, producer_count * messages_per_producer * message.size());
+    EXPECT_EQ(queue.pending_bytes(), 0);
 }
