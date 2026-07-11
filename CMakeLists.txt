@@ -43,9 +43,14 @@ find_package(nlohmann_json CONFIG REQUIRED)
 find_package(simdjson CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(asio CONFIG REQUIRED)
+find_package(magic_enum CONFIG REQUIRED)
+find_package(zstd CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(libzip CONFIG REQUIRED)
+find_path(CONCURRENTQUEUE_INCLUDE_DIR NAMES concurrentqueue/moodycamel/concurrentqueue.h REQUIRED)
+find_path(GTL_INCLUDE_DIR NAMES gtl/lru_cache.hpp REQUIRED)
+find_path(STRINGZILLA_INCLUDE_DIR NAMES stringzilla/stringzilla.hpp REQUIRED)
 
 # Fetch zerialize for binary format deserialization
 include(FetchContent)
@@ -81,6 +86,9 @@ target_sources(nats_asio INTERFACE
 target_include_directories(nats_asio 
     INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CONCURRENTQUEUE_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${GTL_INCLUDE_DIR}>
+        $<BUILD_INTERFACE:${STRINGZILLA_INCLUDE_DIR}>
         $<INSTALL_INTERFACE:include>
 )
 
@@ -91,6 +99,8 @@ target_link_libraries(nats_asio
         simdjson::simdjson
         spdlog::spdlog
         asio::asio
+        magic_enum::magic_enum
+        zstd::libzstd
         OpenSSL::SSL
         ZLIB::ZLIB
         libzip::zip
@@ -103,8 +113,6 @@ if(NATS_ASIO_BUILD_SAMPLES)
     find_package(cxxopts CONFIG REQUIRED)
     find_package(mimalloc CONFIG REQUIRED)
     find_package(simdjson CONFIG REQUIRED)
-    find_package(zstd CONFIG REQUIRED)
-
     add_executable(nats_tool samples/nats_tool.cpp)
     target_link_libraries(nats_tool
         PRIVATE
