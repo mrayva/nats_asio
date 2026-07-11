@@ -54,8 +54,7 @@ set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" F
 FetchContent_Declare(
     zerialize
     GIT_REPOSITORY https://github.com/colinator/zerialize.git
-    GIT_TAG        main
-    GIT_SHALLOW    TRUE
+    GIT_TAG        aedaaf2e585dbc0a7f239bca33fd2a6595ed47df
 )
 FetchContent_MakeAvailable(zerialize)
 
