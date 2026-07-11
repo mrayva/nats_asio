@@ -817,10 +817,28 @@ int main(int argc, char* argv[]) {
         if (m == mode::publisher) {
             bool use_batch_pub = result.count("batch_pub") > 0;
             bool use_jetstream = result.count("jetstream") > 0;
+            int js_timeout_ms = result.count("js_timeout") ? result["js_timeout"].as<int>() : 5000;
+            int js_window_size = result.count("js_window") ? result["js_window"].as<int>() : 1000;
+            int js_max_retries = result.count("js_max_retries") ? result["js_max_retries"].as<int>() : 3;
 
             if (use_batch_pub && use_jetstream && result.count("no_ack") == 0) {
                 console->error("--batch_pub with --jetstream requires --no_ack (fire-and-forget mode)");
                 return 1;
+            }
+
+            if (use_jetstream) {
+                if (js_timeout_ms <= 0) {
+                    console->error("--js_timeout must be > 0");
+                    return 1;
+                }
+                if (js_window_size <= 0) {
+                    console->error("--js_window must be > 0");
+                    return 1;
+                }
+                if (js_max_retries < 0) {
+                    console->error("--js_max_retries must be >= 0");
+                    return 1;
+                }
             }
 
             if (use_batch_pub) {
@@ -890,10 +908,7 @@ int main(int argc, char* argv[]) {
                         pub_connections.push_back(c);
                     }
                 }
-                int js_timeout_ms = result.count("js_timeout") ? result["js_timeout"].as<int>() : 5000;
                 bool wait_for_ack = result.count("no_ack") == 0;  // default: wait for ack
-                int js_window_size = result.count("js_window") ? result["js_window"].as<int>() : 1000;
-                int js_max_retries = result.count("js_max_retries") ? result["js_max_retries"].as<int>() : 3;
                 std::string js_stream = result.count("stream") ? result["stream"].as<std::string>() : "default";
                 bool js_create_stream = result.count("create_stream") > 0;
                 pub_ptr = std::make_shared<publisher>(ioc, console, pub_connections, topic, stats_interval,
