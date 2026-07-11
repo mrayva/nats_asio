@@ -87,6 +87,10 @@ public:
         asio::co_spawn(m_strand, read_and_publish(), asio::detached);
     }
 
+    [[nodiscard]] bool failed() const noexcept {
+        return m_failed.load(std::memory_order_acquire);
+    }
+
     asio::awaitable<void> read_and_publish() {
         // Wait until at least one connection is ready
         while (!has_connected_connection()) {
@@ -99,6 +103,7 @@ public:
             auto s = co_await init_js_ack_pipeline();
             if (s.failed()) {
                 m_log->error("Failed to initialize JetStream ACK pipeline: {}", s.error());
+                mark_failed();
                 m_ioc.stop();
                 co_return;
             }
@@ -117,6 +122,7 @@ public:
 
             if (!stream_ok) {
                 m_log->error("Failed to ensure stream '{}' - aborting publish", stream_name);
+                mark_failed();
                 m_ioc.stop();
                 co_return;
             }
@@ -143,6 +149,7 @@ public:
             m_http_reader = std::make_unique<async_http_reader>(m_ioc, m_src_cfg, m_log);
             if (!co_await m_http_reader->init()) {
                 m_log->error("Failed to connect to HTTP source: {}", m_src_cfg.http_url);
+                mark_failed();
                 m_ioc.stop();
                 co_return;
             }
@@ -153,6 +160,7 @@ public:
 
                 if (error) {
                     m_log->error("HTTP read error");
+                    mark_failed();
                     break;
                 }
 
@@ -179,6 +187,7 @@ public:
 
             if (!m_multi_file_reader->init()) {
                 m_log->error("Failed to initialize multi-file reader");
+                mark_failed();
                 m_ioc.stop();
                 co_return;
             }
@@ -191,6 +200,7 @@ public:
 
                 if (error) {
                     m_log->error("Multi-file read error");
+                    mark_failed();
                     break;
                 }
 
@@ -213,6 +223,7 @@ public:
             // Initialize input reader (file/stdin)
             if (!m_input_reader.init()) {
                 m_log->error("Failed to initialize input reader");
+                mark_failed();
                 m_ioc.stop();
                 co_return;
             }
@@ -223,6 +234,7 @@ public:
 
                 if (error) {
                     m_log->error("Input read error");
+                    mark_failed();
                     break;
                 }
 
@@ -265,6 +277,9 @@ public:
                         m_ack_success_total.load(std::memory_order_relaxed),
                         m_ack_failures.load(std::memory_order_relaxed),
                         m_ack_retries.load(std::memory_order_relaxed));
+            if (m_ack_failures.load(std::memory_order_relaxed) != 0) {
+                mark_failed();
+            }
         }
 
         // Ensure queued writes are flushed before shutdown in no-ack JS mode.
@@ -273,6 +288,7 @@ public:
                 auto s = co_await conn->flush();
                 if (s.failed()) {
                     m_log->warn("flush failed during shutdown: {}", s.error());
+                    mark_failed();
                 }
             }
         }
@@ -283,6 +299,10 @@ public:
     }
 
 private:
+    void mark_failed() noexcept {
+        m_failed.store(true, std::memory_order_release);
+    }
+
     // Replace {{Count}} placeholder with message number
     std::string apply_count_template(const std::string& tpl, std::size_t count) {
         std::string result = tpl;
@@ -317,6 +337,7 @@ private:
         } else if (m_input_cfg.format == input_format::csv) {
             if (m_input_cfg.csv_headers.empty()) {
                 m_log->error("CSV format requires --csv_headers");
+                mark_failed();
                 co_return;
             }
 
@@ -405,6 +426,7 @@ private:
 
             if (s.failed()) {
                 m_log->error("publish failed: {}", s.error());
+                mark_failed();
             } else {
                 m_counter++;
             }
@@ -471,6 +493,7 @@ private:
                         m_ack_failures.fetch_add(1, std::memory_order_relaxed);
                     } else {
                         m_log->error("publish failed: {}", s.error());
+                        mark_failed();
                     }
                 } else {
                     m_counter++;
@@ -802,6 +825,7 @@ private:
     std::string m_js_stream;
     bool m_js_create_stream;
     int m_js_max_retries;
+    std::atomic<bool> m_failed{false};
     std::atomic<uint64_t> m_ack_failures{0};
     std::atomic<uint64_t> m_ack_retries{0};
     std::atomic<uint64_t> m_ack_success_total{0};

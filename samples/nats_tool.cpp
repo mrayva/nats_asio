@@ -124,6 +124,7 @@ std::string read_file(const std::shared_ptr<spdlog::logger>& console, const std:
 }
 
 int main(int argc, char* argv[]) {
+    int exit_status = 0;
     try {
         cxxopts::Options options(argv[0], " - filters command line options");
         nats_asio::connect_config conf;
@@ -1015,6 +1016,8 @@ int main(int argc, char* argv[]) {
             ioc.run();
         }
 
+        exit_status = pub_ptr && pub_ptr->failed() ? 1 : 0;
+
         // Explicitly release mode handlers before tearing down publisher shard io_contexts.
         // This guarantees connection/socket destruction happens while shard reactors are alive.
         pub_ptr.reset();
@@ -1057,5 +1060,5 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    return 0;
+    return exit_status;
 }
