@@ -143,6 +143,14 @@ if(NATS_ASIO_BUILD_TESTS)
     )
     
     add_test(NAME parser_test COMMAND parser_test)
+
+    if(TARGET nats_tool)
+        add_test(
+            NAME nats_tool_cli_validation
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/nats_tool_cli_validation.sh
+                    $<TARGET_FILE:nats_tool>
+        )
+    endif()
 endif()
 
 # Installation (same as before)
