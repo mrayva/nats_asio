@@ -2140,6 +2140,16 @@ public:
     virtual asio::awaitable<status> drain(
         std::chrono::milliseconds timeout = std::chrono::milliseconds(30000)) override {
 
+        if (!m_strand.running_in_this_thread()) {
+            auto self = this->shared_from_this();
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [self, timeout]() -> asio::awaitable<status> {
+                    co_return co_await self->drain(timeout);
+                },
+                asio::use_awaitable);
+        }
+
         if (!m_is_connected) {
             co_return status(error_code::not_connected);
         }
@@ -2159,7 +2169,26 @@ public:
             }
         }
 
-        // 2. Unsubscribe all subscriptions
+        // 2. Wait for outstanding JetStream publish acknowledgments while the
+        // ACK router subscription is still active.
+        while (!m_js_ack_waiters.empty()) {
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                m_draining.store(false, std::memory_order_release);
+                co_return status(error_code::timeout, "drain timeout waiting for acknowledgments");
+            }
+
+            timer.expires_after(std::min(
+                std::chrono::milliseconds(5),
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+            auto [wait_ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+            if (wait_ec && wait_ec != asio::error::operation_aborted) {
+                m_draining.store(false, std::memory_order_release);
+                co_return status(wait_ec.message());
+            }
+        }
+
+        // 3. Unsubscribe all subscriptions.
         std::vector<isubscription_sptr> subs_to_remove;
         {
             std::lock_guard<std::mutex> lock(m_subs_mutex);
@@ -2174,16 +2203,24 @@ public:
                 m_draining.store(false, std::memory_order_release);
                 co_return status(error_code::timeout, "drain timeout during unsubscribe");
             }
-            co_await unsubscribe_impl(sub);
+            auto unsubscribe_status = co_await unsubscribe_impl(sub);
+            if (unsubscribe_status.failed()) {
+                m_draining.store(false, std::memory_order_release);
+                co_return unsubscribe_status;
+            }
         }
 
-        // 3. Final flush to ensure all unsub commands are sent
+        // 4. Final flush to ensure all unsubscribe commands are sent.
         if (!m_write_queue.empty()) {
-            co_await flush();
+            auto flush_status = co_await flush();
+            if (flush_status.failed()) {
+                m_draining.store(false, std::memory_order_release);
+                co_return flush_status;
+            }
         }
 
-        // 4. Stop the connection
-        m_stop_flag.store(true, std::memory_order_release);
+        // 5. Cancel pending I/O and close the socket before reporting success.
+        stop_on_strand();
 
         m_draining.store(false, std::memory_order_release);
         co_return status();
@@ -3130,6 +3167,7 @@ public:
 private:
     void stop_on_strand() noexcept {
         m_stop_flag.store(true, std::memory_order_release);
+        m_is_connected.store(false, std::memory_order_release);
         asio::error_code ec;
         m_reconnect_timer.cancel(ec);
         m_ping_timer.cancel(ec);

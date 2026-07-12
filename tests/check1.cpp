@@ -441,3 +441,75 @@ TEST(connection_protocol, malformed_payload_terminator_disconnects) {
     expect_malformed_frame_disconnects(
         "MSG subject 1 3\r\nabcXX", "invalid message payload terminator");
 }
+
+TEST(connection_lifecycle, drain_closes_connection_from_outside_strand) {
+    asio::io_context server_ioc;
+    asio::ip::tcp::acceptor acceptor(
+        server_ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    const auto port = acceptor.local_endpoint().port();
+    std::atomic<bool> server_observed_close{false};
+
+    std::thread server([&] {
+        asio::error_code ec;
+        asio::ip::tcp::socket socket(server_ioc);
+        acceptor.accept(socket, ec);
+        if (ec) {
+            return;
+        }
+        acceptor.close(ec);
+
+        const std::string info = "INFO {\"max_payload\":1048576}\r\n";
+        asio::write(socket, asio::buffer(info), ec);
+        asio::streambuf connect_buf;
+        asio::read_until(socket, connect_buf, "\r\n", ec);
+        if (ec) {
+            return;
+        }
+
+        std::array<char, 1> byte{};
+        socket.read_some(asio::buffer(byte), ec);
+        server_observed_close.store(
+            ec == asio::error::eof || ec == asio::error::connection_reset,
+            std::memory_order_relaxed);
+    });
+
+    asio::io_context client_ioc;
+    std::atomic<bool> connected{false};
+    std::atomic<bool> drain_succeeded{false};
+    auto conn = create_connection(
+        client_ioc,
+        [&](iconnection&) -> asio::awaitable<void> {
+            connected.store(true, std::memory_order_release);
+            co_return;
+        },
+        [](iconnection&) -> asio::awaitable<void> { co_return; },
+        [](iconnection&, string_view) -> asio::awaitable<void> { co_return; },
+        std::nullopt);
+
+    connect_config config;
+    config.address = "127.0.0.1";
+    config.port = port;
+    conn->start(config);
+
+    asio::co_spawn(
+        client_ioc,
+        [&]() -> asio::awaitable<void> {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            while (!connected.load(std::memory_order_acquire)) {
+                timer.expires_after(std::chrono::milliseconds(1));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+
+            auto result = co_await conn->drain(std::chrono::milliseconds(500));
+            drain_succeeded.store(result.ok(), std::memory_order_release);
+            co_return;
+        },
+        asio::detached);
+
+    client_ioc.run();
+    server.join();
+
+    EXPECT_TRUE(drain_succeeded.load(std::memory_order_acquire));
+    EXPECT_TRUE(server_observed_close.load(std::memory_order_relaxed));
+    EXPECT_FALSE(conn->is_connected());
+}
