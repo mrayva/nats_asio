@@ -139,6 +139,42 @@ TEST(http_reader, parse_url_invalid_protocol) {
     EXPECT_FALSE(reader.parse_url("ftp://example.com/data", protocol, host, port, path));
 }
 
+TEST(http_reader, parse_url_query_without_path) {
+    asio::io_context ioc;
+    input_source_config cfg;
+    async_http_reader reader(ioc, cfg, spdlog::default_logger());
+
+    std::string protocol, host, port, path;
+    ASSERT_TRUE(reader.parse_url("http://example.com?limit=10#ignored", protocol, host, port, path));
+    EXPECT_EQ(host, "example.com");
+    EXPECT_EQ(port, "80");
+    EXPECT_EQ(path, "/?limit=10");
+}
+
+TEST(http_reader, parse_url_ipv6_with_port) {
+    asio::io_context ioc;
+    input_source_config cfg;
+    async_http_reader reader(ioc, cfg, spdlog::default_logger());
+
+    std::string protocol, host, port, path;
+    ASSERT_TRUE(reader.parse_url("http://[::1]:8080/events", protocol, host, port, path));
+    EXPECT_EQ(host, "::1");
+    EXPECT_EQ(port, "8080");
+    EXPECT_EQ(path, "/events");
+}
+
+TEST(http_reader, parse_url_rejects_invalid_authority) {
+    asio::io_context ioc;
+    input_source_config cfg;
+    async_http_reader reader(ioc, cfg, spdlog::default_logger());
+
+    std::string protocol, host, port, path;
+    EXPECT_FALSE(reader.parse_url("http://", protocol, host, port, path));
+    EXPECT_FALSE(reader.parse_url("http://example.com:", protocol, host, port, path));
+    EXPECT_FALSE(reader.parse_url("http://example.com:70000", protocol, host, port, path));
+    EXPECT_FALSE(reader.parse_url("http://::1/events", protocol, host, port, path));
+}
+
 TEST(compression_detection, detects_magic_bytes) {
     const char gzip_magic[4] = {static_cast<char>(0x1f), static_cast<char>(0x8b), 0x08, 0x00};
     const char zstd_magic[4] = {static_cast<char>(0x28), static_cast<char>(0xb5),

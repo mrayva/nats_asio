@@ -107,33 +107,91 @@ public:
     // Parse URL into components
     bool parse_url(const std::string& url, std::string& protocol, std::string& host,
                    std::string& port, std::string& path) {
-        std::string u = url;
-        if (u.find("https://") == 0) {
+        std::string_view remainder = url;
+        if (remainder.starts_with("https://")) {
             protocol = "https";
-            u = u.substr(8);
-        } else if (u.find("http://") == 0) {
+            remainder.remove_prefix(8);
+        } else if (remainder.starts_with("http://")) {
             protocol = "http";
-            u = u.substr(7);
+            remainder.remove_prefix(7);
         } else {
             m_log->error("Invalid URL protocol: {}", url);
             return false;
         }
 
-        auto path_pos = u.find('/');
-        if (path_pos != std::string::npos) {
-            path = u.substr(path_pos);
-            u = u.substr(0, path_pos);
-        } else {
+        const auto resource_pos = remainder.find_first_of("/?#");
+        const std::string_view authority = remainder.substr(0, resource_pos);
+        std::string_view resource = resource_pos == std::string_view::npos
+            ? std::string_view{}
+            : remainder.substr(resource_pos);
+        const auto fragment_pos = resource.find('#');
+        if (fragment_pos != std::string_view::npos) {
+            resource = resource.substr(0, fragment_pos);
+        }
+        if (resource.empty()) {
             path = "/";
+        } else if (resource.front() == '?') {
+            path = "/" + std::string(resource);
+        } else {
+            path = resource;
         }
 
-        auto port_pos = u.find(':');
-        if (port_pos != std::string::npos) {
-            host = u.substr(0, port_pos);
-            port = u.substr(port_pos + 1);
+        if (authority.empty() || authority.find('@') != std::string_view::npos) {
+            m_log->error("Invalid HTTP URL authority: {}", url);
+            return false;
+        }
+
+        std::string_view port_view;
+        if (authority.front() == '[') {
+            const auto bracket = authority.find(']');
+            if (bracket == std::string_view::npos || bracket == 1) {
+                m_log->error("Invalid IPv6 URL authority: {}", url);
+                return false;
+            }
+            host = authority.substr(1, bracket - 1);
+            const auto suffix = authority.substr(bracket + 1);
+            if (!suffix.empty()) {
+                if (suffix.front() != ':') {
+                    m_log->error("Invalid IPv6 URL authority: {}", url);
+                    return false;
+                }
+                port_view = suffix.substr(1);
+            }
         } else {
-            host = u;
-            port = (protocol == "https") ? "443" : "80";
+            const auto colon = authority.find(':');
+            if (colon != std::string_view::npos) {
+                if (authority.find(':', colon + 1) != std::string_view::npos) {
+                    m_log->error("IPv6 URL hosts must be enclosed in brackets: {}", url);
+                    return false;
+                }
+                host = authority.substr(0, colon);
+                port_view = authority.substr(colon + 1);
+            } else {
+                host = authority;
+            }
+        }
+
+        if (host.empty()) {
+            m_log->error("HTTP URL host is empty: {}", url);
+            return false;
+        }
+
+        if (port_view.empty()) {
+            if (authority.back() == ':') {
+                m_log->error("HTTP URL port is empty: {}", url);
+                return false;
+            }
+            port = protocol == "https" ? "443" : "80";
+        } else {
+            unsigned int port_number = 0;
+            const auto [ptr, ec] = std::from_chars(
+                port_view.data(), port_view.data() + port_view.size(), port_number);
+            if (ec != std::errc{} || ptr != port_view.data() + port_view.size() ||
+                port_number == 0 || port_number > 65535) {
+                m_log->error("Invalid HTTP URL port: {}", url);
+                return false;
+            }
+            port = port_view;
         }
 
         return true;
@@ -146,7 +204,11 @@ public:
             co_return false;
         }
 
-        m_host = host;
+        m_host = host.find(':') == std::string::npos ? host : "[" + host + "]";
+        if ((protocol == "http" && port != "80") ||
+            (protocol == "https" && port != "443")) {
+            m_host += ":" + port;
+        }
         m_path = path;
         m_use_ssl = (protocol == "https");
 
