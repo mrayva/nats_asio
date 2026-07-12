@@ -465,9 +465,20 @@ private:
         return status_code;
     }
 
-    static bool has_chunked_transfer_encoding(const std::string& headers) {
+    static bool is_http_token(std::string_view value) {
+        if (value.empty()) return false;
+        for (unsigned char c : value) {
+            if (std::isalnum(c)) continue;
+            constexpr std::string_view symbols = "!#$%&'*+-.^_`|~";
+            if (symbols.find(static_cast<char>(c)) == std::string_view::npos) return false;
+        }
+        return true;
+    }
+
+    static std::optional<bool> parse_chunked_transfer_encoding(const std::string& headers) {
         std::istringstream lines(headers);
         std::string line;
+        std::vector<std::string> encodings;
 
         bool is_first_line = true;
         while (std::getline(lines, line)) {
@@ -489,13 +500,44 @@ private:
                 continue;
             }
 
-            std::string value = to_lower_copy(trim_copy(std::string_view(line.data() + colon_pos + 1, line.size() - colon_pos - 1)));
-            if (value.find("chunked") != std::string::npos) {
-                return true;
+            std::string_view value(line.data() + colon_pos + 1, line.size() - colon_pos - 1);
+            while (!value.empty()) {
+                const auto comma = value.find(',');
+                std::string encoding = to_lower_copy(trim_copy(value.substr(0, comma)));
+                if (!is_http_token(encoding)) return std::nullopt;
+                encodings.push_back(std::move(encoding));
+                if (comma == std::string_view::npos) break;
+                value.remove_prefix(comma + 1);
+                if (value.empty()) return std::nullopt;
             }
         }
 
-        return false;
+        if (encodings.empty()) return false;
+        if (encodings.size() != 1 || encodings.front() != "chunked") {
+            return std::nullopt;
+        }
+        return true;
+    }
+
+    static bool valid_chunk_trailers(std::string_view trailers) {
+        while (!trailers.empty()) {
+            const auto line_end = trailers.find("\r\n");
+            const std::string_view line = trailers.substr(0, line_end);
+            const auto colon = line.find(':');
+            if (colon == std::string_view::npos || !is_http_token(line.substr(0, colon))) {
+                return false;
+            }
+            const std::string name = to_lower_copy(line.substr(0, colon));
+            if (name == "content-length" || name == "transfer-encoding" || name == "host") {
+                return false;
+            }
+            for (unsigned char c : line.substr(colon + 1)) {
+                if ((c < 0x20 && c != '\t') || c == 0x7f) return false;
+            }
+            if (line_end == std::string_view::npos) break;
+            trailers.remove_prefix(line_end + 2);
+        }
+        return true;
     }
 
     static std::optional<size_t> parse_content_length(const std::string& headers,
@@ -748,6 +790,11 @@ private:
                         return false;
                     }
 
+                    if (!valid_chunk_trailers(
+                            std::string_view(m_chunk_raw_buffer).substr(0, trailer_end))) {
+                        return false;
+                    }
+
                     m_chunk_raw_buffer.erase(0, trailer_end + 4);
                     m_chunk_stream_complete = true;
                     return true;
@@ -820,7 +867,12 @@ private:
             co_return false;
         }
 
-        m_chunked = has_chunked_transfer_encoding(headers);
+        auto chunked = parse_chunked_transfer_encoding(headers);
+        if (!chunked) {
+            m_log->error("Invalid or unsupported HTTP Transfer-Encoding header");
+            co_return false;
+        }
+        m_chunked = *chunked;
         bool content_length_valid = false;
         auto content_length = parse_content_length(headers, content_length_valid);
         if (!content_length_valid) {

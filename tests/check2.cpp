@@ -300,6 +300,40 @@ TEST(http_reader, completes_at_declared_content_length) {
     EXPECT_FALSE(std::get<2>(result.line));
 }
 
+TEST(http_reader, rejects_invalid_transfer_encoding_tokens) {
+    input_source_config config;
+    auto substring = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: xchunked\r\n\r\nbody", config);
+    EXPECT_FALSE(substring.initialized);
+
+    auto unsupported = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", config);
+    EXPECT_FALSE(unsupported.initialized);
+}
+
+TEST(http_reader, validates_chunk_trailers) {
+    input_source_config config;
+    auto malformed = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "2\r\na\n\r\n0\r\ninvalid\r\n\r\n",
+        config);
+    EXPECT_FALSE(malformed.initialized);
+
+    auto forbidden = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "2\r\na\n\r\n0\r\nContent-Length: 2\r\n\r\n",
+        config);
+    EXPECT_FALSE(forbidden.initialized);
+
+    auto valid = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "2\r\na\n\r\n0\r\nX-Checksum: ok\r\n\r\n",
+        config);
+    ASSERT_TRUE(valid.initialized);
+    EXPECT_EQ(std::get<0>(valid.line), "a");
+    EXPECT_FALSE(std::get<2>(valid.line));
+}
+
 TEST(compression_detection, detects_magic_bytes) {
     const char gzip_magic[4] = {static_cast<char>(0x1f), static_cast<char>(0x8b), 0x08, 0x00};
     const char zstd_magic[4] = {static_cast<char>(0x28), static_cast<char>(0xb5),
