@@ -278,7 +278,8 @@ int main(int argc, char* argv[]) {
         } else if (mode == pub_mode) {
             m = mode::publisher;
             if (num_connections < 1) {
-                num_connections = 1;
+                console->error("--connections must be > 0");
+                return 1;
             }
         } else if (mode == req_mode) {
             m = mode::requester;
@@ -822,6 +823,11 @@ int main(int argc, char* argv[]) {
             int js_window_size = result.count("js_window") ? result["js_window"].as<int>() : 1000;
             int js_max_retries = result.count("js_max_retries") ? result["js_max_retries"].as<int>() : 3;
 
+            if (max_in_flight <= 0) {
+                console->error("--max_in_flight must be > 0");
+                return 1;
+            }
+
             if (use_batch_pub && use_jetstream && result.count("no_ack") == 0) {
                 console->error("--batch_pub with --jetstream requires --no_ack (fire-and-forget mode)");
                 return 1;
@@ -847,6 +853,18 @@ int main(int argc, char* argv[]) {
                 int batch_size_val = result.count("batch_size") ? result["batch_size"].as<int>() : 65536;
                 int max_queue_val = result.count("max_queue") ? result["max_queue"].as<int>() : 100;
                 int flush_timeout_val = result.count("flush_timeout") ? result["flush_timeout"].as<int>() : 0;
+                if (batch_size_val <= 0) {
+                    console->error("--batch_size must be > 0");
+                    return 1;
+                }
+                if (max_queue_val < 0) {
+                    console->error("--max_queue must be >= 0");
+                    return 1;
+                }
+                if (flush_timeout_val < 0) {
+                    console->error("--flush_timeout must be >= 0");
+                    return 1;
+                }
                 console->info("Using multi-threaded batch publisher: {} writers, batch_size={}, max_queue={}",
                              num_connections, batch_size_val, max_queue_val);
                 batch_pub_ptr = std::make_shared<batch_publisher>(console, conf, opt_ssl_conf, topic,
