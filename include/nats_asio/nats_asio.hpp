@@ -2234,7 +2234,8 @@ public:
             co_return status(error_code::operation_failed, "circuit breaker is open");
         }
 
-        if (m_max_payload > 0 && payload.size() > m_max_payload) {
+        const auto max_payload = m_max_payload.load(std::memory_order_acquire);
+        if (max_payload > 0 && payload.size() > max_payload) {
             co_return status(error_code::message_too_large);
         }
 
@@ -2428,7 +2429,8 @@ public:
             return status(error_code::connection_closed, "connection is draining");
         }
 
-        if (m_max_payload > 0 && payload.size() > m_max_payload) {
+        const auto max_payload = m_max_payload.load(std::memory_order_acquire);
+        if (max_payload > 0 && payload.size() > max_payload) {
             return status(error_code::message_too_large);
         }
 
@@ -2777,7 +2779,8 @@ public:
         std::size_t hdr_len = hdr_data->size();
         std::size_t total_len = hdr_len + payload.size();
 
-        if (m_max_payload > 0 && total_len > m_max_payload) {
+        const auto max_payload = m_max_payload.load(std::memory_order_acquire);
+        if (max_payload > 0 && total_len > max_payload) {
             co_return status(error_code::message_too_large);
         }
 
@@ -2806,7 +2809,8 @@ public:
         std::size_t hdr_len = hdr_data->size();
         std::size_t total_len = hdr_len + payload.size();
 
-        if (m_max_payload > 0 && total_len > m_max_payload) {
+        const auto max_payload = m_max_payload.load(std::memory_order_acquire);
+        if (max_payload > 0 && total_len > max_payload) {
             co_return status(error_code::message_too_large);
         }
 
@@ -4404,7 +4408,10 @@ private:
         fast_json parser;
         if (parser.parse(info)) {
             if (parser.contains("max_payload")) {
-                m_max_payload = parser.get_uint("max_payload", m_max_payload);
+                const auto current = m_max_payload.load(std::memory_order_relaxed);
+                const auto advertised = parser.get_uint("max_payload", current);
+                m_max_payload.store(static_cast<std::size_t>(advertised),
+                                    std::memory_order_release);
             }
         } else {
             std::string err_msg = fmt::format("failed to parse INFO from server: {}", parser.error());
@@ -4611,7 +4618,8 @@ private:
 
             std::string header;
             std::istream is(&m_buf);
-            auto s = co_await protocol_parser::parse_header(header, is, *this, m_max_payload);
+            auto s = co_await protocol_parser::parse_header(
+                header, is, *this, m_max_payload.load(std::memory_order_acquire));
             if (s.failed()) {
                 co_return s;
             }
@@ -4754,7 +4762,8 @@ private:
 
                 std::istream is(&m_buf);
                 m_protocol_error = false;
-                auto s = co_await protocol_parser::parse_header(header, is, *this, m_max_payload);
+                auto s = co_await protocol_parser::parse_header(
+                    header, is, *this, m_max_payload.load(std::memory_order_acquire));
                 if (s.failed() || m_protocol_error) {
                     if (m_error_cb) {
                         auto message = s.failed()
@@ -4976,7 +4985,7 @@ private:
     }
 
     std::atomic<uint64_t> m_sid;
-    std::size_t m_max_payload;
+    std::atomic<std::size_t> m_max_payload;
     aio& m_io;
     asio::strand<aio::executor_type> m_strand;
     asio::steady_timer m_reconnect_timer;
