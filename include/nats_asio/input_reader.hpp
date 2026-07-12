@@ -278,6 +278,11 @@ private:
                                                  : m_config.input_max_line_size;
     }
 
+    std::chrono::milliseconds poll_interval() const {
+        return std::chrono::milliseconds(
+            m_config.poll_interval_ms > 0 ? m_config.poll_interval_ms : 100);
+    }
+
     // Read with follow mode (tail -f behavior)
     asio::awaitable<std::tuple<std::string, bool, bool>> read_line_follow_mode(
         char* read_buf, size_t buf_size) {
@@ -360,7 +365,7 @@ private:
             }
 
             // No new data, wait and poll again
-            timer.expires_after(std::chrono::milliseconds(m_config.poll_interval_ms));
+            timer.expires_after(poll_interval());
             auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
             if (ec) {
                 co_return std::make_tuple("", true, false);

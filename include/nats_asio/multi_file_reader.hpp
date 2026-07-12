@@ -68,7 +68,7 @@ public:
                             std::shared_ptr<spdlog::logger> log,
                             size_t max_line_size = 16 * 1024 * 1024)
         : m_ioc(ioc), m_patterns(std::move(patterns)), m_follow(follow),
-          m_poll_interval_ms(poll_interval_ms), m_max_line_size(
+          m_poll_interval_ms(poll_interval_ms > 0 ? poll_interval_ms : 100), m_max_line_size(
               max_line_size == 0 ? 16 * 1024 * 1024 : max_line_size),
           m_log(std::move(log)) {}
 

@@ -571,6 +571,10 @@ int main(int argc, char* argv[]) {
         src_cfg.follow = result.count("follow") > 0;
         if (result.count("poll_interval")) {
             src_cfg.poll_interval_ms = result["poll_interval"].as<int>();
+            if (src_cfg.poll_interval_ms <= 0) {
+                console->error("--poll_interval must be greater than 0");
+                return 1;
+            }
         }
         if (result.count("max_line_size")) {
             src_cfg.input_max_line_size = result["max_line_size"].as<std::size_t>();

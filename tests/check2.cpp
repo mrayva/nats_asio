@@ -260,7 +260,7 @@ TEST(multi_file_reader, preserves_extracted_zip_files_across_rescans) {
     ASSERT_TRUE(create_test_zip(archive_path, "line\n"));
 
     asio::io_context ioc;
-    async_multi_file_reader reader(ioc, {archive_path.string()}, true, 0,
+    async_multi_file_reader reader(ioc, {archive_path.string()}, true, 1,
                                    spdlog::default_logger());
     ASSERT_TRUE(reader.init());
     ASSERT_EQ(reader.file_count(), 1u);
