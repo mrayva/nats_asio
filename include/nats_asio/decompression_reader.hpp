@@ -206,6 +206,11 @@ private:
                     return {0, true, true};
                 }
                 if (bytes == 0) {
+                    if (m_gzip_member_complete) {
+                        m_eof = true;
+                        ssize_t decompressed = buffer_size - m_zstream->avail_out;
+                        return {decompressed, true, false};
+                    }
                     // EOF on input
                     int ret = inflate(m_zstream.get(), Z_FINISH);
                     if (ret != Z_STREAM_END && ret != Z_OK) {
@@ -219,13 +224,25 @@ private:
 
                 m_zstream->avail_in = bytes;
                 m_zstream->next_in = reinterpret_cast<unsigned char*>(m_compressed_buffer.data());
+                m_gzip_member_complete = false;
             }
 
             int ret = inflate(m_zstream.get(), Z_NO_FLUSH);
             if (ret == Z_STREAM_END) {
-                m_eof = true;
-                ssize_t decompressed = buffer_size - m_zstream->avail_out;
-                return {decompressed, true, false};
+                auto* next_in = m_zstream->next_in;
+                const auto avail_in = m_zstream->avail_in;
+                ret = inflateReset2(m_zstream.get(), 15 + 32);
+                if (ret != Z_OK) {
+                    m_log->error("gzip decompressor reset failed: {}", ret);
+                    return {0, true, true};
+                }
+                m_zstream->next_in = next_in;
+                m_zstream->avail_in = avail_in;
+                m_gzip_member_complete = true;
+                if (avail_in > 0) {
+                    m_gzip_member_complete = false;
+                }
+                continue;
             }
             if (ret != Z_OK) {
                 m_log->error("gzip decompression error: {}", ret);
@@ -297,6 +314,7 @@ private:
 
     // gzip state
     std::unique_ptr<z_stream> m_zstream;
+    bool m_gzip_member_complete = false;
 
     // zstd state
     ZSTD_DStream* m_zstd_dctx = nullptr;

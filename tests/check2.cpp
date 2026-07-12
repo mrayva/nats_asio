@@ -20,6 +20,25 @@ struct file_closer {
 };
 using temp_file = std::unique_ptr<FILE, file_closer>;
 
+std::vector<char> gzip_compress(std::string_view input) {
+    z_stream stream{};
+    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8,
+                     Z_DEFAULT_STRATEGY) != Z_OK) {
+        return {};
+    }
+    std::vector<char> output(compressBound(input.size()) + 64);
+    stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
+    stream.avail_in = static_cast<uInt>(input.size());
+    stream.next_out = reinterpret_cast<Bytef*>(output.data());
+    stream.avail_out = static_cast<uInt>(output.size());
+    const int result = deflate(&stream, Z_FINISH);
+    const size_t output_size = stream.total_out;
+    deflateEnd(&stream);
+    if (result != Z_STREAM_END) return {};
+    output.resize(output_size);
+    return output;
+}
+
 struct http_read_result {
     bool initialized = false;
     std::tuple<std::string, bool, bool> line;
@@ -123,6 +142,69 @@ TEST(decompression_reader, reads_concatenated_zstd_frames) {
     ASSERT_FALSE(error);
     EXPECT_TRUE(eof);
     EXPECT_EQ(std::string(output.data(), static_cast<size_t>(bytes_read)), first + second);
+}
+
+TEST(decompression_reader, reads_concatenated_gzip_members) {
+    const std::string first = "first gzip member\n";
+    const std::string second = "second gzip member\n";
+    auto compressed = gzip_compress(first);
+    auto second_member = gzip_compress(second);
+    ASSERT_FALSE(compressed.empty());
+    ASSERT_FALSE(second_member.empty());
+    compressed.insert(compressed.end(), second_member.begin(), second_member.end());
+
+    temp_file file(std::tmpfile());
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(std::fwrite(compressed.data(), 1, compressed.size(), file.get()), compressed.size());
+    std::rewind(file.get());
+
+    decompression_reader reader(fileno(file.get()), compression_format::gzip,
+                                spdlog::default_logger());
+    std::vector<char> output(1024);
+    auto [bytes_read, eof, error] = reader.read(output.data(), output.size());
+    ASSERT_FALSE(error);
+    EXPECT_TRUE(eof);
+    EXPECT_EQ(std::string(output.data(), static_cast<size_t>(bytes_read)), first + second);
+}
+
+TEST(decompression_reader, rejects_truncated_gzip_member) {
+    auto compressed = gzip_compress(std::string(4096, 'x'));
+    ASSERT_GT(compressed.size(), 1u);
+    compressed.pop_back();
+
+    temp_file file(std::tmpfile());
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(std::fwrite(compressed.data(), 1, compressed.size(), file.get()), compressed.size());
+    std::rewind(file.get());
+
+    decompression_reader reader(fileno(file.get()), compression_format::gzip,
+                                spdlog::default_logger());
+    std::vector<char> output(8192);
+    auto [bytes_read, eof, error] = reader.read(output.data(), output.size());
+    EXPECT_EQ(bytes_read, 0);
+    EXPECT_TRUE(eof);
+    EXPECT_TRUE(error);
+}
+
+TEST(decompression_reader, rejects_truncated_second_gzip_member) {
+    auto compressed = gzip_compress("complete member");
+    auto truncated = gzip_compress(std::string(4096, 'x'));
+    ASSERT_GT(truncated.size(), 1u);
+    truncated.pop_back();
+    compressed.insert(compressed.end(), truncated.begin(), truncated.end());
+
+    temp_file file(std::tmpfile());
+    ASSERT_NE(file, nullptr);
+    ASSERT_EQ(std::fwrite(compressed.data(), 1, compressed.size(), file.get()), compressed.size());
+    std::rewind(file.get());
+
+    decompression_reader reader(fileno(file.get()), compression_format::gzip,
+                                spdlog::default_logger());
+    std::vector<char> output(8192);
+    auto [bytes_read, eof, error] = reader.read(output.data(), output.size());
+    EXPECT_EQ(bytes_read, 0);
+    EXPECT_TRUE(eof);
+    EXPECT_TRUE(error);
 }
 
 TEST(zip_extractor, validates_entry_names) {
