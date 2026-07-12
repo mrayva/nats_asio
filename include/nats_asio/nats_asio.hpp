@@ -3184,19 +3184,14 @@ private:
 
     template <typename ConstBufferSequence>
     asio::awaitable<status> guarded_socket_write(const ConstBufferSequence& buffers,
-                                                 string_view op_name) {
+                                                 string_view /*op_name*/) {
         if (!m_strand.running_in_this_thread()) {
             co_return status(error_code::operation_failed,
                              "guarded_socket_write must run on strand");
         }
 
         while (m_write_in_progress) {
-            auto overlap_count = ++m_write_overlap_count;
-            if (m_error_cb && overlap_count <= m_write_overlap_log_limit) {
-                co_await m_error_cb(
-                    *this, fmt::format("socket write overlap detected: op={} overlap_count={}",
-                                       op_name, overlap_count));
-            }
+            ++m_write_contention_count;
 
             auto waiter = std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
             waiter->expires_at((std::chrono::steady_clock::time_point::max)());
@@ -5060,8 +5055,7 @@ private:
     std::atomic<bool> m_flush_running{false};
     std::atomic<bool> m_immediate_flush_running{false};
     bool m_write_in_progress{false};
-    uint64_t m_write_overlap_count{0};
-    static constexpr uint64_t m_write_overlap_log_limit{20};
+    uint64_t m_write_contention_count{0};
     std::atomic<uint64_t> m_write_ops{0};
     std::atomic<uint64_t> m_write_bytes{0};
     std::deque<std::shared_ptr<asio::steady_timer>> m_write_waiters;
