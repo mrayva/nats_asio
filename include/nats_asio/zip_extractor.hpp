@@ -27,6 +27,7 @@ SOFTWARE.
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -114,12 +115,19 @@ inline std::filesystem::path unique_zip_output_path(
     }
 }
 
+struct zip_extraction_limits {
+    uint64_t max_entries = 10'000;
+    uint64_t max_entry_bytes = 256ULL * 1024 * 1024;
+    uint64_t max_total_bytes = 1024ULL * 1024 * 1024;
+};
+
 // Extract all files from a zip archive to a temporary directory
 // Returns: vector of extracted file paths
 inline std::vector<std::string> extract_zip_to_temp(
     const std::string& zip_path,
     std::shared_ptr<spdlog::logger> log,
-    std::filesystem::path* extracted_temp_dir = nullptr) {
+    std::filesystem::path* extracted_temp_dir = nullptr,
+    zip_extraction_limits limits = {}) {
 
     std::vector<std::string> extracted_files;
 
@@ -146,7 +154,18 @@ inline std::vector<std::string> extract_zip_to_temp(
 
     // Get number of files in archive
     zip_int64_t num_entries = zip_get_num_entries(archive, 0);
+    if (num_entries < 0 || static_cast<uint64_t>(num_entries) > limits.max_entries) {
+        log->error("ZIP archive {} exceeds the {} entry limit", zip_path, limits.max_entries);
+        zip_close(archive);
+        std::error_code remove_ec;
+        std::filesystem::remove_all(*temp_dir, remove_ec);
+        if (extracted_temp_dir) extracted_temp_dir->clear();
+        return extracted_files;
+    }
     log->info("Extracting {} file(s) from zip archive: {}", num_entries, zip_path);
+
+    uint64_t total_extracted_bytes = 0;
+    bool limit_exceeded = false;
 
     // Extract each file
     for (zip_int64_t i = 0; i < num_entries; i++) {
@@ -162,6 +181,17 @@ inline std::vector<std::string> extract_zip_to_temp(
                 log->warn("Skipping ZIP entry {} with an empty name in {}", i, zip_path);
             }
             continue;
+        }
+
+        zip_stat_t entry_stat;
+        zip_stat_init(&entry_stat);
+        if (zip_stat_index(archive, i, 0, &entry_stat) == 0 &&
+            (entry_stat.valid & ZIP_STAT_SIZE) != 0 &&
+            (entry_stat.size > limits.max_entry_bytes ||
+             entry_stat.size > limits.max_total_bytes - total_extracted_bytes)) {
+            log->error("ZIP entry {} ({}) exceeds extraction limits", i, name);
+            limit_exceeded = true;
+            break;
         }
 
         // Open file in archive
@@ -185,17 +215,30 @@ inline std::vector<std::string> extract_zip_to_temp(
         char buffer[8192];
         zip_int64_t bytes_read;
         bool write_failed = false;
+        uint64_t entry_extracted_bytes = 0;
         while ((bytes_read = zip_fread(zf, buffer, sizeof(buffer))) > 0) {
+            const uint64_t chunk_size = static_cast<uint64_t>(bytes_read);
+            if (chunk_size > limits.max_entry_bytes - entry_extracted_bytes ||
+                chunk_size > limits.max_total_bytes - total_extracted_bytes) {
+                limit_exceeded = true;
+                break;
+            }
             out.write(buffer, bytes_read);
             if (!out) {
                 write_failed = true;
                 break;
             }
+            entry_extracted_bytes += chunk_size;
+            total_extracted_bytes += chunk_size;
         }
 
         zip_fclose(zf);
         out.close();
 
+        if (limit_exceeded) {
+            log->error("ZIP entry {} ({}) exceeds extraction limits", i, name);
+            break;
+        }
         if (bytes_read < 0 || write_failed) {
             log->warn("Error extracting entry {} ({}) from {}", i, name, zip_path);
             std::error_code remove_ec;
@@ -209,6 +252,9 @@ inline std::vector<std::string> extract_zip_to_temp(
 
     zip_close(archive);
 
+    if (limit_exceeded) {
+        extracted_files.clear();
+    }
     if (extracted_files.empty()) {
         std::error_code remove_ec;
         std::filesystem::remove_all(*temp_dir, remove_ec);

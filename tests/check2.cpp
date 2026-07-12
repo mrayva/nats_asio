@@ -285,6 +285,34 @@ TEST(zip_extractor, preserves_entries_after_flattened_name_collisions) {
     std::filesystem::remove_all(*source_dir);
 }
 
+TEST(zip_extractor, enforces_extraction_limits) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto archive_path = *source_dir / "limits.zip";
+    ASSERT_TRUE(create_test_zip(archive_path, {{"one.txt", "123"}, {"two.txt", "456"}}));
+
+    std::filesystem::path extraction_dir;
+    zip_extraction_limits entry_count_limit;
+    entry_count_limit.max_entries = 1;
+    EXPECT_TRUE(extract_zip_to_temp(archive_path, spdlog::default_logger(),
+                                    &extraction_dir, entry_count_limit).empty());
+    EXPECT_TRUE(extraction_dir.empty());
+
+    zip_extraction_limits entry_size_limit;
+    entry_size_limit.max_entry_bytes = 2;
+    EXPECT_TRUE(extract_zip_to_temp(archive_path, spdlog::default_logger(),
+                                    &extraction_dir, entry_size_limit).empty());
+    EXPECT_TRUE(extraction_dir.empty());
+
+    zip_extraction_limits total_size_limit;
+    total_size_limit.max_total_bytes = 5;
+    EXPECT_TRUE(extract_zip_to_temp(archive_path, spdlog::default_logger(),
+                                    &extraction_dir, total_size_limit).empty());
+    EXPECT_TRUE(extraction_dir.empty());
+
+    std::filesystem::remove_all(*source_dir);
+}
+
 TEST(multi_file_reader, preserves_extracted_zip_files_across_rescans) {
     auto source_dir = create_zip_temp_directory();
     ASSERT_TRUE(source_dir);
