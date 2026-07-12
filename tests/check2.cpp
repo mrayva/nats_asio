@@ -9,6 +9,7 @@
 #include <nats_asio/nats_asio.hpp>
 #include <nats_asio/zip_extractor.hpp>
 #include <spdlog/spdlog.h>
+#include <thread>
 #include <type_traits>
 
 using namespace nats_asio;
@@ -18,6 +19,48 @@ struct file_closer {
     void operator()(FILE* file) const noexcept { std::fclose(file); }
 };
 using temp_file = std::unique_ptr<FILE, file_closer>;
+
+struct http_read_result {
+    bool initialized = false;
+    std::tuple<std::string, bool, bool> line;
+};
+
+http_read_result read_test_http_response(std::string response, input_source_config config) {
+    asio::io_context server_ioc;
+    asio::ip::tcp::acceptor acceptor(
+        server_ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    config.http_url = "http://127.0.0.1:" +
+        std::to_string(acceptor.local_endpoint().port()) + "/";
+    config.http_method = "GET";
+    config.http_timeout_ms = 1000;
+
+    std::thread server([&] {
+        asio::ip::tcp::socket socket(server_ioc);
+        asio::error_code ec;
+        acceptor.accept(socket, ec);
+        if (ec) return;
+        asio::streambuf request;
+        asio::read_until(socket, request, "\r\n\r\n", ec);
+        if (!ec) asio::write(socket, asio::buffer(response), ec);
+        socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+    });
+
+    asio::io_context client_ioc;
+    async_http_reader reader(client_ioc, config, spdlog::default_logger());
+    http_read_result result;
+    std::exception_ptr exception;
+    asio::co_spawn(
+        client_ioc,
+        [&]() -> asio::awaitable<void> {
+            result.initialized = co_await reader.init();
+            if (result.initialized) result.line = co_await reader.read_line();
+        },
+        [&](std::exception_ptr error) { exception = error; });
+    client_ioc.run();
+    server.join();
+    if (exception) std::rethrow_exception(exception);
+    return result;
+}
 } // namespace
 
 static_assert(!std::is_copy_constructible_v<zstd_compressor>);
@@ -193,6 +236,25 @@ TEST(http_reader, parse_url_rejects_invalid_authority) {
     EXPECT_FALSE(reader.parse_url("http://example.com:", protocol, host, port, path));
     EXPECT_FALSE(reader.parse_url("http://example.com:70000", protocol, host, port, path));
     EXPECT_FALSE(reader.parse_url("http://::1/events", protocol, host, port, path));
+}
+
+TEST(http_reader, rejects_oversized_response_line) {
+    input_source_config config;
+    config.http_max_line_size = 4;
+    auto result = read_test_http_response("HTTP/1.1 200 OK\r\n\r\n12345", config);
+
+    ASSERT_TRUE(result.initialized);
+    EXPECT_TRUE(std::get<1>(result.line));
+    EXPECT_TRUE(std::get<2>(result.line));
+}
+
+TEST(http_reader, rejects_oversized_chunk_metadata) {
+    input_source_config config;
+    config.http_max_chunk_metadata_size = 4;
+    auto result = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12345", config);
+
+    EXPECT_FALSE(result.initialized);
 }
 
 TEST(compression_detection, detects_magic_bytes) {

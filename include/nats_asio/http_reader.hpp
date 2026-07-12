@@ -36,10 +36,12 @@ SOFTWARE.
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
+#include <atomic>
 #include <cctype>
 #include <charconv>
 #include <chrono>
 #include <memory>
+#include <limits>
 #include <openssl/ssl.h>
 #include <spdlog/spdlog.h>
 #include <sstream>
@@ -67,6 +69,8 @@ struct input_source_config {
     std::vector<std::pair<std::string, std::string>> http_headers;  // Custom headers
     int http_timeout_ms = 30000;        // Connection timeout
     bool http_insecure = false;         // Skip SSL verification
+    size_t http_max_line_size = 16 * 1024 * 1024;
+    size_t http_max_chunk_metadata_size = 64 * 1024;
 
     // Helper to check if using multiple file patterns
     bool is_multi_file() const {
@@ -320,6 +324,11 @@ public:
                 co_return std::make_tuple(std::move(line), false, false);
             }
 
+            if (m_buffer.size() > max_line_size()) {
+                m_log->error("HTTP response line exceeds {} bytes", max_line_size());
+                co_return std::make_tuple("", true, true);
+            }
+
             if (m_chunked && m_chunk_stream_complete) {
                 if (!m_buffer.empty()) {
                     std::string line = std::move(m_buffer);
@@ -468,6 +477,16 @@ private:
         return std::chrono::milliseconds(m_config.http_timeout_ms);
     }
 
+    size_t max_line_size() const {
+        return m_config.http_max_line_size == 0 ? 16 * 1024 * 1024
+                                                : m_config.http_max_line_size;
+    }
+
+    size_t max_chunk_metadata_size() const {
+        return m_config.http_max_chunk_metadata_size == 0 ? 64 * 1024
+                                                          : m_config.http_max_chunk_metadata_size;
+    }
+
     void cancel_pending_io() {
         m_resolver.cancel();
         if (m_socket) {
@@ -482,14 +501,14 @@ private:
 
     template <typename Op>
     asio::awaitable<std::tuple<asio::error_code, bool>> run_with_timeout(Op&& op) {
-        bool timed_out = false;
+        auto timed_out = std::make_shared<std::atomic_bool>(false);
         asio::error_code op_ec;
 
         asio::steady_timer timer(co_await asio::this_coro::executor);
         timer.expires_after(timeout_duration());
-        timer.async_wait([this, &timed_out](const asio::error_code& ec) {
+        timer.async_wait([this, timed_out](const asio::error_code& ec) {
             if (!ec) {
-                timed_out = true;
+                timed_out->store(true, std::memory_order_release);
                 cancel_pending_io();
             }
         });
@@ -498,11 +517,12 @@ private:
         asio::error_code ignored;
         timer.cancel(ignored);
 
-        if (timed_out && op_ec == asio::error::operation_aborted) {
+        const bool did_time_out = timed_out->load(std::memory_order_acquire);
+        if (did_time_out && op_ec == asio::error::operation_aborted) {
             op_ec = asio::error::timed_out;
         }
 
-        co_return std::make_tuple(op_ec, timed_out);
+        co_return std::make_tuple(op_ec, did_time_out);
     }
 
     asio::awaitable<std::tuple<asio::error_code, std::size_t, bool>>
@@ -592,10 +612,27 @@ private:
                 return true;
             }
 
+            if (m_chunk_needs_terminator) {
+                if (m_chunk_raw_buffer.size() < 2) {
+                    return true;
+                }
+                if (m_chunk_raw_buffer[0] != '\r' || m_chunk_raw_buffer[1] != '\n') {
+                    return false;
+                }
+                m_chunk_raw_buffer.erase(0, 2);
+                m_chunk_needs_terminator = false;
+            }
+
             if (m_chunk_bytes_remaining == 0) {
                 auto line_end = m_chunk_raw_buffer.find("\r\n");
                 if (line_end == std::string::npos) {
+                    if (m_chunk_raw_buffer.size() > max_chunk_metadata_size()) {
+                        return false;
+                    }
                     return true;
+                }
+                if (line_end > max_chunk_metadata_size()) {
+                    return false;
                 }
 
                 std::string chunk_size_line = m_chunk_raw_buffer.substr(0, line_end);
@@ -632,7 +669,13 @@ private:
 
                     auto trailer_end = m_chunk_raw_buffer.find("\r\n\r\n");
                     if (trailer_end == std::string::npos) {
+                        if (m_chunk_raw_buffer.size() > max_chunk_metadata_size()) {
+                            return false;
+                        }
                         return true;
+                    }
+                    if (trailer_end > max_chunk_metadata_size()) {
+                        return false;
                     }
 
                     m_chunk_raw_buffer.erase(0, trailer_end + 4);
@@ -640,24 +683,29 @@ private:
                     return true;
                 }
 
+                if (chunk_size > std::numeric_limits<size_t>::max()) {
+                    return false;
+                }
                 m_chunk_bytes_remaining = static_cast<size_t>(chunk_size);
             }
 
-            if (m_chunk_raw_buffer.size() < m_chunk_bytes_remaining + 2) {
+            const size_t payload_size =
+                std::min(m_chunk_bytes_remaining, m_chunk_raw_buffer.size());
+            if (payload_size == 0) {
                 return true;
             }
 
-            m_buffer.append(m_chunk_raw_buffer.data(), m_chunk_bytes_remaining);
-            m_chunk_raw_buffer.erase(0, m_chunk_bytes_remaining);
-
-            if (m_chunk_raw_buffer.size() < 2 ||
-                m_chunk_raw_buffer[0] != '\r' ||
-                m_chunk_raw_buffer[1] != '\n') {
+            m_buffer.append(m_chunk_raw_buffer.data(), payload_size);
+            m_chunk_raw_buffer.erase(0, payload_size);
+            m_chunk_bytes_remaining -= payload_size;
+            if (m_buffer.find('\n') == std::string::npos &&
+                m_buffer.size() > max_line_size()) {
                 return false;
             }
-
-            m_chunk_raw_buffer.erase(0, 2);
-            m_chunk_bytes_remaining = 0;
+            if (m_chunk_bytes_remaining > 0) {
+                return true;
+            }
+            m_chunk_needs_terminator = true;
         }
     }
 
@@ -736,6 +784,7 @@ private:
     bool m_chunked = false;
     std::string m_chunk_raw_buffer;
     size_t m_chunk_bytes_remaining = 0;
+    bool m_chunk_needs_terminator = false;
     bool m_chunk_stream_complete = false;
 };
 
