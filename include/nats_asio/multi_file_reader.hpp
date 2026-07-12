@@ -180,6 +180,11 @@ public:
     size_t file_count() const { return m_files.size(); }
 
 private:
+    struct extracted_zip_state {
+        std::vector<std::string> files;
+        std::unique_ptr<zip_temp_cleanup> cleanup;
+    };
+
     // Try to read a line from a specific file
     // Returns: {got_line, line_content, eof_reached}
     std::tuple<bool, std::string, bool> try_read_line_from_file(tracked_file& file) {
@@ -270,6 +275,7 @@ private:
     // Scan for files matching patterns and open new ones
     bool scan_for_files() {
         std::set<std::string> current_paths;
+        std::set<std::string> current_zip_paths;
 
         for (const auto& pattern : m_patterns) {
             glob_t glob_result;
@@ -292,6 +298,7 @@ private:
 
                 // Check if this is a zip file
                 if (is_zip_file(path) || is_zip_file_magic(path)) {
+                    current_zip_paths.insert(path);
                     // Check if we've already extracted this zip
                     if (m_extracted_zips.find(path) == m_extracted_zips.end()) {
                         m_log->info("Detected zip archive: {}", path);
@@ -299,13 +306,6 @@ private:
                         auto extracted = extract_zip_to_temp(path, m_log, &temp_dir);
 
                         if (!extracted.empty()) {
-                            // Track this zip as extracted
-                            m_extracted_zips.insert(path);
-
-                            // Add cleanup handler
-                            m_zip_cleanups.push_back(
-                                std::make_unique<zip_temp_cleanup>(std::move(temp_dir), m_log));
-
                             // Add all extracted files to current paths and open them
                             for (const auto& extracted_path : extracted) {
                                 current_paths.insert(extracted_path);
@@ -315,6 +315,16 @@ private:
                                     }
                                 }
                             }
+
+                            m_extracted_zips.emplace(
+                                path,
+                                extracted_zip_state{
+                                    std::move(extracted),
+                                    std::make_unique<zip_temp_cleanup>(std::move(temp_dir), m_log)});
+                        }
+                    } else {
+                        for (const auto& extracted_path : m_extracted_zips.at(path).files) {
+                            current_paths.insert(extracted_path);
                         }
                     }
                 } else {
@@ -344,6 +354,14 @@ private:
         for (const auto& path : to_remove) {
             m_log->info("File no longer matches pattern, closing: {}", path);
             close_file(path);
+        }
+
+        for (auto it = m_extracted_zips.begin(); it != m_extracted_zips.end();) {
+            if (current_zip_paths.find(it->first) == current_zip_paths.end()) {
+                it = m_extracted_zips.erase(it);
+            } else {
+                ++it;
+            }
         }
 
         return !m_files.empty();
@@ -482,8 +500,7 @@ private:
     std::shared_ptr<spdlog::logger> m_log;
 
     std::map<std::string, tracked_file> m_files;  // path -> file state
-    std::set<std::string> m_extracted_zips;       // zip files already extracted
-    std::vector<std::unique_ptr<zip_temp_cleanup>> m_zip_cleanups;  // cleanup handlers
+    std::map<std::string, extracted_zip_state> m_extracted_zips;
 };
 
 } // namespace nats_asio

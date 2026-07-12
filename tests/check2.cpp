@@ -6,6 +6,7 @@
 #include <nats_asio/compression.hpp>
 #include <nats_asio/decompression_reader.hpp>
 #include <nats_asio/http_reader.hpp>
+#include <nats_asio/multi_file_reader.hpp>
 #include <nats_asio/nats_asio.hpp>
 #include <nats_asio/zip_extractor.hpp>
 #include <spdlog/spdlog.h>
@@ -37,6 +38,21 @@ std::vector<char> gzip_compress(std::string_view input) {
     if (result != Z_STREAM_END) return {};
     output.resize(output_size);
     return output;
+}
+
+bool create_test_zip(const std::filesystem::path& path, std::string_view payload) {
+    int error = 0;
+    zip_t* archive = zip_open(path.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &error);
+    if (!archive) return false;
+    zip_source_t* source = zip_source_buffer(archive, payload.data(), payload.size(), 0);
+    if (!source || zip_file_add(archive, "data.txt", source, ZIP_FL_OVERWRITE) < 0) {
+        if (source) zip_source_free(source);
+        zip_discard(archive);
+        return false;
+    }
+    if (zip_close(archive) == 0) return true;
+    zip_discard(archive);
+    return false;
 }
 
 struct http_read_result {
@@ -233,6 +249,41 @@ TEST(zip_extractor, creates_unique_temp_directories) {
         zip_temp_cleanup cleanup(*second, spdlog::default_logger());
     }
     EXPECT_FALSE(std::filesystem::exists(*second));
+}
+
+TEST(multi_file_reader, preserves_extracted_zip_files_across_rescans) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto archive_path = *source_dir / "input.zip";
+    ASSERT_TRUE(create_test_zip(archive_path, "line\n"));
+
+    asio::io_context ioc;
+    async_multi_file_reader reader(ioc, {archive_path.string()}, true, 0,
+                                   spdlog::default_logger());
+    ASSERT_TRUE(reader.init());
+    ASSERT_EQ(reader.file_count(), 1u);
+
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            co_await reader.read_line();
+        },
+        asio::detached);
+    ioc.run();
+    EXPECT_EQ(reader.file_count(), 1u);
+
+    ASSERT_TRUE(std::filesystem::remove(archive_path));
+    ioc.restart();
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            co_await reader.read_line();
+        },
+        asio::detached);
+    ioc.run();
+    EXPECT_EQ(reader.file_count(), 0u);
+
+    std::filesystem::remove_all(*source_dir);
 }
 
 TEST(http_reader, parse_url_https_default_port) {
