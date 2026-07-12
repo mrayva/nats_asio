@@ -288,6 +288,49 @@ TEST(multi_file_reader, preserves_extracted_zip_files_across_rescans) {
     std::filesystem::remove_all(*source_dir);
 }
 
+TEST(multi_file_reader, reads_newly_discovered_files_from_beginning) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto initial_path = *source_dir / "initial.log";
+    const auto new_path = *source_dir / "new.log";
+    {
+        std::ofstream initial(initial_path);
+        initial << "existing initial content\n";
+    }
+
+    asio::io_context ioc;
+    async_multi_file_reader reader(ioc, {(source_dir->string() + "/*.log")}, true, 1,
+                                   spdlog::default_logger());
+    ASSERT_TRUE(reader.init());
+
+    std::string line;
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            auto [value, path, eof, error] = co_await reader.read_line();
+            (void)path;
+            (void)eof;
+            if (!error) line = std::move(value);
+        },
+        asio::detached);
+
+    std::thread writer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        {
+            std::ofstream new_file(new_path);
+            new_file << "new file content\n";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::ofstream initial(initial_path, std::ios::app);
+        initial << "old file fallback\n";
+    });
+
+    ioc.run();
+    writer.join();
+    EXPECT_EQ(line, "new file content");
+    std::filesystem::remove_all(*source_dir);
+}
+
 TEST(input_reader, follows_replacement_inode) {
     auto source_dir = create_zip_temp_directory();
     ASSERT_TRUE(source_dir);

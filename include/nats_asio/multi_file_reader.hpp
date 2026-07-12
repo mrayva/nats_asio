@@ -76,7 +76,9 @@ public:
     // Initialize - scan for files and open them
     bool init() {
         // Expand all glob patterns
-        if (!scan_for_files()) {
+        const bool found_files = scan_for_files();
+        m_initial_scan = false;
+        if (!found_files) {
             m_log->error("Failed to find any files matching patterns");
             return false;
         }
@@ -417,7 +419,7 @@ private:
 
         // For follow mode, start at end of file (like tail -f)
         // Note: Follow mode not fully supported for compressed files
-        if (m_follow && !file.decompressor) {
+        if (m_follow && m_initial_scan && !file.decompressor) {
             file.position = ::lseek(fd, 0, SEEK_END);
             if (file.position < 0) file.position = 0;
         }
@@ -497,6 +499,7 @@ private:
     std::vector<std::string> m_patterns;
     bool m_follow;
     int m_poll_interval_ms;
+    bool m_initial_scan = true;
     std::shared_ptr<spdlog::logger> m_log;
 
     std::map<std::string, tracked_file> m_files;  // path -> file state
