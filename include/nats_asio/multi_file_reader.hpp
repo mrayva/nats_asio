@@ -66,11 +66,12 @@ public:
     async_multi_file_reader(asio::io_context& ioc, std::vector<std::string> patterns,
                             bool follow, int poll_interval_ms,
                             std::shared_ptr<spdlog::logger> log,
-                            size_t max_line_size = 16 * 1024 * 1024)
+                            size_t max_line_size = 16 * 1024 * 1024,
+                            zip_extraction_limits zip_limits = {})
         : m_ioc(ioc), m_patterns(std::move(patterns)), m_follow(follow),
           m_poll_interval_ms(poll_interval_ms > 0 ? poll_interval_ms : 100), m_max_line_size(
               max_line_size == 0 ? 16 * 1024 * 1024 : max_line_size),
-          m_log(std::move(log)) {}
+          m_zip_limits(zip_limits), m_log(std::move(log)) {}
 
     ~async_multi_file_reader() {
         close_all_files();
@@ -359,7 +360,8 @@ private:
                     if (m_extracted_zips.find(path) == m_extracted_zips.end()) {
                         m_log->info("Detected zip archive: {}", path);
                         std::filesystem::path temp_dir;
-                        auto extracted = extract_zip_to_temp(path, m_log, &temp_dir);
+                        auto extracted = extract_zip_to_temp(path, m_log, &temp_dir,
+                                                             m_zip_limits);
 
                         if (!extracted.empty()) {
                             // Add all extracted files to current paths and open them
@@ -558,6 +560,7 @@ private:
     bool m_follow;
     int m_poll_interval_ms;
     size_t m_max_line_size;
+    zip_extraction_limits m_zip_limits;
     bool m_initial_scan = true;
     std::shared_ptr<spdlog::logger> m_log;
 

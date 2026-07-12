@@ -215,6 +215,9 @@ int main(int argc, char* argv[]) {
         ("follow,f", "Follow mode - continuously read new data (like tail -f)")
         ("poll_interval", "Poll interval in ms for follow mode (default: 100)", cxxopts::value<int>())
         ("max_line_size", "Maximum input line size in bytes (default: 16777216)", cxxopts::value<std::size_t>())
+        ("zip_max_entries", "Maximum entries extracted from a ZIP (default: 10000)", cxxopts::value<uint64_t>())
+        ("zip_max_entry_bytes", "Maximum uncompressed bytes per ZIP entry (default: 268435456)", cxxopts::value<uint64_t>())
+        ("zip_max_total_bytes", "Maximum total uncompressed ZIP bytes (default: 1073741824)", cxxopts::value<uint64_t>())
         ("http", "HTTP URL to read streaming data from (e.g., Feldera output)", cxxopts::value<std::string>())
         ("http_method", "HTTP method: GET or POST (default: POST)", cxxopts::value<std::string>())
         ("http_body", "HTTP request body for POST method", cxxopts::value<std::string>())
@@ -582,6 +585,24 @@ int main(int argc, char* argv[]) {
                 console->error("--max_line_size must be greater than 0");
                 return 1;
             }
+        }
+        if (result.count("zip_max_entries")) {
+            src_cfg.zip_max_entries = result["zip_max_entries"].as<uint64_t>();
+        }
+        if (result.count("zip_max_entry_bytes")) {
+            src_cfg.zip_max_entry_bytes = result["zip_max_entry_bytes"].as<uint64_t>();
+        }
+        if (result.count("zip_max_total_bytes")) {
+            src_cfg.zip_max_total_bytes = result["zip_max_total_bytes"].as<uint64_t>();
+        }
+        if (src_cfg.zip_max_entries == 0 || src_cfg.zip_max_entry_bytes == 0 ||
+            src_cfg.zip_max_total_bytes == 0) {
+            console->error("ZIP extraction limits must be greater than 0");
+            return 1;
+        }
+        if (src_cfg.zip_max_entry_bytes > src_cfg.zip_max_total_bytes) {
+            console->error("--zip_max_entry_bytes cannot exceed --zip_max_total_bytes");
+            return 1;
         }
 
         // HTTP source options

@@ -24,3 +24,7 @@ expect_invalid --batch_pub --file /tmp/nats_asio_cli_test_missing_input --stats_
 expect_invalid --max_line_size 0
 expect_invalid --poll_interval 0
 expect_invalid --poll_interval -1
+expect_invalid --zip_max_entries 0
+expect_invalid --zip_max_entry_bytes 0
+expect_invalid --zip_max_total_bytes 0
+expect_invalid --zip_max_entry_bytes 10 --zip_max_total_bytes 9

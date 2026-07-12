@@ -40,6 +40,7 @@ SOFTWARE.
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <limits>
 #include <optional>
@@ -63,6 +64,9 @@ struct input_source_config {
     bool follow = false;                        // Continuously read new data (like tail -f)
     int poll_interval_ms = 100;                 // Poll interval for follow mode
     size_t input_max_line_size = 16 * 1024 * 1024;
+    uint64_t zip_max_entries = 10'000;
+    uint64_t zip_max_entry_bytes = 256ULL * 1024 * 1024;
+    uint64_t zip_max_total_bytes = 1024ULL * 1024 * 1024;
 
     // HTTP source options
     std::string http_url;               // HTTP URL to fetch from (empty = not HTTP)
