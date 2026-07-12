@@ -26,6 +26,7 @@ SOFTWARE.
 
 #include <cstring>
 #include <span>
+#include <utility>
 #include <vector>
 #include <zstd.h>
 
@@ -42,13 +43,30 @@ public:
         m_dctx = ZSTD_createDCtx();
     }
 
-    ~zstd_compressor() {
-        if (m_cctx) ZSTD_freeCCtx(m_cctx);
-        if (m_dctx) ZSTD_freeDCtx(m_dctx);
+    ~zstd_compressor() { reset(); }
+
+    zstd_compressor(const zstd_compressor&) = delete;
+    zstd_compressor& operator=(const zstd_compressor&) = delete;
+
+    zstd_compressor(zstd_compressor&& other) noexcept
+        : m_cctx(std::exchange(other.m_cctx, nullptr)),
+          m_dctx(std::exchange(other.m_dctx, nullptr)),
+          m_level(other.m_level) {}
+
+    zstd_compressor& operator=(zstd_compressor&& other) noexcept {
+        if (this != &other) {
+            reset();
+            m_cctx = std::exchange(other.m_cctx, nullptr);
+            m_dctx = std::exchange(other.m_dctx, nullptr);
+            m_level = other.m_level;
+        }
+        return *this;
     }
 
     // Compress data, returns compressed bytes (empty on error)
     std::vector<char> compress(std::span<const char> input) {
+        if (!m_cctx) return {};
+
         size_t bound = ZSTD_compressBound(input.size());
         std::vector<char> output(bound);
 
@@ -66,6 +84,8 @@ public:
 
     // Decompress data, returns decompressed bytes (empty on error)
     std::vector<char> decompress(std::span<const char> input) {
+        if (!m_dctx) return {};
+
         unsigned long long decompressed_size = ZSTD_getFrameContentSize(input.data(), input.size());
         if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
             decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
@@ -94,6 +114,13 @@ public:
     }
 
 private:
+    void reset() noexcept {
+        if (m_cctx) ZSTD_freeCCtx(m_cctx);
+        if (m_dctx) ZSTD_freeDCtx(m_dctx);
+        m_cctx = nullptr;
+        m_dctx = nullptr;
+    }
+
     ZSTD_CCtx* m_cctx = nullptr;
     ZSTD_DCtx* m_dctx = nullptr;
     int m_level;

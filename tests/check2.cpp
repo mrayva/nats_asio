@@ -2,12 +2,33 @@
 
 #include <chrono>
 #include <memory>
+#include <nats_asio/compression.hpp>
 #include <nats_asio/decompression_reader.hpp>
 #include <nats_asio/http_reader.hpp>
 #include <nats_asio/nats_asio.hpp>
 #include <spdlog/spdlog.h>
+#include <type_traits>
 
 using namespace nats_asio;
+
+static_assert(!std::is_copy_constructible_v<zstd_compressor>);
+static_assert(!std::is_copy_assignable_v<zstd_compressor>);
+static_assert(std::is_nothrow_move_constructible_v<zstd_compressor>);
+static_assert(std::is_nothrow_move_assignable_v<zstd_compressor>);
+
+TEST(zstd_compressor, remains_usable_after_moves) {
+    const std::string payload = "move-only compressor round trip";
+    zstd_compressor source;
+    zstd_compressor compressor(std::move(source));
+
+    auto compressed = compressor.compress(std::span(payload.data(), payload.size()));
+    ASSERT_FALSE(compressed.empty());
+
+    zstd_compressor decompressor;
+    decompressor = std::move(compressor);
+    auto decompressed = decompressor.decompress(compressed);
+    EXPECT_EQ(std::string(decompressed.begin(), decompressed.end()), payload);
+}
 
 TEST(http_reader, parse_url_https_default_port) {
     asio::io_context ioc;
