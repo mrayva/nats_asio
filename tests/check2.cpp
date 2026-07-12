@@ -128,6 +128,17 @@ TEST(zstd_compressor, remains_usable_after_moves) {
     EXPECT_EQ(std::string(decompressed.begin(), decompressed.end()), payload);
 }
 
+TEST(zstd_compressor, enforces_decompression_output_limit) {
+    const std::string payload = "bounded decompression";
+    zstd_compressor compressor;
+    auto compressed = compressor.compress(std::span(payload.data(), payload.size()));
+    ASSERT_FALSE(compressed.empty());
+
+    EXPECT_TRUE(compressor.decompress(compressed, payload.size() - 1).empty());
+    auto decompressed = compressor.decompress(compressed, payload.size());
+    EXPECT_EQ(std::string(decompressed.begin(), decompressed.end()), payload);
+}
+
 TEST(decompression_reader, rejects_truncated_zstd_frame) {
     const std::string payload(4096, 'x');
     zstd_compressor compressor;

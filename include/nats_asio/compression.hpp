@@ -25,6 +25,7 @@ SOFTWARE.
 #pragma once
 
 #include <cstring>
+#include <limits>
 #include <span>
 #include <utility>
 #include <vector>
@@ -83,12 +84,16 @@ public:
     }
 
     // Decompress data, returns decompressed bytes (empty on error)
-    std::vector<char> decompress(std::span<const char> input) {
+    std::vector<char> decompress(
+        std::span<const char> input,
+        size_t max_output_size = 1024ULL * 1024 * 1024) {
         if (!m_dctx) return {};
 
         unsigned long long decompressed_size = ZSTD_getFrameContentSize(input.data(), input.size());
         if (decompressed_size == ZSTD_CONTENTSIZE_ERROR ||
-            decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+            decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN ||
+            decompressed_size > std::numeric_limits<size_t>::max() ||
+            decompressed_size > max_output_size) {
             return {};
         }
 
