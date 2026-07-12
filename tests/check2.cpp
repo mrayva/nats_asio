@@ -72,14 +72,18 @@ struct http_read_result {
     std::tuple<std::string, bool, bool> line;
 };
 
-http_read_result read_test_http_response(std::string response, input_source_config config) {
+http_read_result read_test_http_response(
+    std::string response,
+    input_source_config config,
+    int timeout_ms = 1000,
+    std::chrono::milliseconds response_delay = {}) {
     asio::io_context server_ioc;
     asio::ip::tcp::acceptor acceptor(
         server_ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
     config.http_url = "http://127.0.0.1:" +
         std::to_string(acceptor.local_endpoint().port()) + "/";
     config.http_method = "GET";
-    config.http_timeout_ms = 1000;
+    config.http_timeout_ms = timeout_ms;
 
     std::thread server([&] {
         asio::ip::tcp::socket socket(server_ioc);
@@ -88,7 +92,10 @@ http_read_result read_test_http_response(std::string response, input_source_conf
         if (ec) return;
         asio::streambuf request;
         asio::read_until(socket, request, "\r\n\r\n", ec);
-        if (!ec) asio::write(socket, asio::buffer(response), ec);
+        if (!ec) {
+            std::this_thread::sleep_for(response_delay);
+            asio::write(socket, asio::buffer(response), ec);
+        }
         socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
     });
 
@@ -735,6 +742,14 @@ TEST(http_reader, rejects_oversized_response_line) {
     ASSERT_TRUE(result.initialized);
     EXPECT_TRUE(std::get<1>(result.line));
     EXPECT_TRUE(std::get<2>(result.line));
+}
+
+TEST(http_reader, times_out_delayed_response) {
+    input_source_config config;
+    auto result = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", config, 10,
+        std::chrono::milliseconds(50));
+    EXPECT_FALSE(result.initialized);
 }
 
 TEST(http_reader, rejects_oversized_chunk_metadata) {

@@ -31,6 +31,7 @@ SOFTWARE.
 #include <asio/connect.hpp>
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
+#include <asio/post.hpp>
 #include <asio/read_until.hpp>
 #include <asio/ssl.hpp>
 #include <asio/steady_timer.hpp>
@@ -618,23 +619,35 @@ private:
 
     template <typename Op>
     asio::awaitable<std::tuple<asio::error_code, bool>> run_with_timeout(Op&& op) {
-        auto timed_out = std::make_shared<std::atomic_bool>(false);
+        // 0 = active, 1 = operation completed, 2 = timeout cancellation active,
+        // 3 = timeout cancellation completed.
+        auto state = std::make_shared<std::atomic_int>(0);
         asio::error_code op_ec;
 
-        asio::steady_timer timer(co_await asio::this_coro::executor);
+        auto executor = co_await asio::this_coro::executor;
+        asio::steady_timer timer(executor);
         timer.expires_after(timeout_duration());
-        timer.async_wait([this, timed_out](const asio::error_code& ec) {
-            if (!ec) {
-                timed_out->store(true, std::memory_order_release);
+        timer.async_wait([this, state](const asio::error_code& ec) {
+            int expected = 0;
+            if (!ec && state->compare_exchange_strong(
+                           expected, 2, std::memory_order_acq_rel)) {
                 cancel_pending_io();
+                state->store(3, std::memory_order_release);
             }
         });
 
         op_ec = co_await op();
-        asio::error_code ignored;
-        timer.cancel(ignored);
+        int expected = 0;
+        if (state->compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+            asio::error_code ignored;
+            timer.cancel(ignored);
+        } else {
+            while (state->load(std::memory_order_acquire) == 2) {
+                co_await asio::post(executor, asio::use_awaitable);
+            }
+        }
 
-        const bool did_time_out = timed_out->load(std::memory_order_acquire);
+        const bool did_time_out = state->load(std::memory_order_acquire) == 3;
         if (did_time_out && op_ec == asio::error::operation_aborted) {
             op_ec = asio::error::timed_out;
         }
