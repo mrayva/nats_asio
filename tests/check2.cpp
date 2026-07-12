@@ -2,10 +2,12 @@
 
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <nats_asio/compression.hpp>
 #include <nats_asio/decompression_reader.hpp>
 #include <nats_asio/http_reader.hpp>
+#include <nats_asio/input_reader.hpp>
 #include <nats_asio/multi_file_reader.hpp>
 #include <nats_asio/nats_asio.hpp>
 #include <nats_asio/zip_extractor.hpp>
@@ -283,6 +285,55 @@ TEST(multi_file_reader, preserves_extracted_zip_files_across_rescans) {
     ioc.run();
     EXPECT_EQ(reader.file_count(), 0u);
 
+    std::filesystem::remove_all(*source_dir);
+}
+
+TEST(input_reader, follows_replacement_inode) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto input_path = *source_dir / "input.log";
+    const auto rotated_path = *source_dir / "input.log.1";
+    {
+        std::ofstream input(input_path);
+        input << "existing\n";
+    }
+
+    asio::io_context ioc;
+    input_source_config config;
+    config.file_path = input_path.string();
+    config.follow = true;
+    config.poll_interval_ms = 1;
+    async_input_reader reader(ioc, config, spdlog::default_logger());
+    ASSERT_TRUE(reader.init());
+
+    std::string line;
+    bool error = false;
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            auto [value, eof, read_error] = co_await reader.read_line();
+            (void)eof;
+            line = std::move(value);
+            error = read_error;
+        },
+        asio::detached);
+
+    std::thread writer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::filesystem::rename(input_path, rotated_path);
+        {
+            std::ofstream replacement(input_path);
+            replacement << "replacement\n";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::ofstream old_file(rotated_path, std::ios::app);
+        old_file << "old inode\n";
+    });
+
+    ioc.run();
+    writer.join();
+    EXPECT_FALSE(error);
+    EXPECT_EQ(line, "replacement");
     std::filesystem::remove_all(*source_dir);
 }
 

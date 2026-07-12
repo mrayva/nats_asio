@@ -82,6 +82,16 @@ public:
             m_stream = std::make_unique<asio::posix::stream_descriptor>(m_ioc, m_fd);
             m_is_stdin = false;
 
+            struct stat initial_stat;
+            if (::fstat(m_fd, &initial_stat) < 0) {
+                m_log->error("fstat failed for {}: {}", m_config.file_path, strerror(errno));
+                m_stream.reset();
+                m_fd = -1;
+                return false;
+            }
+            m_file_inode = initial_stat.st_ino;
+            m_file_device = initial_stat.st_dev;
+
             // Detect compression format
             compression_format fmt = detect_compression_from_filename(m_config.file_path);
             if (fmt == compression_format::none) {
@@ -230,6 +240,33 @@ private:
         asio::steady_timer timer(co_await asio::this_coro::executor);
 
         for (;;) {
+            struct stat path_stat;
+            if (::stat(m_config.file_path.c_str(), &path_stat) == 0 &&
+                (path_stat.st_ino != m_file_inode || path_stat.st_dev != m_file_device)) {
+                int replacement_fd = ::open(m_config.file_path.c_str(), O_RDONLY | O_NONBLOCK);
+                if (replacement_fd < 0) {
+                    m_log->error("Failed to open rotated file {}: {}",
+                                 m_config.file_path, strerror(errno));
+                    co_return std::make_tuple("", true, true);
+                }
+                struct stat replacement_stat;
+                if (::fstat(replacement_fd, &replacement_stat) < 0) {
+                    m_log->error("fstat failed for rotated file {}: {}",
+                                 m_config.file_path, strerror(errno));
+                    ::close(replacement_fd);
+                    co_return std::make_tuple("", true, true);
+                }
+
+                m_stream.reset();
+                m_fd = replacement_fd;
+                m_stream = std::make_unique<asio::posix::stream_descriptor>(m_ioc, m_fd);
+                m_file_inode = replacement_stat.st_ino;
+                m_file_device = replacement_stat.st_dev;
+                m_file_pos = 0;
+                m_buffer.clear();
+                m_log->info("File rotated, reopened replacement: {}", m_config.file_path);
+            }
+
             // Check current file size
             struct stat st;
             if (::fstat(m_fd, &st) < 0) {
@@ -241,7 +278,12 @@ private:
             if (st.st_size < m_file_pos) {
                 m_log->info("File truncated, seeking to beginning");
                 m_file_pos = 0;
-                ::lseek(m_fd, 0, SEEK_SET);
+                m_buffer.clear();
+                if (::lseek(m_fd, 0, SEEK_SET) < 0) {
+                    m_log->error("Failed to seek truncated file {}: {}",
+                                 m_config.file_path, strerror(errno));
+                    co_return std::make_tuple("", true, true);
+                }
             }
 
             // Read any new data
@@ -282,6 +324,8 @@ private:
     bool m_is_stdin = false;
     std::string m_buffer;
     off_t m_file_pos = 0;
+    ino_t m_file_inode = 0;
+    dev_t m_file_device = 0;
 };
 
 } // namespace nats_asio
