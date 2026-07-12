@@ -162,6 +162,13 @@ if(NATS_ASIO_BUILD_TESTS)
     
     add_test(NAME parser_test COMMAND parser_test)
 
+    add_executable(public_headers_test tests/public_headers.cpp)
+    target_link_libraries(public_headers_test PRIVATE nats_asio::nats_asio)
+    set_target_properties(public_headers_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+    )
+    add_test(NAME public_headers_test COMMAND public_headers_test)
+
     if(TARGET nats_tool)
         add_test(
             NAME nats_tool_cli_validation

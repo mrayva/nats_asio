@@ -24,14 +24,18 @@ persons to whom the Software is furnished to do so, subject to the following con
 
 #pragma once
 
+#include <asio/awaitable.hpp>
 #include <asio/io_context.hpp>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace nats_asio {
