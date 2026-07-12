@@ -52,17 +52,6 @@ find_path(CONCURRENTQUEUE_INCLUDE_DIR NAMES concurrentqueue/moodycamel/concurren
 find_path(GTL_INCLUDE_DIR NAMES gtl/lru_cache.hpp REQUIRED)
 find_path(STRINGZILLA_INCLUDE_DIR NAMES stringzilla/stringzilla.hpp REQUIRED)
 
-# Fetch zerialize for binary format deserialization
-include(FetchContent)
-# zerialize vendors jsoncons; disable jsoncons tests to avoid third-party -Werror breakages.
-set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
-FetchContent_Declare(
-    zerialize
-    GIT_REPOSITORY https://github.com/colinator/zerialize.git
-    GIT_TAG        aedaaf2e585dbc0a7f239bca33fd2a6595ed47df
-)
-FetchContent_MakeAvailable(zerialize)
-
 add_library(nats_asio INTERFACE)
 add_library(nats_asio::nats_asio ALIAS nats_asio)
 
@@ -113,6 +102,17 @@ if(NATS_ASIO_BUILD_SAMPLES)
     find_package(cxxopts CONFIG REQUIRED)
     find_package(mimalloc CONFIG REQUIRED)
     find_package(simdjson CONFIG REQUIRED)
+
+    # zerialize is only used by nats_tool for binary format conversion.
+    include(FetchContent)
+    set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
+    FetchContent_Declare(
+        zerialize
+        GIT_REPOSITORY https://github.com/colinator/zerialize.git
+        GIT_TAG        aedaaf2e585dbc0a7f239bca33fd2a6595ed47df
+    )
+    FetchContent_MakeAvailable(zerialize)
+
     add_executable(nats_tool samples/nats_tool.cpp)
     target_link_libraries(nats_tool
         PRIVATE
