@@ -42,6 +42,7 @@ SOFTWARE.
 #include <chrono>
 #include <memory>
 #include <limits>
+#include <optional>
 #include <openssl/ssl.h>
 #include <spdlog/spdlog.h>
 #include <sstream>
@@ -339,6 +340,16 @@ public:
                 co_return std::make_tuple("", true, false);
             }
 
+            if (m_content_bytes_remaining && *m_content_bytes_remaining == 0) {
+                if (!m_buffer.empty()) {
+                    std::string line = std::move(m_buffer);
+                    m_buffer.clear();
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    co_return std::make_tuple(std::move(line), true, false);
+                }
+                co_return std::make_tuple("", true, false);
+            }
+
             auto [ec, bytes_read, timed_out] = co_await read_some_with_timeout(read_buf, sizeof(read_buf));
             if (timed_out) {
                 m_log->error("HTTP read timeout after {}ms", timeout_duration().count());
@@ -357,6 +368,11 @@ public:
                             co_return std::make_tuple("", true, true);
                         }
                     }
+                    if (m_content_bytes_remaining && *m_content_bytes_remaining != 0) {
+                        m_log->error("HTTP response ended with {} body bytes missing",
+                                     *m_content_bytes_remaining);
+                        co_return std::make_tuple("", true, true);
+                    }
 
                     if (!m_buffer.empty()) {
                         std::string line = std::move(m_buffer);
@@ -372,6 +388,11 @@ public:
             }
 
             if (bytes_read == 0) {
+                if (m_content_bytes_remaining && *m_content_bytes_remaining != 0) {
+                    m_log->error("HTTP response ended with {} body bytes missing",
+                                 *m_content_bytes_remaining);
+                    co_return std::make_tuple("", true, true);
+                }
                 if (!m_buffer.empty()) {
                     std::string line = std::move(m_buffer);
                     m_buffer.clear();
@@ -388,6 +409,13 @@ public:
                     co_return std::make_tuple("", true, true);
                 }
             } else {
+                if (m_content_bytes_remaining) {
+                    if (bytes_read > *m_content_bytes_remaining) {
+                        m_log->error("HTTP response exceeds declared Content-Length");
+                        co_return std::make_tuple("", true, true);
+                    }
+                    *m_content_bytes_remaining -= bytes_read;
+                }
                 m_buffer.append(read_buf, bytes_read);
             }
         }
@@ -468,6 +496,48 @@ private:
         }
 
         return false;
+    }
+
+    static std::optional<size_t> parse_content_length(const std::string& headers,
+                                                       bool& valid) {
+        valid = true;
+        std::optional<size_t> content_length;
+        std::istringstream lines(headers);
+        std::string line;
+        bool is_first_line = true;
+        while (std::getline(lines, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (is_first_line) {
+                is_first_line = false;
+                continue;
+            }
+
+            const auto colon_pos = line.find(':');
+            if (colon_pos == std::string::npos ||
+                to_lower_copy(trim_copy(std::string_view(line.data(), colon_pos))) !=
+                    "content-length") {
+                continue;
+            }
+
+            const std::string value = trim_copy(
+                std::string_view(line.data() + colon_pos + 1, line.size() - colon_pos - 1));
+            unsigned long long parsed = 0;
+            const auto [ptr, ec] =
+                std::from_chars(value.data(), value.data() + value.size(), parsed);
+            if (value.empty() || ec != std::errc{} || ptr != value.data() + value.size() ||
+                parsed > std::numeric_limits<size_t>::max()) {
+                valid = false;
+                return std::nullopt;
+            }
+
+            const size_t length = static_cast<size_t>(parsed);
+            if (content_length && *content_length != length) {
+                valid = false;
+                return std::nullopt;
+            }
+            content_length = length;
+        }
+        return content_length;
     }
 
     std::chrono::milliseconds timeout_duration() const {
@@ -751,6 +821,16 @@ private:
         }
 
         m_chunked = has_chunked_transfer_encoding(headers);
+        bool content_length_valid = false;
+        auto content_length = parse_content_length(headers, content_length_valid);
+        if (!content_length_valid) {
+            m_log->error("Invalid or conflicting HTTP Content-Length header");
+            co_return false;
+        }
+        if (m_chunked && content_length) {
+            m_log->error("HTTP response contains both chunked encoding and Content-Length");
+            co_return false;
+        }
         if (m_chunked) {
             m_chunk_raw_buffer.append(response_body);
             if (!decode_chunked_body()) {
@@ -758,6 +838,13 @@ private:
                 co_return false;
             }
         } else {
+            if (content_length && response_body.size() > *content_length) {
+                m_log->error("HTTP response exceeds declared Content-Length");
+                co_return false;
+            }
+            if (content_length) {
+                m_content_bytes_remaining = *content_length - response_body.size();
+            }
             m_buffer = std::move(response_body);
         }
 
@@ -780,6 +867,7 @@ private:
     bool m_use_ssl = false;
     bool m_connected = false;
     std::string m_buffer;
+    std::optional<size_t> m_content_bytes_remaining;
 
     bool m_chunked = false;
     std::string m_chunk_raw_buffer;

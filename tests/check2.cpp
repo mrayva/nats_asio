@@ -257,6 +257,49 @@ TEST(http_reader, rejects_oversized_chunk_metadata) {
     EXPECT_FALSE(result.initialized);
 }
 
+TEST(http_reader, rejects_truncated_content_length_body) {
+    input_source_config config;
+    auto result = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", config);
+
+    ASSERT_TRUE(result.initialized);
+    EXPECT_TRUE(std::get<1>(result.line));
+    EXPECT_TRUE(std::get<2>(result.line));
+}
+
+TEST(http_reader, rejects_excess_content_length_body) {
+    input_source_config config;
+    auto result = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nabc", config);
+
+    EXPECT_FALSE(result.initialized);
+}
+
+TEST(http_reader, rejects_ambiguous_content_length) {
+    input_source_config config;
+    auto conflicting = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc",
+        config);
+    EXPECT_FALSE(conflicting.initialized);
+
+    auto chunked = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "3\r\nabc\r\n0\r\n\r\n",
+        config);
+    EXPECT_FALSE(chunked.initialized);
+}
+
+TEST(http_reader, completes_at_declared_content_length) {
+    input_source_config config;
+    auto result = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", config);
+
+    ASSERT_TRUE(result.initialized);
+    EXPECT_EQ(std::get<0>(result.line), "abc");
+    EXPECT_TRUE(std::get<1>(result.line));
+    EXPECT_FALSE(std::get<2>(result.line));
+}
+
 TEST(compression_detection, detects_magic_bytes) {
     const char gzip_magic[4] = {static_cast<char>(0x1f), static_cast<char>(0x8b), 0x08, 0x00};
     const char zstd_magic[4] = {static_cast<char>(0x28), static_cast<char>(0xb5),
