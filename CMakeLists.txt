@@ -2,6 +2,20 @@ cmake_minimum_required(VERSION 3.25)
 
 set(VCPKG_OVERLAY_TRIPLETS "${CMAKE_CURRENT_SOURCE_DIR}/triplets" CACHE STRING "")
 
+option(NATS_ASIO_BUILD_TESTS "Build tests" ON)
+option(NATS_ASIO_BUILD_SAMPLES "Build sample programs" ON)
+option(NATS_ASIO_INSTALL "Generate install target" ON)
+
+# vcpkg resolves manifest features during project(), so select optional
+# dependencies before the toolchain performs manifest installation.
+if(NATS_ASIO_BUILD_SAMPLES)
+    list(APPEND VCPKG_MANIFEST_FEATURES samples)
+endif()
+if(NATS_ASIO_BUILD_TESTS)
+    list(APPEND VCPKG_MANIFEST_FEATURES tests)
+endif()
+list(REMOVE_DUPLICATES VCPKG_MANIFEST_FEATURES)
+
 project(nats_asio
     VERSION 0.1.0
     DESCRIPTION "Header-only C++ NATS client using standalone Asio"
@@ -11,10 +25,6 @@ project(nats_asio
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
-option(NATS_ASIO_BUILD_TESTS "Build tests" ON)
-option(NATS_ASIO_BUILD_SAMPLES "Build sample programs" ON)
-option(NATS_ASIO_INSTALL "Generate install target" ON)
 
 find_program(CLANG_FORMAT_EXE NAMES "clang-format")
 

@@ -2,21 +2,33 @@
   "name": "nats-asio",
   "version-string": "0.1.0",
   "dependencies": [
-    "cxxopts",
+    "asio",
     "concurrentqueue",
     "fmt",
     "gtl",
-    "inja",
     "libzip",
     "magic-enum",
-    "mimalloc",
-	"nlohmann-json",
-    "simdjson",
-	"spdlog",
-    "stringzilla",
+    "nlohmann-json",
     "openssl",
-    "asio",
-    "zstd",
-	"gtest"
-  ]
+    "simdjson",
+    "spdlog",
+    "stringzilla",
+    "zstd"
+  ],
+  "features": {
+    "samples": {
+      "description": "Dependencies required to build nats_tool",
+      "dependencies": [
+        "cxxopts",
+        "inja",
+        "mimalloc"
+      ]
+    },
+    "tests": {
+      "description": "Dependencies required to build tests",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  }
 }
