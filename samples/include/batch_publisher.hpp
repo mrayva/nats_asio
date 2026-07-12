@@ -148,7 +148,8 @@ public:
         : m_console(std::move(console)), m_conf(conf), m_ssl_conf(std::move(ssl_conf)),
           m_topic(topic), m_num_writers(num_writers), m_stats_interval(stats_interval),
           m_batch_size(batch_size), m_flush_timeout_ms(flush_timeout_ms),
-          m_file_path(file_path), m_counter(0), m_pending_writes(0), m_running(true) {
+          m_file_path(file_path), m_counter(0), m_pending_writes(0), m_running(true),
+          m_failed(false) {
         m_queue.set_max_size(max_queue_size);
         // Pre-build the static part of PUB command: "PUB <topic> "
         m_pub_prefix = "PUB ";
@@ -234,6 +235,10 @@ public:
         m_console->info("Batch publisher finished, total messages: {}", m_counter.load());
     }
 
+    [[nodiscard]] bool failed() const noexcept {
+        return m_failed.load(std::memory_order_acquire);
+    }
+
 private:
     // Validate that a buffer is a concatenation of well-formed
     // "PUB <subject> <size>\\r\\n<payload>\\r\\n" frames.
@@ -290,6 +295,8 @@ private:
             input_fd = ::open(m_file_path.c_str(), O_RDONLY);
             if (input_fd < 0) {
                 m_console->error("Failed to open file '{}': {}", m_file_path, strerror(errno));
+                m_failed.store(true, std::memory_order_release);
+                m_running.store(false, std::memory_order_release);
                 return;
             }
             close_fd = true;
@@ -328,7 +335,10 @@ private:
                         append_pub_header(batch_buf, accum_size);
                         batch_buf.append(accum_buf);
                         batch_buf.append("\r\n", 2);
-                        m_queue.push({std::move(batch_buf), 1});
+                        if (!m_queue.push({std::move(batch_buf), 1})) {
+                            m_failed.store(true, std::memory_order_release);
+                            break;
+                        }
                         batch_buf.clear();
                         batch_buf.reserve(m_batch_size * 2);
                         accum_buf.clear();
@@ -338,6 +348,7 @@ private:
                 } else if (poll_result < 0) {
                     if (errno == EINTR) continue;
                     m_console->error("poll error: {}", strerror(errno));
+                    m_failed.store(true, std::memory_order_release);
                     break;
                 }
                 // poll_result > 0: data available, proceed to read
@@ -353,6 +364,10 @@ private:
 
             if (bytes_read <= 0) {
                 accum_buf.resize(old_size);  // Restore size
+                if (bytes_read < 0) {
+                    m_console->error("read error: {}", strerror(errno));
+                    m_failed.store(true, std::memory_order_release);
+                }
                 break;  // EOF or error
             }
 
@@ -410,7 +425,10 @@ private:
             }
 
             if (msg_count > 0) {
-                m_queue.push({std::move(batch_buf), msg_count});
+                if (!m_queue.push({std::move(batch_buf), msg_count})) {
+                    m_failed.store(true, std::memory_order_release);
+                    break;
+                }
                 batch_buf.clear();
                 batch_buf.reserve(m_batch_size * 2);
             }
@@ -422,7 +440,9 @@ private:
             append_pub_header(batch_buf, accum_buf.size());
             batch_buf.append(accum_buf);
             batch_buf.append("\r\n", 2);
-            m_queue.push({std::move(batch_buf), 1});
+            if (!m_queue.push({std::move(batch_buf), 1})) {
+                m_failed.store(true, std::memory_order_release);
+            }
         }
 
         if (close_fd) {
@@ -442,6 +462,7 @@ private:
                 [](nats_asio::iconnection&) -> asio::awaitable<void> { co_return; },
                 [this](nats_asio::iconnection&, std::string_view err) -> asio::awaitable<void> {
                     m_console->error("connection error: {}", err);
+                    m_failed.store(true, std::memory_order_release);
                     co_return;
                 }, m_ssl_conf)
             : nats_asio::create_connection(ioc,
@@ -449,6 +470,7 @@ private:
                 [](nats_asio::iconnection&) -> asio::awaitable<void> { co_return; },
                 [this](nats_asio::iconnection&, std::string_view err) -> asio::awaitable<void> {
                     m_console->error("connection error: {}", err);
+                    m_failed.store(true, std::memory_order_release);
                     co_return;
                 }, std::nullopt);
 
@@ -489,6 +511,7 @@ private:
                  &write_done]() mutable -> asio::awaitable<void> {
                     if (!validate_pub_batch(data)) {
                         m_console->error("Skipping malformed batch payload ({} bytes)", data.size());
+                        m_failed.store(true, std::memory_order_release);
                         write_done.set_value(true);
                         co_return;
                     }
@@ -497,6 +520,7 @@ private:
                     auto s = co_await conn->write_raw(batch_span);
                     if (s.failed()) {
                         m_console->error("batch write failed: {}", s.error());
+                        m_failed.store(true, std::memory_order_release);
                     } else {
                         m_counter += count;
                     }
@@ -543,6 +567,7 @@ private:
     std::atomic<std::size_t> m_bytes_read{0};
     std::atomic<std::size_t> m_pending_writes;
     std::atomic<bool> m_running;
+    std::atomic<bool> m_failed;
     batch_queue m_queue;
     std::vector<std::thread> m_writer_threads;
     std::thread m_stats_thread;

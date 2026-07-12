@@ -125,6 +125,7 @@ std::string read_file(const std::shared_ptr<spdlog::logger>& console, const std:
 
 int main(int argc, char* argv[]) {
     int exit_status = 0;
+    std::atomic<bool> operation_failed{false};
     try {
         cxxopts::Options options(argv[0], " - filters command line options");
         nats_asio::connect_config conf;
@@ -661,6 +662,8 @@ int main(int argc, char* argv[]) {
 
                         if (r.second.failed()) {
                             console->error("failed to subscribe with error: {}", r.second.error());
+                            operation_failed.store(true, std::memory_order_release);
+                            ioc.stop();
                         } else if (max_msgs > 0) {
                             console->info("subscribed to {} (will auto-unsubscribe after {} messages)", topic, max_msgs);
                         }
@@ -683,6 +686,8 @@ int main(int argc, char* argv[]) {
 
                         if (s.failed()) {
                             console->error("js_subscribe failed: {}", s.error());
+                            operation_failed.store(true, std::memory_order_release);
+                            ioc.stop();
                         } else {
                             console->info("JetStream subscription active: stream={} consumer={}",
                                         sub->info().stream, sub->info().name);
@@ -698,6 +703,8 @@ int main(int argc, char* argv[]) {
 
                         if (s.failed()) {
                             console->error("kv_watch failed: {}", s.error());
+                            operation_failed.store(true, std::memory_order_release);
+                            ioc.stop();
                         } else {
                             if (kv_key.empty()) {
                                 console->info("Watching KV bucket: {}", kv_bucket);
@@ -714,6 +721,7 @@ int main(int argc, char* argv[]) {
 
                         if (s.failed()) {
                             console->error("kv_create failed: {}", s.error());
+                            operation_failed.store(true, std::memory_order_release);
                         } else {
                             console->info("Created {}/{} revision={}", kv_bucket, kv_key, rev);
                         }
@@ -727,6 +735,7 @@ int main(int argc, char* argv[]) {
 
                         if (s.failed()) {
                             console->error("kv_update failed: {}", s.error());
+                            operation_failed.store(true, std::memory_order_release);
                         } else {
                             console->info("Updated {}/{} revision={} (was {})", kv_bucket, kv_key, rev, kv_revision);
                         }
@@ -738,6 +747,7 @@ int main(int argc, char* argv[]) {
 
                         if (s.failed()) {
                             console->error("kv_keys failed: {}", s.error());
+                            operation_failed.store(true, std::memory_order_release);
                         } else {
                             console->info("Keys in bucket '{}' ({} keys):", kv_bucket, keys.size());
                             for (const auto& key : keys) {
@@ -752,6 +762,7 @@ int main(int argc, char* argv[]) {
 
                         if (s.failed()) {
                             console->error("kv_history failed: {}", s.error());
+                            operation_failed.store(true, std::memory_order_release);
                         } else {
                             console->info("History for {}/{} ({} revisions):", kv_bucket, kv_key, history.size());
                             for (const auto& entry : history) {
@@ -777,6 +788,7 @@ int main(int argc, char* argv[]) {
 
                         if (s.failed()) {
                             console->error("kv_purge failed: {}", s.error());
+                            operation_failed.store(true, std::memory_order_release);
                         } else {
                             console->info("Purged {}/{} revision={}", kv_bucket, kv_key, rev);
                         }
@@ -789,6 +801,7 @@ int main(int argc, char* argv[]) {
 
                         if (s.failed()) {
                             console->error("kv_revert failed: {}", s.error());
+                            operation_failed.store(true, std::memory_order_release);
                         } else {
                             console->info("Reverted {}/{} to revision {} -> new revision={}",
                                          kv_bucket, kv_key, kv_revision, rev);
@@ -875,7 +888,7 @@ int main(int argc, char* argv[]) {
                                                                    src_cfg.file_path);
                 // Run batch publisher (blocks until done)
                 batch_pub_ptr->run();
-                return 0;
+                return batch_pub_ptr->failed() ? 1 : 0;
             } else {
                 // Standard publisher mode - multiple connections supported
                 console->info("Creating {} connections for pub mode", num_connections);
@@ -1034,7 +1047,8 @@ int main(int argc, char* argv[]) {
             ioc.run();
         }
 
-        exit_status = pub_ptr && pub_ptr->failed() ? 1 : 0;
+        exit_status = ((pub_ptr && pub_ptr->failed()) ||
+                       operation_failed.load(std::memory_order_acquire)) ? 1 : 0;
 
         // Explicitly release mode handlers before tearing down publisher shard io_contexts.
         // This guarantees connection/socket destruction happens while shard reactors are alive.

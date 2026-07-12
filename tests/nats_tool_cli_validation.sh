@@ -20,3 +20,4 @@ expect_invalid --batch_pub --batch_size 0
 expect_invalid --batch_pub --batch_size -1
 expect_invalid --batch_pub --max_queue -1
 expect_invalid --batch_pub --flush_timeout -1
+expect_invalid --batch_pub --file /tmp/nats_asio_cli_test_missing_input --stats_interval 0
