@@ -212,3 +212,21 @@ if(NATS_ASIO_INSTALL)
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nats_asio
     )
 endif()
+
+if(NATS_ASIO_BUILD_TESTS AND NATS_ASIO_INSTALL)
+    set(NATS_ASIO_CONSUMER_DEPENDENCY_PREFIX "")
+    if(DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+        set(NATS_ASIO_CONSUMER_DEPENDENCY_PREFIX
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+    endif()
+    add_test(
+        NAME installed_package_consumer
+        COMMAND ${CMAKE_COMMAND}
+            -DPROJECT_BUILD_DIR=${CMAKE_BINARY_DIR}
+            -DCONSUMER_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/install_consumer
+            -DTEST_ROOT=${CMAKE_BINARY_DIR}/installed-package-test
+            -DDEPENDENCY_PREFIX=${NATS_ASIO_CONSUMER_DEPENDENCY_PREFIX}
+            -DINSTALL_CMAKE_DIR=${CMAKE_INSTALL_LIBDIR}/cmake/nats_asio
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_installed_consumer.cmake
+    )
+endif()
