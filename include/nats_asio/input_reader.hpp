@@ -120,6 +120,7 @@ public:
             if (m_config.follow) {
                 if (m_decompressor) {
                     m_log->warn("Follow mode not supported for compressed files, ignoring --follow");
+                    m_config.follow = false;
                 } else {
                     m_file_pos = ::lseek(m_fd, 0, SEEK_END);
                     if (m_file_pos < 0) m_file_pos = 0;
@@ -184,6 +185,13 @@ public:
                 }
 
                 m_buffer.append(read_buf, bytes_read);
+                newline_pos = m_buffer.find('\n');
+                if (newline_pos != std::string::npos) {
+                    std::string line = m_buffer.substr(0, newline_pos);
+                    m_buffer.erase(0, newline_pos + 1);
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    co_return std::make_tuple(std::move(line), false, false);
+                }
             } else {
                 // Normal read (stdin or non-follow file)
                 auto [ec, bytes_read] = co_await m_stream->async_read_some(

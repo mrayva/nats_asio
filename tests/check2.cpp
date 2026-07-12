@@ -337,6 +337,46 @@ TEST(input_reader, follows_replacement_inode) {
     std::filesystem::remove_all(*source_dir);
 }
 
+TEST(input_reader, disables_follow_for_compressed_files) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto input_path = *source_dir / "input.gz";
+    auto compressed = gzip_compress("first compressed line\nsecond compressed line\n");
+    ASSERT_FALSE(compressed.empty());
+    {
+        std::ofstream input(input_path, std::ios::binary);
+        input.write(compressed.data(), static_cast<std::streamsize>(compressed.size()));
+    }
+
+    asio::io_context ioc;
+    input_source_config config;
+    config.file_path = input_path.string();
+    config.follow = true;
+    async_input_reader reader(ioc, config, spdlog::default_logger());
+    ASSERT_TRUE(reader.init());
+    EXPECT_FALSE(reader.is_follow_mode());
+
+    std::vector<std::string> lines;
+    bool error = false;
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            for (int i = 0; i < 2; ++i) {
+                auto [value, eof, read_error] = co_await reader.read_line();
+                (void)eof;
+                lines.push_back(std::move(value));
+                error = error || read_error;
+            }
+        },
+        asio::detached);
+    ioc.run();
+
+    EXPECT_FALSE(error);
+    EXPECT_EQ(lines, (std::vector<std::string>{"first compressed line",
+                                               "second compressed line"}));
+    std::filesystem::remove_all(*source_dir);
+}
+
 TEST(http_reader, parse_url_https_default_port) {
     asio::io_context ioc;
     input_source_config cfg;
