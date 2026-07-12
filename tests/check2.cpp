@@ -331,6 +331,42 @@ TEST(multi_file_reader, reads_newly_discovered_files_from_beginning) {
     std::filesystem::remove_all(*source_dir);
 }
 
+TEST(multi_file_reader, reextracts_replaced_zip_archives) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto archive_path = *source_dir / "input.zip";
+    const auto replacement_path = *source_dir / "replacement.tmp";
+    ASSERT_TRUE(create_test_zip(archive_path, "initial content\n"));
+
+    asio::io_context ioc;
+    async_multi_file_reader reader(ioc, {archive_path.string()}, true, 1,
+                                   spdlog::default_logger());
+    ASSERT_TRUE(reader.init());
+
+    std::string line;
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            auto [value, path, eof, error] = co_await reader.read_line();
+            (void)path;
+            (void)eof;
+            if (!error) line = std::move(value);
+        },
+        asio::detached);
+
+    std::thread writer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (create_test_zip(replacement_path, "replacement content\n")) {
+            std::filesystem::rename(replacement_path, archive_path);
+        }
+    });
+
+    ioc.run();
+    writer.join();
+    EXPECT_EQ(line, "replacement content");
+    std::filesystem::remove_all(*source_dir);
+}
+
 TEST(input_reader, follows_replacement_inode) {
     auto source_dir = create_zip_temp_directory();
     ASSERT_TRUE(source_dir);

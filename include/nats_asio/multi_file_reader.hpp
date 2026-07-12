@@ -185,7 +185,17 @@ private:
     struct extracted_zip_state {
         std::vector<std::string> files;
         std::unique_ptr<zip_temp_cleanup> cleanup;
+        dev_t device = 0;
+        ino_t inode = 0;
+        off_t size = 0;
+        timespec modified{};
     };
+
+    static bool same_zip_source(const extracted_zip_state& state, const struct stat& st) {
+        return state.device == st.st_dev && state.inode == st.st_ino &&
+               state.size == st.st_size && state.modified.tv_sec == st.st_mtim.tv_sec &&
+               state.modified.tv_nsec == st.st_mtim.tv_nsec;
+    }
 
     // Try to read a line from a specific file
     // Returns: {got_line, line_content, eof_reached}
@@ -301,6 +311,22 @@ private:
                 // Check if this is a zip file
                 if (is_zip_file(path) || is_zip_file_magic(path)) {
                     current_zip_paths.insert(path);
+                    struct stat zip_stat;
+                    if (::stat(path.c_str(), &zip_stat) < 0) {
+                        m_log->warn("stat failed for ZIP archive {}: {}", path, strerror(errno));
+                        continue;
+                    }
+
+                    auto existing_zip = m_extracted_zips.find(path);
+                    if (existing_zip != m_extracted_zips.end() &&
+                        !same_zip_source(existing_zip->second, zip_stat)) {
+                        m_log->info("ZIP archive replaced or modified: {}", path);
+                        for (const auto& extracted_path : existing_zip->second.files) {
+                            close_file(extracted_path);
+                        }
+                        m_extracted_zips.erase(existing_zip);
+                    }
+
                     // Check if we've already extracted this zip
                     if (m_extracted_zips.find(path) == m_extracted_zips.end()) {
                         m_log->info("Detected zip archive: {}", path);
@@ -322,7 +348,11 @@ private:
                                 path,
                                 extracted_zip_state{
                                     std::move(extracted),
-                                    std::make_unique<zip_temp_cleanup>(std::move(temp_dir), m_log)});
+                                    std::make_unique<zip_temp_cleanup>(std::move(temp_dir), m_log),
+                                    zip_stat.st_dev,
+                                    zip_stat.st_ino,
+                                    zip_stat.st_size,
+                                    zip_stat.st_mtim});
                         }
                     } else {
                         for (const auto& extracted_path : m_extracted_zips.at(path).files) {
