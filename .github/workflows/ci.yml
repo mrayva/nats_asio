@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: core-only
+            samples: "OFF"
+            tests: "OFF"
+            sanitizer_flags: ""
+            run_tests: false
+          - name: full
+            samples: "ON"
+            tests: "ON"
+            sanitizer_flags: ""
+            run_tests: true
+          - name: sanitizers
+            samples: "OFF"
+            tests: "ON"
+            sanitizer_flags: "-fsanitize=address,undefined -fno-sanitize=alignment -fno-omit-frame-pointer"
+            run_tests: true
+
+    name: ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11.6
+        with:
+          vcpkgGitCommitId: f87344cac03158cbf1467264565f1fd36b382a24
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-ci -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake
+          -DVCPKG_OVERLAY_TRIPLETS=${GITHUB_WORKSPACE}/triplets
+          -DNATS_ASIO_BUILD_SAMPLES=${{ matrix.samples }}
+          -DNATS_ASIO_BUILD_TESTS=${{ matrix.tests }}
+          -DNATS_ASIO_INSTALL=ON
+          -DCMAKE_CXX_FLAGS="${{ matrix.sanitizer_flags }}"
+          -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.sanitizer_flags }}"
+
+      - name: Build
+        run: cmake --build build-ci --parallel 2
+
+      - name: Test core-only installed consumer
+        if: matrix.name == 'core-only'
+        run: >-
+          cmake
+          -DPROJECT_BUILD_DIR=${GITHUB_WORKSPACE}/build-ci
+          -DCONSUMER_SOURCE_DIR=${GITHUB_WORKSPACE}/tests/install_consumer
+          -DTEST_ROOT=${GITHUB_WORKSPACE}/build-ci/core-consumer-test
+          -DDEPENDENCY_PREFIX=${GITHUB_WORKSPACE}/build-ci/vcpkg_installed/x64-linux
+          -DINSTALL_CMAKE_DIR=lib/cmake/nats_asio
+          -P ${GITHUB_WORKSPACE}/tests/run_installed_consumer.cmake
+
+      - name: Test
+        if: matrix.run_tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-ci --output-on-failure
