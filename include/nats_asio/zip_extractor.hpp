@@ -26,6 +26,7 @@ SOFTWARE.
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -80,11 +81,23 @@ inline std::optional<std::string> zip_entry_filename(std::string_view name) {
     return filename;
 }
 
+inline std::optional<std::filesystem::path> create_zip_temp_directory() {
+    std::string pattern =
+        (std::filesystem::temp_directory_path() / "nats_tool_zip_XXXXXX").string();
+    std::vector<char> writable_pattern(pattern.begin(), pattern.end());
+    writable_pattern.push_back('\0');
+    if (::mkdtemp(writable_pattern.data()) == nullptr) {
+        return std::nullopt;
+    }
+    return std::filesystem::path(writable_pattern.data());
+}
+
 // Extract all files from a zip archive to a temporary directory
 // Returns: vector of extracted file paths
 inline std::vector<std::string> extract_zip_to_temp(
     const std::string& zip_path,
-    std::shared_ptr<spdlog::logger> log) {
+    std::shared_ptr<spdlog::logger> log,
+    std::filesystem::path* extracted_temp_dir = nullptr) {
 
     std::vector<std::string> extracted_files;
 
@@ -99,16 +112,14 @@ inline std::vector<std::string> extract_zip_to_temp(
         return extracted_files;
     }
 
-    // Create temporary directory for extraction
-    std::filesystem::path temp_dir = std::filesystem::temp_directory_path() /
-        ("nats_tool_zip_" + std::to_string(std::hash<std::string>{}(zip_path)));
-
-    try {
-        std::filesystem::create_directories(temp_dir);
-    } catch (const std::exception& e) {
-        log->error("Failed to create temp directory {}: {}", temp_dir.string(), e.what());
+    auto temp_dir = create_zip_temp_directory();
+    if (!temp_dir) {
+        log->error("Failed to create temporary directory for ZIP archive {}", zip_path);
         zip_close(archive);
         return extracted_files;
+    }
+    if (extracted_temp_dir) {
+        *extracted_temp_dir = *temp_dir;
     }
 
     // Get number of files in archive
@@ -140,12 +151,12 @@ inline std::vector<std::string> extract_zip_to_temp(
 
         // Create output file path (flatten directory structure, deduplicate)
         // Deduplicate: if filename already exists, prepend parent dir
-        std::filesystem::path output_path = temp_dir / *filename;
+        std::filesystem::path output_path = *temp_dir / *filename;
         if (std::filesystem::exists(output_path)) {
             std::string unique_name = std::string(name);
             std::replace(unique_name.begin(), unique_name.end(), '/', '_');
             std::replace(unique_name.begin(), unique_name.end(), '\\', '_');
-            output_path = temp_dir / unique_name;
+            output_path = *temp_dir / unique_name;
         }
 
         // Read and write file
@@ -183,6 +194,14 @@ inline std::vector<std::string> extract_zip_to_temp(
 
     zip_close(archive);
 
+    if (extracted_files.empty()) {
+        std::error_code remove_ec;
+        std::filesystem::remove_all(*temp_dir, remove_ec);
+        if (extracted_temp_dir) {
+            extracted_temp_dir->clear();
+        }
+    }
+
     log->info("Successfully extracted {} file(s) from {}", extracted_files.size(), zip_path);
     return extracted_files;
 }
@@ -190,6 +209,10 @@ inline std::vector<std::string> extract_zip_to_temp(
 // RAII wrapper for automatic cleanup of extracted temp files
 class zip_temp_cleanup {
 public:
+    zip_temp_cleanup(std::filesystem::path temp_dir, std::shared_ptr<spdlog::logger> log)
+        : m_temp_dir(std::move(temp_dir)), m_log(std::move(log)) {}
+
+    // Compatibility constructor for callers using the former deterministic path.
     zip_temp_cleanup(const std::string& zip_path, std::shared_ptr<spdlog::logger> log)
         : m_log(std::move(log)) {
         m_temp_dir = std::filesystem::temp_directory_path() /

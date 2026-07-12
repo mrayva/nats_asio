@@ -90,6 +90,26 @@ TEST(zip_extractor, validates_entry_names) {
     EXPECT_EQ(*filename, "data.json");
 }
 
+TEST(zip_extractor, creates_unique_temp_directories) {
+    auto first = create_zip_temp_directory();
+    auto second = create_zip_temp_directory();
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    EXPECT_NE(*first, *second);
+    EXPECT_TRUE(std::filesystem::is_directory(*first));
+    EXPECT_TRUE(std::filesystem::is_directory(*second));
+
+    {
+        zip_temp_cleanup cleanup(*first, spdlog::default_logger());
+    }
+    EXPECT_FALSE(std::filesystem::exists(*first));
+    EXPECT_TRUE(std::filesystem::exists(*second));
+    {
+        zip_temp_cleanup cleanup(*second, spdlog::default_logger());
+    }
+    EXPECT_FALSE(std::filesystem::exists(*second));
+}
+
 TEST(http_reader, parse_url_https_default_port) {
     asio::io_context ioc;
     input_source_config cfg;

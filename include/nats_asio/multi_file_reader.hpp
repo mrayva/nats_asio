@@ -295,7 +295,8 @@ private:
                     // Check if we've already extracted this zip
                     if (m_extracted_zips.find(path) == m_extracted_zips.end()) {
                         m_log->info("Detected zip archive: {}", path);
-                        auto extracted = extract_zip_to_temp(path, m_log);
+                        std::filesystem::path temp_dir;
+                        auto extracted = extract_zip_to_temp(path, m_log, &temp_dir);
 
                         if (!extracted.empty()) {
                             // Track this zip as extracted
@@ -303,7 +304,7 @@ private:
 
                             // Add cleanup handler
                             m_zip_cleanups.push_back(
-                                std::make_unique<zip_temp_cleanup>(path, m_log));
+                                std::make_unique<zip_temp_cleanup>(std::move(temp_dir), m_log));
 
                             // Add all extracted files to current paths and open them
                             for (const auto& extracted_path : extracted) {
