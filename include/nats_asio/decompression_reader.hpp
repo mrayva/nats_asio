@@ -261,7 +261,10 @@ private:
                     return {0, true, true};
                 }
                 if (bytes == 0) {
-                    // EOF on input
+                    if (!m_zstd_frame_complete) {
+                        m_log->error("zstd compressed stream ended before frame completion");
+                        return {0, true, true};
+                    }
                     m_eof = true;
                     return {static_cast<ssize_t>(output.pos), true, false};
                 }
@@ -277,11 +280,9 @@ private:
                 return {0, true, true};
             }
 
-            if (ret == 0) {
-                // Frame complete
-                m_eof = true;
-                return {static_cast<ssize_t>(output.pos), true, false};
-            }
+            // A completed frame is only EOF once the underlying input ends.
+            // Continuing here also supports concatenated zstd frames.
+            m_zstd_frame_complete = (ret == 0);
 
             // Continue loop to fill buffer completely
         }
@@ -300,6 +301,7 @@ private:
     // zstd state
     ZSTD_DStream* m_zstd_dctx = nullptr;
     ZSTD_inBuffer m_zstd_input{};
+    bool m_zstd_frame_complete = false;
 
     // Shared compressed buffer
     std::vector<char> m_compressed_buffer;
