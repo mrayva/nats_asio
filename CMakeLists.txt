@@ -29,17 +29,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_program(CLANG_FORMAT_EXE NAMES "clang-format")
 
 if(CLANG_FORMAT_EXE)
-    # Globbing is generally discouraged for build sources, but acceptable for a dev-only format target.
-    # We exclude the build directory explicitly.
-    file(GLOB_RECURSE ALL_SOURCE_FILES 
+    # Restrict the dev-only format target to sources owned by this project.
+    file(GLOB_RECURSE ALL_SOURCE_FILES
         LIST_DIRECTORIES false
         CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp" 
-        "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/*.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/samples/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/samples/*.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp"
     )
 
-	list(FILTER ALL_SOURCE_FILES EXCLUDE REGEX ".*/build/.*")
- 
     add_custom_target(format
         COMMAND ${CLANG_FORMAT_EXE} -i -style=file ${ALL_SOURCE_FILES}
         COMMENT "Formatting project files with clang-format..."
