@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <nats_asio/compression.hpp>
 #include <nats_asio/decompression_reader.hpp>
@@ -42,19 +43,27 @@ std::vector<char> gzip_compress(std::string_view input) {
     return output;
 }
 
-bool create_test_zip(const std::filesystem::path& path, std::string_view payload) {
+bool create_test_zip(
+    const std::filesystem::path& path,
+    const std::vector<std::pair<std::string, std::string>>& entries) {
     int error = 0;
     zip_t* archive = zip_open(path.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &error);
     if (!archive) return false;
-    zip_source_t* source = zip_source_buffer(archive, payload.data(), payload.size(), 0);
-    if (!source || zip_file_add(archive, "data.txt", source, ZIP_FL_OVERWRITE) < 0) {
-        if (source) zip_source_free(source);
-        zip_discard(archive);
-        return false;
+    for (const auto& [name, payload] : entries) {
+        zip_source_t* source = zip_source_buffer(archive, payload.data(), payload.size(), 0);
+        if (!source || zip_file_add(archive, name.c_str(), source, ZIP_FL_OVERWRITE) < 0) {
+            if (source) zip_source_free(source);
+            zip_discard(archive);
+            return false;
+        }
     }
     if (zip_close(archive) == 0) return true;
     zip_discard(archive);
     return false;
+}
+
+bool create_test_zip(const std::filesystem::path& path, std::string_view payload) {
+    return create_test_zip(path, {{"data.txt", std::string(payload)}});
 }
 
 struct http_read_result {
@@ -251,6 +260,29 @@ TEST(zip_extractor, creates_unique_temp_directories) {
         zip_temp_cleanup cleanup(*second, spdlog::default_logger());
     }
     EXPECT_FALSE(std::filesystem::exists(*second));
+}
+
+TEST(zip_extractor, preserves_entries_after_flattened_name_collisions) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto archive_path = *source_dir / "collisions.zip";
+    ASSERT_TRUE(create_test_zip(
+        archive_path,
+        {{"one/x.txt", "first"}, {"two_x.txt", "second"}, {"two/x.txt", "third"}}));
+
+    std::filesystem::path extraction_dir;
+    auto files = extract_zip_to_temp(archive_path, spdlog::default_logger(), &extraction_dir);
+    ASSERT_EQ(files.size(), 3u);
+
+    std::set<std::string> contents;
+    for (const auto& file : files) {
+        std::ifstream input(file);
+        contents.emplace(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    }
+    EXPECT_EQ(contents, (std::set<std::string>{"first", "second", "third"}));
+
+    zip_temp_cleanup cleanup(std::move(extraction_dir), spdlog::default_logger());
+    std::filesystem::remove_all(*source_dir);
 }
 
 TEST(multi_file_reader, preserves_extracted_zip_files_across_rescans) {

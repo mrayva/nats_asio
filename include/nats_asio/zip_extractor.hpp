@@ -92,6 +92,28 @@ inline std::optional<std::filesystem::path> create_zip_temp_directory() {
     return std::filesystem::path(writable_pattern.data());
 }
 
+inline std::filesystem::path unique_zip_output_path(
+    const std::filesystem::path& temp_dir,
+    std::string_view entry_name,
+    std::string_view filename) {
+    std::filesystem::path candidate = temp_dir / filename;
+    if (!std::filesystem::exists(candidate)) return candidate;
+
+    std::string flattened(entry_name);
+    std::replace(flattened.begin(), flattened.end(), '/', '_');
+    std::replace(flattened.begin(), flattened.end(), '\\', '_');
+    candidate = temp_dir / flattened;
+    if (!std::filesystem::exists(candidate)) return candidate;
+
+    const std::filesystem::path flattened_path(flattened);
+    const std::string stem = flattened_path.stem().string();
+    const std::string extension = flattened_path.extension().string();
+    for (size_t suffix = 2;; ++suffix) {
+        candidate = temp_dir / (stem + "_" + std::to_string(suffix) + extension);
+        if (!std::filesystem::exists(candidate)) return candidate;
+    }
+}
+
 // Extract all files from a zip archive to a temporary directory
 // Returns: vector of extracted file paths
 inline std::vector<std::string> extract_zip_to_temp(
@@ -149,15 +171,8 @@ inline std::vector<std::string> extract_zip_to_temp(
             continue;
         }
 
-        // Create output file path (flatten directory structure, deduplicate)
-        // Deduplicate: if filename already exists, prepend parent dir
-        std::filesystem::path output_path = *temp_dir / *filename;
-        if (std::filesystem::exists(output_path)) {
-            std::string unique_name = std::string(name);
-            std::replace(unique_name.begin(), unique_name.end(), '/', '_');
-            std::replace(unique_name.begin(), unique_name.end(), '\\', '_');
-            output_path = *temp_dir / unique_name;
-        }
+        std::filesystem::path output_path =
+            unique_zip_output_path(*temp_dir, name, *filename);
 
         // Read and write file
         std::ofstream out(output_path, std::ios::binary);
