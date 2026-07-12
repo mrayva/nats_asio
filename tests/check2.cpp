@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -137,6 +138,18 @@ TEST(zstd_compressor, enforces_decompression_output_limit) {
     EXPECT_TRUE(compressor.decompress(compressed, payload.size() - 1).empty());
     auto decompressed = compressor.decompress(compressed, payload.size());
     EXPECT_EQ(std::string(decompressed.begin(), decompressed.end()), payload);
+}
+
+TEST(zstd_compressor, detects_wire_format_magic) {
+    const std::string payload = "compressed payload";
+    zstd_compressor compressor;
+    auto compressed = compressor.compress(std::span(payload.data(), payload.size()));
+    ASSERT_FALSE(compressed.empty());
+
+    EXPECT_TRUE(zstd_compressor::is_compressed(compressed));
+    const std::array<char, 4> plain{'t', 'e', 'x', 't'};
+    EXPECT_FALSE(zstd_compressor::is_compressed(plain));
+    EXPECT_FALSE(zstd_compressor::is_compressed(std::span(plain.data(), 3)));
 }
 
 TEST(decompression_reader, rejects_truncated_zstd_frame) {

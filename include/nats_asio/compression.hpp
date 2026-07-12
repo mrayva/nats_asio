@@ -24,7 +24,6 @@ SOFTWARE.
 
 #pragma once
 
-#include <cstring>
 #include <limits>
 #include <span>
 #include <utility>
@@ -113,9 +112,10 @@ public:
     // Check if data appears to be zstd compressed
     static bool is_compressed(std::span<const char> data) {
         if (data.size() < 4) return false;
-        // zstd magic number: 0xFD2FB528
-        unsigned int magic = ZSTD_MAGICNUMBER;
-        return std::memcmp(data.data(), &magic, 4) == 0;
+        return static_cast<unsigned char>(data[0]) == 0x28 &&
+               static_cast<unsigned char>(data[1]) == 0xb5 &&
+               static_cast<unsigned char>(data[2]) == 0x2f &&
+               static_cast<unsigned char>(data[3]) == 0xfd;
     }
 
 private:
