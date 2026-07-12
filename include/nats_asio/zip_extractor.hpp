@@ -25,13 +25,18 @@ SOFTWARE.
 
 #pragma once
 
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <spdlog/spdlog.h>
 #include <string>
+#include <string_view>
+#include <system_error>
 #include <vector>
-#include <filesystem>
 #include <zip.h>
-#include <fstream>
-#include <memory>
 
 namespace nats_asio {
 
@@ -61,6 +66,18 @@ inline bool is_zip_file_magic(const std::string& path) {
             static_cast<unsigned char>(magic[1]) == 0x4B &&
             static_cast<unsigned char>(magic[2]) == 0x03 &&
             static_cast<unsigned char>(magic[3]) == 0x04);
+}
+
+inline std::optional<std::string> zip_entry_filename(std::string_view name) {
+    if (name.empty() || name.back() == '/') {
+        return std::nullopt;
+    }
+
+    std::string filename = std::filesystem::path(name).filename().string();
+    if (filename.empty()) {
+        return std::nullopt;
+    }
+    return filename;
 }
 
 // Extract all files from a zip archive to a temporary directory
@@ -106,8 +123,11 @@ inline std::vector<std::string> extract_zip_to_temp(
             continue;
         }
 
-        // Skip directories
-        if (name[strlen(name) - 1] == '/') {
+        auto filename = zip_entry_filename(name);
+        if (!filename) {
+            if (*name == '\0') {
+                log->warn("Skipping ZIP entry {} with an empty name in {}", i, zip_path);
+            }
             continue;
         }
 
@@ -119,15 +139,8 @@ inline std::vector<std::string> extract_zip_to_temp(
         }
 
         // Create output file path (flatten directory structure, deduplicate)
-        std::string filename = std::filesystem::path(name).filename().string();
-        if (filename.empty()) {
-            filename = std::string(name);
-            std::replace(filename.begin(), filename.end(), '/', '_');
-            std::replace(filename.begin(), filename.end(), '\\', '_');
-        }
-
         // Deduplicate: if filename already exists, prepend parent dir
-        std::filesystem::path output_path = temp_dir / filename;
+        std::filesystem::path output_path = temp_dir / *filename;
         if (std::filesystem::exists(output_path)) {
             std::string unique_name = std::string(name);
             std::replace(unique_name.begin(), unique_name.end(), '/', '_');
@@ -145,15 +158,22 @@ inline std::vector<std::string> extract_zip_to_temp(
 
         char buffer[8192];
         zip_int64_t bytes_read;
+        bool write_failed = false;
         while ((bytes_read = zip_fread(zf, buffer, sizeof(buffer))) > 0) {
             out.write(buffer, bytes_read);
+            if (!out) {
+                write_failed = true;
+                break;
+            }
         }
 
         zip_fclose(zf);
         out.close();
 
-        if (bytes_read < 0) {
-            log->warn("Error reading entry {} ({}) from {}", i, name, zip_path);
+        if (bytes_read < 0 || write_failed) {
+            log->warn("Error extracting entry {} ({}) from {}", i, name, zip_path);
+            std::error_code remove_ec;
+            std::filesystem::remove(output_path, remove_ec);
             continue;
         }
 

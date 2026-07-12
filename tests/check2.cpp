@@ -7,6 +7,7 @@
 #include <nats_asio/decompression_reader.hpp>
 #include <nats_asio/http_reader.hpp>
 #include <nats_asio/nats_asio.hpp>
+#include <nats_asio/zip_extractor.hpp>
 #include <spdlog/spdlog.h>
 #include <type_traits>
 
@@ -79,6 +80,14 @@ TEST(decompression_reader, reads_concatenated_zstd_frames) {
     ASSERT_FALSE(error);
     EXPECT_TRUE(eof);
     EXPECT_EQ(std::string(output.data(), static_cast<size_t>(bytes_read)), first + second);
+}
+
+TEST(zip_extractor, validates_entry_names) {
+    EXPECT_FALSE(zip_entry_filename(""));
+    EXPECT_FALSE(zip_entry_filename("directory/"));
+    auto filename = zip_entry_filename("directory/data.json");
+    ASSERT_TRUE(filename);
+    EXPECT_EQ(*filename, "data.json");
 }
 
 TEST(http_reader, parse_url_https_default_port) {
