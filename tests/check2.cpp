@@ -427,6 +427,47 @@ TEST(multi_file_reader, reextracts_replaced_zip_archives) {
     std::filesystem::remove_all(*source_dir);
 }
 
+TEST(multi_file_reader, clears_partial_lines_after_truncation) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto input_path = *source_dir / "truncate.log";
+    {
+        std::ofstream input(input_path);
+    }
+
+    asio::io_context ioc;
+    async_multi_file_reader reader(ioc, {input_path.string()}, true, 1,
+                                   spdlog::default_logger());
+    ASSERT_TRUE(reader.init());
+
+    std::string line;
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            auto [value, path, eof, error] = co_await reader.read_line();
+            (void)path;
+            (void)eof;
+            if (!error) line = std::move(value);
+        },
+        asio::detached);
+
+    std::thread writer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        {
+            std::ofstream input(input_path, std::ios::app);
+            input << "partial";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::ofstream replacement(input_path, std::ios::trunc);
+        replacement << "new\n";
+    });
+
+    ioc.run();
+    writer.join();
+    EXPECT_EQ(line, "new");
+    std::filesystem::remove_all(*source_dir);
+}
+
 TEST(input_reader, follows_replacement_inode) {
     auto source_dir = create_zip_temp_directory();
     ASSERT_TRUE(source_dir);

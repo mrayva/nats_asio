@@ -35,6 +35,7 @@ SOFTWARE.
 #include <glob.h>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <spdlog/spdlog.h>
 #include <string>
@@ -55,6 +56,7 @@ public:
         std::string path;
         int fd = -1;
         ino_t inode = 0;           // For rotation detection
+        dev_t device = 0;
         off_t position = 0;
         std::string buffer;
         bool eof_reached = false;
@@ -148,7 +150,9 @@ public:
 
             if (m_follow) {
                 // In follow mode, check for new data or new files
-                check_file_rotations();
+                if (auto failed_path = check_file_rotations()) {
+                    co_return std::make_tuple("", std::move(*failed_path), true, true);
+                }
                 scan_for_files();  // Look for new files
 
                 // Check if any files have new data
@@ -157,11 +161,13 @@ public:
                     if (file.has_error) continue;
 
                     struct stat st;
-                    if (::fstat(file.fd, &st) == 0) {
-                        if (st.st_size > file.position) {
-                            file.eof_reached = false;
-                            any_new_data = true;
-                        }
+                    if (::fstat(file.fd, &st) < 0) {
+                        m_log->error("fstat failed for {}: {}", path, strerror(errno));
+                        co_return std::make_tuple("", path, true, true);
+                    }
+                    if (st.st_size > file.position) {
+                        file.eof_reached = false;
+                        any_new_data = true;
                     }
                 }
 
@@ -263,6 +269,10 @@ private:
         if (bytes_read == 0 && eof) {
             // EOF reached
             if (!file.buffer.empty()) {
+                if (m_follow) {
+                    file.eof_reached = true;
+                    return std::make_tuple(false, "", true, false);
+                }
                 if (file.buffer.size() > m_max_line_size) {
                     m_log->error("Input line in {} exceeds {} bytes", file.path,
                                  m_max_line_size);
@@ -449,6 +459,7 @@ private:
         file.path = path;
         file.fd = fd;
         file.inode = st.st_ino;
+        file.device = st.st_dev;
         file.position = 0;
         file.eof_reached = false;
         file.has_error = false;
@@ -511,7 +522,7 @@ private:
     }
 
     // Check for file rotations (inode changes)
-    void check_file_rotations() {
+    std::optional<std::string> check_file_rotations() {
         std::vector<std::string> deleted_paths;
         std::vector<std::string> rotated_paths;
 
@@ -525,7 +536,7 @@ private:
                 continue;
             }
 
-            if (st.st_ino != file.inode) {
+            if (st.st_ino != file.inode || st.st_dev != file.device) {
                 m_log->info("File rotated: {} (inode {} -> {})", path, file.inode, st.st_ino);
                 rotated_paths.push_back(path);
                 continue;
@@ -533,8 +544,14 @@ private:
 
             if (st.st_size < file.position) {
                 m_log->info("File truncated: {}", path);
+                if (::lseek(file.fd, 0, SEEK_SET) < 0) {
+                    m_log->error("Failed to seek truncated file {}: {}", path,
+                                 strerror(errno));
+                    file.has_error = true;
+                    return path;
+                }
                 file.position = 0;
-                ::lseek(file.fd, 0, SEEK_SET);
+                file.buffer.clear();
                 file.eof_reached = false;
             }
         }
@@ -551,8 +568,10 @@ private:
             }
             if (!open_file(path)) {
                 m_log->error("Failed to reopen rotated file: {}", path);
+                return path;
             }
         }
+        return std::nullopt;
     }
 
     asio::io_context& m_ioc;
