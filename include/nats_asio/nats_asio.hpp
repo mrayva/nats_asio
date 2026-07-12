@@ -4766,10 +4766,12 @@ private:
 
                 // Update stats for reconnection
                 if (m_stats.reconnect_count.load(std::memory_order_relaxed) > 0 ||
-                    m_stats.connected_at != std::chrono::steady_clock::time_point{}) {
+                    m_stats.connected_at.load(std::memory_order_acquire) !=
+                        std::chrono::steady_clock::time_point{}) {
                     m_stats.reconnect_count.fetch_add(1, std::memory_order_relaxed);
                 }
-                m_stats.connected_at = std::chrono::steady_clock::now();
+                m_stats.connected_at.store(std::chrono::steady_clock::now(),
+                                           std::memory_order_release);
                 m_pings_outstanding.store(0, std::memory_order_release);
 
                 m_is_connected = true;

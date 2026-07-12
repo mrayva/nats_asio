@@ -471,7 +471,8 @@ struct connection_stats {
 
     // Connection state
     std::atomic<uint32_t> reconnect_count{0};
-    std::chrono::steady_clock::time_point connected_at{};
+    std::atomic<std::chrono::steady_clock::time_point> connected_at{
+        std::chrono::steady_clock::time_point{}};
 
     // Ping/pong statistics
     std::atomic<uint64_t> pings_sent{0};
@@ -565,11 +566,12 @@ struct connection_stats {
 
     // Get uptime since connected
     std::chrono::milliseconds uptime() const noexcept {
-        if (connected_at == std::chrono::steady_clock::time_point{}) {
+        const auto connected_at_snapshot = connected_at.load(std::memory_order_acquire);
+        if (connected_at_snapshot == std::chrono::steady_clock::time_point{}) {
             return std::chrono::milliseconds{0};
         }
         return std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - connected_at);
+            std::chrono::steady_clock::now() - connected_at_snapshot);
     }
 };
 
