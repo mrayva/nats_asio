@@ -140,6 +140,10 @@ public:
         // Check if we have a complete line in the buffer
         auto newline_pos = m_buffer.find('\n');
         if (newline_pos != std::string::npos) {
+            if (newline_pos > max_line_size()) {
+                m_log->error("Input line exceeds {} bytes", max_line_size());
+                co_return std::make_tuple("", true, true);
+            }
             std::string line = m_buffer.substr(0, newline_pos);
             m_buffer.erase(0, newline_pos + 1);
             // Remove trailing \r if present (Windows line endings)
@@ -168,6 +172,10 @@ public:
                 if (bytes_read == 0 && eof) {
                     // EOF - return any remaining data in buffer
                     if (!m_buffer.empty()) {
+                        if (m_buffer.size() > max_line_size()) {
+                            m_log->error("Input line exceeds {} bytes", max_line_size());
+                            co_return std::make_tuple("", true, true);
+                        }
                         std::string line = std::move(m_buffer);
                         m_buffer.clear();
                         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -187,10 +195,18 @@ public:
                 m_buffer.append(read_buf, bytes_read);
                 newline_pos = m_buffer.find('\n');
                 if (newline_pos != std::string::npos) {
+                    if (newline_pos > max_line_size()) {
+                        m_log->error("Input line exceeds {} bytes", max_line_size());
+                        co_return std::make_tuple("", true, true);
+                    }
                     std::string line = m_buffer.substr(0, newline_pos);
                     m_buffer.erase(0, newline_pos + 1);
                     if (!line.empty() && line.back() == '\r') line.pop_back();
                     co_return std::make_tuple(std::move(line), false, false);
+                }
+                if (m_buffer.size() > max_line_size()) {
+                    m_log->error("Input line exceeds {} bytes", max_line_size());
+                    co_return std::make_tuple("", true, true);
                 }
             } else {
                 // Normal read (stdin or non-follow file)
@@ -202,6 +218,10 @@ public:
                     if (ec == asio::error::eof || ec == asio::error::not_found) {
                         // EOF - return any remaining data in buffer
                         if (!m_buffer.empty()) {
+                            if (m_buffer.size() > max_line_size()) {
+                                m_log->error("Input line exceeds {} bytes", max_line_size());
+                                co_return std::make_tuple("", true, true);
+                            }
                             std::string line = std::move(m_buffer);
                             m_buffer.clear();
                             if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -216,6 +236,10 @@ public:
                 if (bytes_read == 0) {
                     // No more data
                     if (!m_buffer.empty()) {
+                        if (m_buffer.size() > max_line_size()) {
+                            m_log->error("Input line exceeds {} bytes", max_line_size());
+                            co_return std::make_tuple("", true, true);
+                        }
                         std::string line = std::move(m_buffer);
                         m_buffer.clear();
                         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -229,10 +253,18 @@ public:
                 // Check for complete line
                 newline_pos = m_buffer.find('\n');
                 if (newline_pos != std::string::npos) {
+                    if (newline_pos > max_line_size()) {
+                        m_log->error("Input line exceeds {} bytes", max_line_size());
+                        co_return std::make_tuple("", true, true);
+                    }
                     std::string line = m_buffer.substr(0, newline_pos);
                     m_buffer.erase(0, newline_pos + 1);
                     if (!line.empty() && line.back() == '\r') line.pop_back();
                     co_return std::make_tuple(std::move(line), false, false);
+                }
+                if (m_buffer.size() > max_line_size()) {
+                    m_log->error("Input line exceeds {} bytes", max_line_size());
+                    co_return std::make_tuple("", true, true);
                 }
             }
         }
@@ -241,6 +273,11 @@ public:
     bool is_follow_mode() const { return m_config.follow; }
 
 private:
+    size_t max_line_size() const {
+        return m_config.input_max_line_size == 0 ? 16 * 1024 * 1024
+                                                 : m_config.input_max_line_size;
+    }
+
     // Read with follow mode (tail -f behavior)
     asio::awaitable<std::tuple<std::string, bool, bool>> read_line_follow_mode(
         char* read_buf, size_t buf_size) {
@@ -306,10 +343,18 @@ private:
                     // Check for complete line
                     auto newline_pos = m_buffer.find('\n');
                     if (newline_pos != std::string::npos) {
+                        if (newline_pos > max_line_size()) {
+                            m_log->error("Input line exceeds {} bytes", max_line_size());
+                            co_return std::make_tuple("", true, true);
+                        }
                         std::string line = m_buffer.substr(0, newline_pos);
                         m_buffer.erase(0, newline_pos + 1);
                         if (!line.empty() && line.back() == '\r') line.pop_back();
                         co_return std::make_tuple(std::move(line), false, false);
+                    }
+                    if (m_buffer.size() > max_line_size()) {
+                        m_log->error("Input line exceeds {} bytes", max_line_size());
+                        co_return std::make_tuple("", true, true);
                     }
                 }
             }

@@ -65,9 +65,12 @@ public:
 
     async_multi_file_reader(asio::io_context& ioc, std::vector<std::string> patterns,
                             bool follow, int poll_interval_ms,
-                            std::shared_ptr<spdlog::logger> log)
+                            std::shared_ptr<spdlog::logger> log,
+                            size_t max_line_size = 16 * 1024 * 1024)
         : m_ioc(ioc), m_patterns(std::move(patterns)), m_follow(follow),
-          m_poll_interval_ms(poll_interval_ms), m_log(std::move(log)) {}
+          m_poll_interval_ms(poll_interval_ms), m_max_line_size(
+              max_line_size == 0 ? 16 * 1024 * 1024 : max_line_size),
+          m_log(std::move(log)) {}
 
     ~async_multi_file_reader() {
         close_all_files();
@@ -117,6 +120,9 @@ public:
                 if (file.has_error) continue;
 
                 auto result = try_read_line_from_file(file);
+                if (std::get<3>(result)) {
+                    co_return std::make_tuple("", path, true, true);
+                }
                 if (std::get<0>(result)) {
                     // Got a line!
                     line = std::move(std::get<1>(result));
@@ -198,21 +204,26 @@ private:
     }
 
     // Try to read a line from a specific file
-    // Returns: {got_line, line_content, eof_reached}
-    std::tuple<bool, std::string, bool> try_read_line_from_file(tracked_file& file) {
+    // Returns: {got_line, line_content, eof_reached, error_occurred}
+    std::tuple<bool, std::string, bool, bool> try_read_line_from_file(tracked_file& file) {
         // Check if we have a complete line in the buffer
         auto newline_pos = file.buffer.find('\n');
         if (newline_pos != std::string::npos) {
+            if (newline_pos > m_max_line_size) {
+                m_log->error("Input line in {} exceeds {} bytes", file.path, m_max_line_size);
+                file.has_error = true;
+                return std::make_tuple(false, "", true, true);
+            }
             std::string line = file.buffer.substr(0, newline_pos);
             file.buffer.erase(0, newline_pos + 1);
             if (!line.empty() && line.back() == '\r') {
                 line.pop_back();
             }
-            return std::make_tuple(true, std::move(line), false);
+            return std::make_tuple(true, std::move(line), false, false);
         }
 
         if (file.eof_reached) {
-            return std::make_tuple(false, "", true);
+            return std::make_tuple(false, "", true, false);
         }
 
         // Try to read more data
@@ -233,7 +244,7 @@ private:
             if (bytes_read < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     // No data available right now
-                    return std::make_tuple(false, "", false);
+                    return std::make_tuple(false, "", false, false);
                 }
                 error = true;
             } else if (bytes_read == 0) {
@@ -245,25 +256,31 @@ private:
             m_log->error("Read error on {}: {}", file.path,
                         file.decompressor ? "decompression error" : strerror(errno));
             file.has_error = true;
-            return std::make_tuple(false, "", true);
+            return std::make_tuple(false, "", true, true);
         }
 
         if (bytes_read == 0 && eof) {
             // EOF reached
             if (!file.buffer.empty()) {
+                if (file.buffer.size() > m_max_line_size) {
+                    m_log->error("Input line in {} exceeds {} bytes", file.path,
+                                 m_max_line_size);
+                    file.has_error = true;
+                    return std::make_tuple(false, "", true, true);
+                }
                 std::string line = std::move(file.buffer);
                 file.buffer.clear();
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 file.eof_reached = true;
-                return std::make_tuple(true, std::move(line), true);
+                return std::make_tuple(true, std::move(line), true, false);
             }
             file.eof_reached = true;
-            return std::make_tuple(false, "", true);
+            return std::make_tuple(false, "", true, false);
         }
 
         if (bytes_read == 0) {
             // No data available right now
-            return std::make_tuple(false, "", false);
+            return std::make_tuple(false, "", false, false);
         }
 
         if (!file.decompressor) {
@@ -274,14 +291,25 @@ private:
         // Check for complete line again
         newline_pos = file.buffer.find('\n');
         if (newline_pos != std::string::npos) {
+            if (newline_pos > m_max_line_size) {
+                m_log->error("Input line in {} exceeds {} bytes", file.path, m_max_line_size);
+                file.has_error = true;
+                return std::make_tuple(false, "", true, true);
+            }
             std::string line = file.buffer.substr(0, newline_pos);
             file.buffer.erase(0, newline_pos + 1);
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            return std::make_tuple(true, std::move(line), false);
+            return std::make_tuple(true, std::move(line), false, false);
+        }
+
+        if (file.buffer.size() > m_max_line_size) {
+            m_log->error("Input line in {} exceeds {} bytes", file.path, m_max_line_size);
+            file.has_error = true;
+            return std::make_tuple(false, "", true, true);
         }
 
         // No complete line yet
-        return std::make_tuple(false, "", false);
+        return std::make_tuple(false, "", false, false);
     }
 
     // Scan for files matching patterns and open new ones
@@ -529,6 +557,7 @@ private:
     std::vector<std::string> m_patterns;
     bool m_follow;
     int m_poll_interval_ms;
+    size_t m_max_line_size;
     bool m_initial_scan = true;
     std::shared_ptr<spdlog::logger> m_log;
 

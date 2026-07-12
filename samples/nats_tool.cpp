@@ -214,6 +214,7 @@ int main(int argc, char* argv[]) {
         ("file", "Read input from file(s)/glob pattern (repeatable, supports wildcards)", cxxopts::value<std::vector<std::string>>())
         ("follow,f", "Follow mode - continuously read new data (like tail -f)")
         ("poll_interval", "Poll interval in ms for follow mode (default: 100)", cxxopts::value<int>())
+        ("max_line_size", "Maximum input line size in bytes (default: 16777216)", cxxopts::value<std::size_t>())
         ("http", "HTTP URL to read streaming data from (e.g., Feldera output)", cxxopts::value<std::string>())
         ("http_method", "HTTP method: GET or POST (default: POST)", cxxopts::value<std::string>())
         ("http_body", "HTTP request body for POST method", cxxopts::value<std::string>())
@@ -570,6 +571,13 @@ int main(int argc, char* argv[]) {
         src_cfg.follow = result.count("follow") > 0;
         if (result.count("poll_interval")) {
             src_cfg.poll_interval_ms = result["poll_interval"].as<int>();
+        }
+        if (result.count("max_line_size")) {
+            src_cfg.input_max_line_size = result["max_line_size"].as<std::size_t>();
+            if (src_cfg.input_max_line_size == 0) {
+                console->error("--max_line_size must be greater than 0");
+                return 1;
+            }
         }
 
         // HTTP source options

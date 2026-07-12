@@ -456,6 +456,67 @@ TEST(input_reader, disables_follow_for_compressed_files) {
     std::filesystem::remove_all(*source_dir);
 }
 
+TEST(input_reader, rejects_oversized_lines) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto input_path = *source_dir / "oversized.log";
+    {
+        std::ofstream input(input_path);
+        input << "12345";
+    }
+
+    asio::io_context ioc;
+    input_source_config config;
+    config.file_path = input_path.string();
+    config.input_max_line_size = 4;
+    async_input_reader reader(ioc, config, spdlog::default_logger());
+    ASSERT_TRUE(reader.init());
+
+    bool error = false;
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            auto [line, eof, read_error] = co_await reader.read_line();
+            (void)line;
+            (void)eof;
+            error = read_error;
+        },
+        asio::detached);
+    ioc.run();
+    EXPECT_TRUE(error);
+    std::filesystem::remove_all(*source_dir);
+}
+
+TEST(multi_file_reader, propagates_oversized_line_errors) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto input_path = *source_dir / "oversized.log";
+    {
+        std::ofstream input(input_path);
+        input << "12345";
+    }
+
+    asio::io_context ioc;
+    async_multi_file_reader reader(ioc, {input_path.string()}, false, 1,
+                                   spdlog::default_logger(), 4);
+    ASSERT_TRUE(reader.init());
+
+    bool error = false;
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            auto [line, path, eof, read_error] = co_await reader.read_line();
+            (void)line;
+            (void)path;
+            (void)eof;
+            error = read_error;
+        },
+        asio::detached);
+    ioc.run();
+    EXPECT_TRUE(error);
+    std::filesystem::remove_all(*source_dir);
+}
+
 TEST(http_reader, parse_url_https_default_port) {
     asio::io_context ioc;
     input_source_config cfg;

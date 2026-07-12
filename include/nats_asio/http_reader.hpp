@@ -62,6 +62,7 @@ struct input_source_config {
     std::vector<std::string> file_patterns;     // Glob patterns for multiple files
     bool follow = false;                        // Continuously read new data (like tail -f)
     int poll_interval_ms = 100;                 // Poll interval for follow mode
+    size_t input_max_line_size = 16 * 1024 * 1024;
 
     // HTTP source options
     std::string http_url;               // HTTP URL to fetch from (empty = not HTTP)

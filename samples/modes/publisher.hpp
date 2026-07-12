@@ -183,7 +183,8 @@ public:
             // Multi-file reader with glob patterns
             auto patterns = m_src_cfg.get_patterns();
             m_multi_file_reader = std::make_unique<async_multi_file_reader>(
-                m_ioc, patterns, m_src_cfg.follow, m_src_cfg.poll_interval_ms, m_log);
+                m_ioc, patterns, m_src_cfg.follow, m_src_cfg.poll_interval_ms, m_log,
+                m_src_cfg.input_max_line_size);
 
             if (!m_multi_file_reader->init()) {
                 m_log->error("Failed to initialize multi-file reader");
