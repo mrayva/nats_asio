@@ -51,6 +51,12 @@ namespace nats_asio {
 // ============================================================================
 
 class async_multi_file_reader {
+private:
+    struct scan_result {
+        bool has_files = false;
+        bool error = false;
+    };
+
 public:
     struct tracked_file {
         std::string path;
@@ -82,9 +88,13 @@ public:
     // Initialize - scan for files and open them
     bool init() {
         // Expand all glob patterns
-        const bool found_files = scan_for_files();
+        const auto scan = scan_for_files();
         m_initial_scan = false;
-        if (!found_files) {
+        if (scan.error) {
+            m_log->error("Failed to scan input file patterns");
+            return false;
+        }
+        if (!scan.has_files) {
             m_log->error("Failed to find any files matching patterns");
             return false;
         }
@@ -153,7 +163,10 @@ public:
                 if (auto failed_path = check_file_rotations()) {
                     co_return std::make_tuple("", std::move(*failed_path), true, true);
                 }
-                scan_for_files();  // Look for new files
+                auto scan = scan_for_files();  // Look for new files
+                if (scan.error) {
+                    co_return std::make_tuple("", "", true, true);
+                }
 
                 // Check if any files have new data
                 bool any_new_data = false;
@@ -324,21 +337,24 @@ private:
     }
 
     // Scan for files matching patterns and open new ones
-    bool scan_for_files() {
+    scan_result scan_for_files() {
         std::set<std::string> current_paths;
         std::set<std::string> current_zip_paths;
+        bool scan_error = false;
 
         for (const auto& pattern : m_patterns) {
             glob_t glob_result;
             memset(&glob_result, 0, sizeof(glob_result));
 
-            int ret = glob(pattern.c_str(), GLOB_TILDE | GLOB_BRACE, nullptr, &glob_result);
+            int ret = glob(pattern.c_str(), GLOB_TILDE | GLOB_BRACE | GLOB_ERR, nullptr,
+                           &glob_result);
 
             if (ret != 0) {
                 if (ret == GLOB_NOMATCH) {
                     m_log->debug("No files match pattern: {}", pattern);
                 } else {
                     m_log->warn("glob() failed for pattern {}: {}", pattern, ret);
+                    scan_error = true;
                 }
                 globfree(&glob_result);
                 continue;
@@ -436,7 +452,7 @@ private:
             }
         }
 
-        return !m_files.empty();
+        return {!m_files.empty(), scan_error};
     }
 
     // Open and track a new file

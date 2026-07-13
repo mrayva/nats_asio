@@ -663,6 +663,28 @@ TEST(multi_file_reader, propagates_oversized_line_errors) {
     std::filesystem::remove_all(*source_dir);
 }
 
+TEST(multi_file_reader, rejects_glob_traversal_errors) {
+    auto source_dir = create_zip_temp_directory();
+    ASSERT_TRUE(source_dir);
+    const auto valid_file = *source_dir / "valid.log";
+    const auto blocked_dir = *source_dir / "blocked";
+    {
+        std::ofstream output(valid_file);
+        output << "data";
+    }
+    ASSERT_TRUE(std::filesystem::create_directory(blocked_dir));
+    std::filesystem::permissions(blocked_dir, std::filesystem::perms::none);
+
+    asio::io_context ioc;
+    async_multi_file_reader reader(
+        ioc, {valid_file.string(), blocked_dir.string() + "/*.log"}, false, 1,
+        spdlog::default_logger());
+    const bool initialized = reader.init();
+    std::filesystem::permissions(blocked_dir, std::filesystem::perms::owner_all);
+    EXPECT_FALSE(initialized);
+    std::filesystem::remove_all(*source_dir);
+}
+
 TEST(http_reader, parse_url_https_default_port) {
     asio::io_context ioc;
     input_source_config cfg;
