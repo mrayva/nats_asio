@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <spdlog/spdlog.h>
 
 #include <array>
 #include <chrono>
@@ -13,22 +14,78 @@
 #include <nats_asio/multi_file_reader.hpp>
 #include <nats_asio/nats_asio.hpp>
 #include <nats_asio/zip_extractor.hpp>
-#include <spdlog/spdlog.h>
 #include <thread>
 #include <type_traits>
+
+#if defined(__unix__)
+#include <unistd.h>
+#endif
 
 using namespace nats_asio;
 
 namespace {
+constexpr std::string_view test_tls_certificate = R"PEM(-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUD7i5gOs7PwgFUMRJuNR5jzHqIegwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcxMzAxMjEwOFoXDTM2MDcx
+MDAxMjEwOFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEAqy1W07OFK4ttDpb4xqTGcvNgoPPQN/HK1pt9H1Bx9eHG
+/ce9lR4v/jM7+llWSao8kg6rHbQlHQ/8Fs8aHa1/DNpIM1QlPtQ7oRcyZ1hrkdxR
+ozpSjb4OzeJ6duqH1E4k7yfK/xHPRe+94pTpPZLrtFwgZvGoo3sLNyMnPY1Lhfs0
+SS+SzrYLm1LsgCAYRazZzkfSWbPgRkjvqEwVp6NOdQzT4AX6cS6wDSPJWseTAqAq
+H6A7cD1cD3cnp5hSKm0NzzIQb6UFVhthXSXu8ToyC0Y3wBXEhzPUElRcHh3UwUbA
++Q/fgS5uRzP66veR1h3NomwSx1ZlduZszGqrdocLXwIDAQABo28wbTAdBgNVHQ4E
+FgQU7W6eFXmvP627zNPBcxnqkhE6zLowHwYDVR0jBBgwFoAU7W6eFXmvP627zNPB
+cxnqkhE6zLowDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH
+BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAFREQmMcsZtUi62yF+E4Q4v1TwgHMbO4
+TOMNCkzucnlP6rtr14XwOXbpvawweYnigTdxwVF1RzDyj0+AeBq0Q8v82W3j6rSd
+rmMA6zpaOTlLeogeS0vT3+qo7EAIDJBlLxY7elxyvgUinGD6bRI3SZkw0tdXZoAI
+XOCfYVh0CAMNUdrvnffJLCLZgMne56SN/SONL8oiazYA9davL4j/jz8I0OHtFWah
+f8lrlvAFKtED1q0W4I8sYNzLmr+WTPU2RR+4I/0MsHp1rZLnpSX704weIvn+/qxw
+pby990w3F8LUaHZXc3QnMIwjRQVgWkfp5aXcfaS3qp1XS8jZZ0293/I=
+-----END CERTIFICATE-----
+)PEM";
+
+constexpr std::string_view test_tls_private_key = R"PEM(-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCrLVbTs4Uri20O
+lvjGpMZy82Cg89A38crWm30fUHH14cb9x72VHi/+Mzv6WVZJqjySDqsdtCUdD/wW
+zxodrX8M2kgzVCU+1DuhFzJnWGuR3FGjOlKNvg7N4np26ofUTiTvJ8r/Ec9F773i
+lOk9kuu0XCBm8aijews3Iyc9jUuF+zRJL5LOtgubUuyAIBhFrNnOR9JZs+BGSO+o
+TBWno051DNPgBfpxLrANI8lax5MCoCofoDtwPVwPdyenmFIqbQ3PMhBvpQVWG2Fd
+Je7xOjILRjfAFcSHM9QSVFweHdTBRsD5D9+BLm5HM/rq95HWHc2ibBLHVmV25mzM
+aqt2hwtfAgMBAAECggEABO9qNPFUkhRTgRuuMX/3rsHAk/NjmfFRMU3LVjdKCdZI
+F/IFz8JOjOwqOwYPXFFZrLZajaEvfr6CvJ+c96UUaCj08vHmnwCcdYEHNX6Rn2N0
+QRoB3k9P+vSgJkSNxPu5yeFiU2dOjAwk897qOJm/TPRpBL7L52a5RI4xZ+9mcYbn
+9+MvJBRUC7sYUrjgbLNQtuG7I48g58m8YyQb530QDHaqGDyNEh8/qzyIBg/+oXuo
+uH8q/3whps2IR00FyvTjyQWcfZ/VB7ateniPKTnKiDX6zG8ZNNJKfO3HlBjgxx5J
+vIto/6nf2Oovhlf3Kan6bKkF7EzwTaigpNKRgHRXeQKBgQDiYMcVaOC1ifnkGF2X
+nM9DPpbK/5CRDSNWKA0Q1yXbPexYQueWBhjX3W2O3HITV+yNNXPQ0TFpacjo8AnL
+X8IHb57dDUyRnt4a4xUaajWUbuakhnVEmZRCUc/aNKcXlCzUw3czz598bTEhTRYu
+DLVe4kibs4gCebxS0VeJoTnQeQKBgQDBk3AkE7u2Y9bkQWPp6+X/8T+f3ptJaJ2M
+YCL3l2MpKz42zOzl/J8NTHmy7W3+0rLFvhaJSb2vuekrkYMiD5sBPKI852qWDiAN
+WXny+Rp2Lyudd0luZMiDBaWQoPwkNqTiALy0OBzdSU7dnA19Tujtv9/qD46gax7Q
+sJi+p5i0lwKBgQCSBsGFQwDoudczVrBQ03szMlWNHuv/VU09D1rWSSKHWVty172R
+nd86qAA7DmKbrbTOpfNOeRL5n55U/DolMWD08QC2MRT6PlOhXmhHgMmNNTicWouc
+s8DaQvHkHODIKfH9URU8m6qSVdFCXPp4vAPm7+rMXTPX/PUJKzbfddvYaQKBgFww
+x7um2kNnETTsH5WMj6FxWAffkL1JYZ81OfII22UD/0FCH6D4yxceUOdyRGyUFCgw
++7Kut/Q06mOhjX5vSDcylWHEJPMKDyHMd1PMZ1nZ5T+9S++TeBtOWSekQ/FLRQON
+rlF2V+jbvP+2DoabSjvQoedrOVYVLjvdnyFN2GBJAoGAUwuUwboe2+Ce2NbqVnSa
+CULibDrdoJ2IVi5Izd3OngRDGrcz8A2rXOAyMw6QxXchfxDbR/TSUwsxyILqFnB6
+eiR3BnSuMWCje51ASHq+K/oJUhoabH09cmgaqALwy1wELC1zHSkV4jlottxM43d2
+mH8gEZSqW/ZYlzAvnNXGvn0=
+-----END PRIVATE KEY-----
+)PEM";
+
 struct file_closer {
-    void operator()(FILE* file) const noexcept { std::fclose(file); }
+    void operator()(FILE* file) const noexcept {
+        std::fclose(file);
+    }
 };
 using temp_file = std::unique_ptr<FILE, file_closer>;
 
 std::vector<char> gzip_compress(std::string_view input) {
     z_stream stream{};
-    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8,
-                     Z_DEFAULT_STRATEGY) != Z_OK) {
+    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) !=
+        Z_OK) {
         return {};
     }
     std::vector<char> output(compressBound(input.size()) + 64);
@@ -39,26 +96,29 @@ std::vector<char> gzip_compress(std::string_view input) {
     const int result = deflate(&stream, Z_FINISH);
     const size_t output_size = stream.total_out;
     deflateEnd(&stream);
-    if (result != Z_STREAM_END) return {};
+    if (result != Z_STREAM_END)
+        return {};
     output.resize(output_size);
     return output;
 }
 
-bool create_test_zip(
-    const std::filesystem::path& path,
-    const std::vector<std::pair<std::string, std::string>>& entries) {
+bool create_test_zip(const std::filesystem::path& path,
+                     const std::vector<std::pair<std::string, std::string>>& entries) {
     int error = 0;
     zip_t* archive = zip_open(path.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &error);
-    if (!archive) return false;
+    if (!archive)
+        return false;
     for (const auto& [name, payload] : entries) {
         zip_source_t* source = zip_source_buffer(archive, payload.data(), payload.size(), 0);
         if (!source || zip_file_add(archive, name.c_str(), source, ZIP_FL_OVERWRITE) < 0) {
-            if (source) zip_source_free(source);
+            if (source)
+                zip_source_free(source);
             zip_discard(archive);
             return false;
         }
     }
-    if (zip_close(archive) == 0) return true;
+    if (zip_close(archive) == 0)
+        return true;
     zip_discard(archive);
     return false;
 }
@@ -72,16 +132,13 @@ struct http_read_result {
     std::tuple<std::string, bool, bool> line;
 };
 
-http_read_result read_test_http_response(
-    std::string response,
-    input_source_config config,
-    int timeout_ms = 1000,
-    std::chrono::milliseconds response_delay = {}) {
+http_read_result read_test_http_response(std::string response, input_source_config config,
+                                         int timeout_ms = 1000,
+                                         std::chrono::milliseconds response_delay = {}) {
     asio::io_context server_ioc;
-    asio::ip::tcp::acceptor acceptor(
-        server_ioc, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
-    config.http_url = "http://127.0.0.1:" +
-        std::to_string(acceptor.local_endpoint().port()) + "/";
+    asio::ip::tcp::acceptor acceptor(server_ioc,
+                                     asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    config.http_url = "http://127.0.0.1:" + std::to_string(acceptor.local_endpoint().port()) + "/";
     config.http_method = "GET";
     config.http_timeout_ms = timeout_ms;
 
@@ -89,7 +146,8 @@ http_read_result read_test_http_response(
         asio::ip::tcp::socket socket(server_ioc);
         asio::error_code ec;
         acceptor.accept(socket, ec);
-        if (ec) return;
+        if (ec)
+            return;
         asio::streambuf request;
         asio::read_until(socket, request, "\r\n\r\n", ec);
         if (!ec) {
@@ -107,12 +165,14 @@ http_read_result read_test_http_response(
         client_ioc,
         [&]() -> asio::awaitable<void> {
             result.initialized = co_await reader.init();
-            if (result.initialized) result.line = co_await reader.read_line();
+            if (result.initialized)
+                result.line = co_await reader.read_line();
         },
         [&](std::exception_ptr error) { exception = error; });
     client_ioc.run();
     server.join();
-    if (exception) std::rethrow_exception(exception);
+    if (exception)
+        std::rethrow_exception(exception);
     return result;
 }
 
@@ -121,13 +181,60 @@ bool initialize_http_reader(input_source_config config) {
     async_http_reader reader(ioc, config, spdlog::default_logger());
     bool initialized = false;
     asio::co_spawn(
-        ioc,
-        [&]() -> asio::awaitable<void> {
-            initialized = co_await reader.init();
-        },
+        ioc, [&]() -> asio::awaitable<void> { initialized = co_await reader.init(); },
         asio::detached);
     ioc.run();
     return initialized;
+}
+
+http_read_result read_test_https_response(bool insecure) {
+    asio::io_context server_ioc;
+    asio::ssl::context tls_context(asio::ssl::context::tls_server);
+    tls_context.use_certificate_chain(asio::buffer(test_tls_certificate));
+    tls_context.use_private_key(asio::buffer(test_tls_private_key), asio::ssl::context::pem);
+    asio::ip::tcp::acceptor acceptor(server_ioc,
+                                     asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+
+    std::thread server([&] {
+        asio::ssl::stream<asio::ip::tcp::socket> socket(server_ioc, tls_context);
+        asio::error_code ec;
+        acceptor.accept(socket.lowest_layer(), ec);
+        if (ec)
+            return;
+        socket.handshake(asio::ssl::stream_base::server, ec);
+        if (ec)
+            return;
+        asio::streambuf request;
+        asio::read_until(socket, request, "\r\n\r\n", ec);
+        if (!ec) {
+            constexpr std::string_view response =
+                "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nsecure\n";
+            asio::write(socket, asio::buffer(response), ec);
+        }
+    });
+
+    asio::io_context client_ioc;
+    input_source_config config;
+    config.http_url = "https://localhost:" + std::to_string(acceptor.local_endpoint().port()) + "/";
+    config.http_method = "GET";
+    config.http_insecure = insecure;
+    config.http_timeout_ms = 1000;
+    async_http_reader reader(client_ioc, config, spdlog::default_logger());
+    http_read_result result;
+    std::exception_ptr exception;
+    asio::co_spawn(
+        client_ioc,
+        [&]() -> asio::awaitable<void> {
+            result.initialized = co_await reader.init();
+            if (result.initialized)
+                result.line = co_await reader.read_line();
+        },
+        [&](std::exception_ptr error) { exception = error; });
+    client_ioc.run();
+    server.join();
+    if (exception)
+        std::rethrow_exception(exception);
+    return result;
 }
 } // namespace
 
@@ -312,8 +419,7 @@ TEST(zip_extractor, preserves_entries_after_flattened_name_collisions) {
     ASSERT_TRUE(source_dir);
     const auto archive_path = *source_dir / "collisions.zip";
     ASSERT_TRUE(create_test_zip(
-        archive_path,
-        {{"one/x.txt", "first"}, {"two_x.txt", "second"}, {"two/x.txt", "third"}}));
+        archive_path, {{"one/x.txt", "first"}, {"two_x.txt", "second"}, {"two/x.txt", "third"}}));
 
     std::filesystem::path extraction_dir;
     auto files = extract_zip_to_temp(archive_path, spdlog::default_logger(), &extraction_dir);
@@ -339,20 +445,23 @@ TEST(zip_extractor, enforces_extraction_limits) {
     std::filesystem::path extraction_dir;
     zip_extraction_limits entry_count_limit;
     entry_count_limit.max_entries = 1;
-    EXPECT_TRUE(extract_zip_to_temp(archive_path, spdlog::default_logger(),
-                                    &extraction_dir, entry_count_limit).empty());
+    EXPECT_TRUE(extract_zip_to_temp(archive_path, spdlog::default_logger(), &extraction_dir,
+                                    entry_count_limit)
+                    .empty());
     EXPECT_TRUE(extraction_dir.empty());
 
     zip_extraction_limits entry_size_limit;
     entry_size_limit.max_entry_bytes = 2;
-    EXPECT_TRUE(extract_zip_to_temp(archive_path, spdlog::default_logger(),
-                                    &extraction_dir, entry_size_limit).empty());
+    EXPECT_TRUE(extract_zip_to_temp(archive_path, spdlog::default_logger(), &extraction_dir,
+                                    entry_size_limit)
+                    .empty());
     EXPECT_TRUE(extraction_dir.empty());
 
     zip_extraction_limits total_size_limit;
     total_size_limit.max_total_bytes = 5;
-    EXPECT_TRUE(extract_zip_to_temp(archive_path, spdlog::default_logger(),
-                                    &extraction_dir, total_size_limit).empty());
+    EXPECT_TRUE(extract_zip_to_temp(archive_path, spdlog::default_logger(), &extraction_dir,
+                                    total_size_limit)
+                    .empty());
     EXPECT_TRUE(extraction_dir.empty());
 
     std::filesystem::remove_all(*source_dir);
@@ -365,28 +474,19 @@ TEST(multi_file_reader, preserves_extracted_zip_files_across_rescans) {
     ASSERT_TRUE(create_test_zip(archive_path, "line\n"));
 
     asio::io_context ioc;
-    async_multi_file_reader reader(ioc, {archive_path.string()}, true, 1,
-                                   spdlog::default_logger());
+    async_multi_file_reader reader(ioc, {archive_path.string()}, true, 1, spdlog::default_logger());
     ASSERT_TRUE(reader.init());
     ASSERT_EQ(reader.file_count(), 1u);
 
     asio::co_spawn(
-        ioc,
-        [&]() -> asio::awaitable<void> {
-            co_await reader.read_line();
-        },
-        asio::detached);
+        ioc, [&]() -> asio::awaitable<void> { co_await reader.read_line(); }, asio::detached);
     ioc.run();
     EXPECT_EQ(reader.file_count(), 1u);
 
     ASSERT_TRUE(std::filesystem::remove(archive_path));
     ioc.restart();
     asio::co_spawn(
-        ioc,
-        [&]() -> asio::awaitable<void> {
-            co_await reader.read_line();
-        },
-        asio::detached);
+        ioc, [&]() -> asio::awaitable<void> { co_await reader.read_line(); }, asio::detached);
     ioc.run();
     EXPECT_EQ(reader.file_count(), 0u);
 
@@ -415,7 +515,8 @@ TEST(multi_file_reader, reads_newly_discovered_files_from_beginning) {
             auto [value, path, eof, error] = co_await reader.read_line();
             (void)path;
             (void)eof;
-            if (!error) line = std::move(value);
+            if (!error)
+                line = std::move(value);
         },
         asio::detached);
 
@@ -444,8 +545,7 @@ TEST(multi_file_reader, reextracts_replaced_zip_archives) {
     ASSERT_TRUE(create_test_zip(archive_path, "initial content\n"));
 
     asio::io_context ioc;
-    async_multi_file_reader reader(ioc, {archive_path.string()}, true, 1,
-                                   spdlog::default_logger());
+    async_multi_file_reader reader(ioc, {archive_path.string()}, true, 1, spdlog::default_logger());
     ASSERT_TRUE(reader.init());
 
     std::string line;
@@ -455,7 +555,8 @@ TEST(multi_file_reader, reextracts_replaced_zip_archives) {
             auto [value, path, eof, error] = co_await reader.read_line();
             (void)path;
             (void)eof;
-            if (!error) line = std::move(value);
+            if (!error)
+                line = std::move(value);
         },
         asio::detached);
 
@@ -481,8 +582,7 @@ TEST(multi_file_reader, clears_partial_lines_after_truncation) {
     }
 
     asio::io_context ioc;
-    async_multi_file_reader reader(ioc, {input_path.string()}, true, 1,
-                                   spdlog::default_logger());
+    async_multi_file_reader reader(ioc, {input_path.string()}, true, 1, spdlog::default_logger());
     ASSERT_TRUE(reader.init());
 
     std::string line;
@@ -492,7 +592,8 @@ TEST(multi_file_reader, clears_partial_lines_after_truncation) {
             auto [value, path, eof, error] = co_await reader.read_line();
             (void)path;
             (void)eof;
-            if (!error) line = std::move(value);
+            if (!error)
+                line = std::move(value);
         },
         asio::detached);
 
@@ -597,8 +698,7 @@ TEST(input_reader, disables_follow_for_compressed_files) {
     ioc.run();
 
     EXPECT_FALSE(error);
-    EXPECT_EQ(lines, (std::vector<std::string>{"first compressed line",
-                                               "second compressed line"}));
+    EXPECT_EQ(lines, (std::vector<std::string>{"first compressed line", "second compressed line"}));
     std::filesystem::remove_all(*source_dir);
 }
 
@@ -643,8 +743,8 @@ TEST(multi_file_reader, propagates_oversized_line_errors) {
     }
 
     asio::io_context ioc;
-    async_multi_file_reader reader(ioc, {input_path.string()}, false, 1,
-                                   spdlog::default_logger(), 4);
+    async_multi_file_reader reader(ioc, {input_path.string()}, false, 1, spdlog::default_logger(),
+                                   4);
     ASSERT_TRUE(reader.init());
 
     bool error = false;
@@ -664,6 +764,11 @@ TEST(multi_file_reader, propagates_oversized_line_errors) {
 }
 
 TEST(multi_file_reader, rejects_glob_traversal_errors) {
+#if defined(__unix__)
+    if (geteuid() == 0) {
+        GTEST_SKIP() << "root bypasses directory permission checks";
+    }
+#endif
     auto source_dir = create_zip_temp_directory();
     ASSERT_TRUE(source_dir);
     const auto valid_file = *source_dir / "valid.log";
@@ -676,9 +781,8 @@ TEST(multi_file_reader, rejects_glob_traversal_errors) {
     std::filesystem::permissions(blocked_dir, std::filesystem::perms::none);
 
     asio::io_context ioc;
-    async_multi_file_reader reader(
-        ioc, {valid_file.string(), blocked_dir.string() + "/*.log"}, false, 1,
-        spdlog::default_logger());
+    async_multi_file_reader reader(ioc, {valid_file.string(), blocked_dir.string() + "/*.log"},
+                                   false, 1, spdlog::default_logger());
     const bool initialized = reader.init();
     std::filesystem::permissions(blocked_dir, std::filesystem::perms::owner_all);
     EXPECT_FALSE(initialized);
@@ -701,6 +805,17 @@ TEST(http_reader, parse_url_https_default_port) {
     EXPECT_EQ(host, "example.com");
     EXPECT_EQ(port, "443");
     EXPECT_EQ(path, "/api/v1");
+}
+
+TEST(http_reader, https_insecure_accepts_self_signed_certificate) {
+    const auto result = read_test_https_response(true);
+    ASSERT_TRUE(result.initialized);
+    EXPECT_EQ(std::get<0>(result.line), "secure");
+    EXPECT_FALSE(std::get<2>(result.line));
+}
+
+TEST(http_reader, https_verification_rejects_self_signed_certificate) {
+    EXPECT_FALSE(read_test_https_response(false).initialized);
 }
 
 TEST(http_reader, parse_url_http_custom_port) {
@@ -740,7 +855,8 @@ TEST(http_reader, parse_url_query_without_path) {
     async_http_reader reader(ioc, cfg, spdlog::default_logger());
 
     std::string protocol, host, port, path;
-    ASSERT_TRUE(reader.parse_url("http://example.com?limit=10#ignored", protocol, host, port, path));
+    ASSERT_TRUE(
+        reader.parse_url("http://example.com?limit=10#ignored", protocol, host, port, path));
     EXPECT_EQ(host, "example.com");
     EXPECT_EQ(port, "80");
     EXPECT_EQ(path, "/?limit=10");
@@ -768,8 +884,8 @@ TEST(http_reader, parse_url_rejects_invalid_authority) {
     EXPECT_FALSE(reader.parse_url("http://example.com:", protocol, host, port, path));
     EXPECT_FALSE(reader.parse_url("http://example.com:70000", protocol, host, port, path));
     EXPECT_FALSE(reader.parse_url("http://::1/events", protocol, host, port, path));
-    EXPECT_FALSE(reader.parse_url("http://example.com\r\nInjected:yes/", protocol, host,
-                                  port, path));
+    EXPECT_FALSE(
+        reader.parse_url("http://example.com\r\nInjected:yes/", protocol, host, port, path));
 }
 
 TEST(http_reader, rejects_request_framing_injection) {
@@ -811,31 +927,28 @@ TEST(http_reader, rejects_oversized_response_line) {
 
 TEST(http_reader, times_out_delayed_response) {
     input_source_config config;
-    auto result = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", config, 10,
-        std::chrono::milliseconds(50));
+    auto result = read_test_http_response("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", config,
+                                          10, std::chrono::milliseconds(50));
     EXPECT_FALSE(result.initialized);
 }
 
 TEST(http_reader, rejects_malformed_response_syntax) {
     input_source_config config;
-    auto bad_status = read_test_http_response(
-        "NOTHTTP 200 OK\r\nContent-Length: 0\r\n\r\n", config);
+    auto bad_status =
+        read_test_http_response("NOTHTTP 200 OK\r\nContent-Length: 0\r\n\r\n", config);
     EXPECT_FALSE(bad_status.initialized);
 
-    auto long_status = read_test_http_response(
-        "HTTP/1.1 2000 OK\r\nContent-Length: 0\r\n\r\n", config);
+    auto long_status =
+        read_test_http_response("HTTP/1.1 2000 OK\r\nContent-Length: 0\r\n\r\n", config);
     EXPECT_FALSE(long_status.initialized);
 
     auto bad_name = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nInvalid Header: value\r\nContent-Length: 0\r\n\r\n",
-        config);
+        "HTTP/1.1 200 OK\r\nInvalid Header: value\r\nContent-Length: 0\r\n\r\n", config);
     EXPECT_FALSE(bad_name.initialized);
 
-    auto folded = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nX-Test: value\r\n continuation\r\n"
-        "Content-Length: 0\r\n\r\n",
-        config);
+    auto folded = read_test_http_response("HTTP/1.1 200 OK\r\nX-Test: value\r\n continuation\r\n"
+                                          "Content-Length: 0\r\n\r\n",
+                                          config);
     EXPECT_FALSE(folded.initialized);
 }
 
@@ -850,8 +963,8 @@ TEST(http_reader, rejects_oversized_chunk_metadata) {
 
 TEST(http_reader, rejects_truncated_content_length_body) {
     input_source_config config;
-    auto result = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", config);
+    auto result =
+        read_test_http_response("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", config);
 
     ASSERT_TRUE(result.initialized);
     EXPECT_TRUE(std::get<1>(result.line));
@@ -860,8 +973,8 @@ TEST(http_reader, rejects_truncated_content_length_body) {
 
 TEST(http_reader, rejects_excess_content_length_body) {
     input_source_config config;
-    auto result = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nabc", config);
+    auto result =
+        read_test_http_response("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nabc", config);
 
     EXPECT_FALSE(result.initialized);
 }
@@ -869,8 +982,7 @@ TEST(http_reader, rejects_excess_content_length_body) {
 TEST(http_reader, rejects_ambiguous_content_length) {
     input_source_config config;
     auto conflicting = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc",
-        config);
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\nabc", config);
     EXPECT_FALSE(conflicting.initialized);
 
     auto chunked = read_test_http_response(
@@ -882,8 +994,8 @@ TEST(http_reader, rejects_ambiguous_content_length) {
 
 TEST(http_reader, completes_at_declared_content_length) {
     input_source_config config;
-    auto result = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", config);
+    auto result =
+        read_test_http_response("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", config);
 
     ASSERT_TRUE(result.initialized);
     EXPECT_EQ(std::get<0>(result.line), "abc");
@@ -904,22 +1016,19 @@ TEST(http_reader, rejects_invalid_transfer_encoding_tokens) {
 
 TEST(http_reader, validates_chunk_trailers) {
     input_source_config config;
-    auto malformed = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-        "2\r\na\n\r\n0\r\ninvalid\r\n\r\n",
-        config);
+    auto malformed = read_test_http_response("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                             "2\r\na\n\r\n0\r\ninvalid\r\n\r\n",
+                                             config);
     EXPECT_FALSE(malformed.initialized);
 
-    auto forbidden = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-        "2\r\na\n\r\n0\r\nContent-Length: 2\r\n\r\n",
-        config);
+    auto forbidden = read_test_http_response("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                             "2\r\na\n\r\n0\r\nContent-Length: 2\r\n\r\n",
+                                             config);
     EXPECT_FALSE(forbidden.initialized);
 
-    auto valid = read_test_http_response(
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-        "2\r\na\n\r\n0\r\nX-Checksum: ok\r\n\r\n",
-        config);
+    auto valid = read_test_http_response("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                         "2\r\na\n\r\n0\r\nX-Checksum: ok\r\n\r\n",
+                                         config);
     ASSERT_TRUE(valid.initialized);
     EXPECT_EQ(std::get<0>(valid.line), "a");
     EXPECT_FALSE(std::get<2>(valid.line));
