@@ -34,6 +34,7 @@ SOFTWARE.
 #include <asio/post.hpp>
 #include <asio/read_until.hpp>
 #include <asio/ssl.hpp>
+#include <asio/ssl/host_name_verification.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 #include <asio/write.hpp>
@@ -243,6 +244,10 @@ public:
 
         if (m_use_ssl) {
             m_ssl_socket = std::make_unique<asio::ssl::stream<asio::ip::tcp::socket>>(m_ioc, m_ssl_ctx);
+
+            if (!m_config.http_insecure) {
+                m_ssl_socket->set_verify_callback(asio::ssl::host_name_verification(host));
+            }
 
             if (!SSL_set_tlsext_host_name(m_ssl_socket->native_handle(), host.c_str())) {
                 m_log->error("Failed to set SNI hostname");
