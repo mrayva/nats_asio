@@ -75,3 +75,50 @@ jobs:
           ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir build-ci --output-on-failure
+
+  gcc-versions:
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gcc: 13
+            image: gcc:13-bookworm
+          - gcc: 14
+            image: gcc:14-bookworm
+          - gcc: 15
+            image: gcc:15-bookworm
+          - gcc: 16
+            image: gcc:16.1-trixie
+
+    name: gcc-${{ matrix.gcc }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build tools
+        run: >-
+          apt-get update && apt-get install -y
+          ca-certificates cmake curl git ninja-build perl pkg-config tar unzip zip
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11.6
+        with:
+          vcpkgGitCommitId: f87344cac03158cbf1467264565f1fd36b382a24
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build-gcc -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake
+          -DVCPKG_OVERLAY_TRIPLETS=${GITHUB_WORKSPACE}/triplets
+          -DNATS_ASIO_BUILD_SAMPLES=OFF
+          -DNATS_ASIO_BUILD_TESTS=ON
+          -DNATS_ASIO_INSTALL=ON
+
+      - name: Build
+        run: cmake --build build-gcc --parallel 2
+
+      - name: Test
+        run: ctest --test-dir build-gcc --output-on-failure
