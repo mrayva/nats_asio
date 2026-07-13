@@ -519,8 +519,21 @@ private:
                 m_log->error("Invalid custom HTTP header");
                 return false;
             }
+            const std::string lowered_name = to_lower_copy(name);
+            if (lowered_name == "host" || lowered_name == "content-length" ||
+                lowered_name == "transfer-encoding" || lowered_name == "connection") {
+                m_log->error("Custom HTTP header {} conflicts with request framing", name);
+                return false;
+            }
         }
         return true;
+    }
+
+    bool has_custom_header(std::string_view expected_name) const {
+        return std::any_of(m_config.http_headers.begin(), m_config.http_headers.end(),
+            [expected_name](const auto& header) {
+                return to_lower_copy(header.first) == expected_name;
+            });
     }
 
     static bool valid_response_headers(const std::string& headers) {
@@ -753,8 +766,7 @@ private:
 
         if (!m_config.http_body.empty()) {
             request << "Content-Length: " << m_config.http_body.size() << "\r\n";
-            if (std::find_if(m_config.http_headers.begin(), m_config.http_headers.end(),
-                    [](const auto& h) { return h.first == "Content-Type"; }) == m_config.http_headers.end()) {
+            if (!has_custom_header("content-type")) {
                 request << "Content-Type: application/json\r\n";
             }
         }

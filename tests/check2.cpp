@@ -763,6 +763,15 @@ TEST(http_reader, rejects_request_framing_injection) {
     config.http_headers = {{"Invalid Header", "value"}};
     EXPECT_FALSE(initialize_http_reader(config));
 
+    config.http_headers = {{"Host", "attacker.example"}};
+    EXPECT_FALSE(initialize_http_reader(config));
+
+    config.http_headers = {{"content-length", "0"}};
+    EXPECT_FALSE(initialize_http_reader(config));
+
+    config.http_headers = {{"Transfer-Encoding", "chunked"}};
+    EXPECT_FALSE(initialize_http_reader(config));
+
     config.http_headers.clear();
     config.http_url = "http://127.0.0.1:1/path with space";
     EXPECT_FALSE(initialize_http_reader(config));
