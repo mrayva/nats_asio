@@ -181,7 +181,16 @@ cat data.csv | ./nats_tool pub \
 
 # Watch for new files matching pattern (log shipper mode)
 ./nats_tool pub --js --topic logs --file "/var/log/*.log" --follow
+
+# Poll every 250 ms and reject input records larger than 8 MiB
+./nats_tool pub --js --topic logs --file "/var/log/*.log" --follow \
+  --poll_interval 250 --max_line_size 8388608
 ```
+
+With `--follow`, regular files present during startup begin at EOF, like `tail -f`.
+Files discovered later and replacement files detected after rotation begin at byte zero.
+Partial records are retained until a newline arrives and are discarded if the file is
+truncated or replaced.
 
 ### Compressed File Input
 ```bash
@@ -217,7 +226,25 @@ cat data.csv | ./nats_tool pub \
   --file "/var/log/*.zip" \
   --file "/var/log/*.gz" \
   --file "/var/log/*.log"
+
+# Override ZIP extraction safety limits for trusted archives
+./nats_tool pub --js --topic archive --file /path/to/archive.zip \
+  --zip_max_entries 20000 \
+  --zip_max_entry_bytes 536870912 \
+  --zip_max_total_bytes 2147483648
 ```
+
+Single compressed files are processed once; `--follow` is disabled because gzip and
+zstd streams cannot be safely tailed. Glob watch mode can still discover and process
+new compressed files and ZIP archives.
+
+Input safety defaults:
+
+- `--max_line_size`: 16 MiB per file/stdin record.
+- `--zip_max_entries`: 10,000 entries per archive.
+- `--zip_max_entry_bytes`: 256 MiB uncompressed per entry.
+- `--zip_max_total_bytes`: 1 GiB total uncompressed output per archive.
+- `--poll_interval`: 100 ms; values must be greater than zero.
 
 ### Subscribing
 ```bash
