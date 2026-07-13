@@ -148,7 +148,10 @@ public:
             path = resource;
         }
 
-        if (authority.empty() || authority.find('@') != std::string_view::npos) {
+        if (authority.empty() || authority.find('@') != std::string_view::npos ||
+            std::any_of(authority.begin(), authority.end(), [](unsigned char c) {
+                return c <= 0x20 || c == 0x7f;
+            })) {
             m_log->error("Invalid HTTP URL authority: {}", url);
             return false;
         }
@@ -223,6 +226,9 @@ public:
         }
         m_path = path;
         m_use_ssl = (protocol == "https");
+        if (!valid_request_config()) {
+            co_return false;
+        }
 
         asio::ip::tcp::resolver::results_type endpoints;
         auto [resolve_ec, resolve_timeout] = co_await run_with_timeout([&]() -> asio::awaitable<asio::error_code> {
@@ -482,6 +488,32 @@ private:
             if (std::isalnum(c)) continue;
             constexpr std::string_view symbols = "!#$%&'*+-.^_`|~";
             if (symbols.find(static_cast<char>(c)) == std::string_view::npos) return false;
+        }
+        return true;
+    }
+
+    static bool valid_http_field_value(std::string_view value) {
+        return std::none_of(value.begin(), value.end(), [](unsigned char c) {
+            return (c < 0x20 && c != '\t') || c == 0x7f;
+        });
+    }
+
+    bool valid_request_config() const {
+        if (!is_http_token(m_config.http_method)) {
+            m_log->error("Invalid HTTP method");
+            return false;
+        }
+        if (std::any_of(m_path.begin(), m_path.end(), [](unsigned char c) {
+                return c <= 0x20 || c == 0x7f;
+            })) {
+            m_log->error("HTTP request target contains invalid characters");
+            return false;
+        }
+        for (const auto& [name, value] : m_config.http_headers) {
+            if (!is_http_token(name) || !valid_http_field_value(value)) {
+                m_log->error("Invalid custom HTTP header");
+                return false;
+            }
         }
         return true;
     }

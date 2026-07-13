@@ -115,6 +115,20 @@ http_read_result read_test_http_response(
     if (exception) std::rethrow_exception(exception);
     return result;
 }
+
+bool initialize_http_reader(input_source_config config) {
+    asio::io_context ioc;
+    async_http_reader reader(ioc, config, spdlog::default_logger());
+    bool initialized = false;
+    asio::co_spawn(
+        ioc,
+        [&]() -> asio::awaitable<void> {
+            initialized = co_await reader.init();
+        },
+        asio::detached);
+    ioc.run();
+    return initialized;
+}
 } // namespace
 
 static_assert(!std::is_copy_constructible_v<zstd_compressor>);
@@ -732,6 +746,26 @@ TEST(http_reader, parse_url_rejects_invalid_authority) {
     EXPECT_FALSE(reader.parse_url("http://example.com:", protocol, host, port, path));
     EXPECT_FALSE(reader.parse_url("http://example.com:70000", protocol, host, port, path));
     EXPECT_FALSE(reader.parse_url("http://::1/events", protocol, host, port, path));
+    EXPECT_FALSE(reader.parse_url("http://example.com\r\nInjected:yes/", protocol, host,
+                                  port, path));
+}
+
+TEST(http_reader, rejects_request_framing_injection) {
+    input_source_config config;
+    config.http_url = "http://127.0.0.1:1/";
+    config.http_method = "GET\r\nInjected: yes";
+    EXPECT_FALSE(initialize_http_reader(config));
+
+    config.http_method = "GET";
+    config.http_headers = {{"X-Test", "value\r\nInjected: yes"}};
+    EXPECT_FALSE(initialize_http_reader(config));
+
+    config.http_headers = {{"Invalid Header", "value"}};
+    EXPECT_FALSE(initialize_http_reader(config));
+
+    config.http_headers.clear();
+    config.http_url = "http://127.0.0.1:1/path with space";
+    EXPECT_FALSE(initialize_http_reader(config));
 }
 
 TEST(http_reader, rejects_oversized_response_line) {
