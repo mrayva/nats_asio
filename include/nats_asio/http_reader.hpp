@@ -461,6 +461,10 @@ private:
     }
 
     static int parse_status_code(const std::string& status_line) {
+        if (!status_line.starts_with("HTTP/1.0 ") &&
+            !status_line.starts_with("HTTP/1.1 ")) {
+            return -1;
+        }
         auto first_sp = status_line.find(' ');
         if (first_sp == std::string::npos) {
             return -1;
@@ -471,6 +475,7 @@ private:
         const size_t code_len = (second_sp == std::string::npos)
             ? status_line.size() - code_begin
             : second_sp - code_begin;
+        if (code_len != 3) return -1;
 
         int status_code = 0;
         std::string_view code_sv(status_line.data() + code_begin, code_len);
@@ -479,7 +484,7 @@ private:
             return -1;
         }
 
-        return status_code;
+        return status_code >= 100 && status_code <= 999 ? status_code : -1;
     }
 
     static bool is_http_token(std::string_view value) {
@@ -516,6 +521,27 @@ private:
             }
         }
         return true;
+    }
+
+    static bool valid_response_headers(const std::string& headers) {
+        std::istringstream lines(headers);
+        std::string line;
+        bool is_first_line = true;
+        while (std::getline(lines, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (is_first_line) {
+                is_first_line = false;
+                continue;
+            }
+            const auto colon = line.find(':');
+            if (colon == std::string::npos || !is_http_token(
+                    std::string_view(line.data(), colon)) ||
+                !valid_http_field_value(
+                    std::string_view(line.data() + colon + 1, line.size() - colon - 1))) {
+                return false;
+            }
+        }
+        return !is_first_line;
     }
 
     static std::optional<bool> parse_chunked_transfer_encoding(const std::string& headers) {
@@ -913,6 +939,11 @@ private:
         headers = headers.substr(0, header_end);
 
         m_log->debug("HTTP response headers:\n{}", headers);
+
+        if (!valid_response_headers(headers)) {
+            m_log->error("HTTP response contains malformed headers");
+            co_return false;
+        }
 
         auto first_line_end = headers.find("\r\n");
         std::string status_line = headers.substr(0, first_line_end);

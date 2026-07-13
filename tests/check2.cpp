@@ -786,6 +786,28 @@ TEST(http_reader, times_out_delayed_response) {
     EXPECT_FALSE(result.initialized);
 }
 
+TEST(http_reader, rejects_malformed_response_syntax) {
+    input_source_config config;
+    auto bad_status = read_test_http_response(
+        "NOTHTTP 200 OK\r\nContent-Length: 0\r\n\r\n", config);
+    EXPECT_FALSE(bad_status.initialized);
+
+    auto long_status = read_test_http_response(
+        "HTTP/1.1 2000 OK\r\nContent-Length: 0\r\n\r\n", config);
+    EXPECT_FALSE(long_status.initialized);
+
+    auto bad_name = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nInvalid Header: value\r\nContent-Length: 0\r\n\r\n",
+        config);
+    EXPECT_FALSE(bad_name.initialized);
+
+    auto folded = read_test_http_response(
+        "HTTP/1.1 200 OK\r\nX-Test: value\r\n continuation\r\n"
+        "Content-Length: 0\r\n\r\n",
+        config);
+    EXPECT_FALSE(folded.initialized);
+}
+
 TEST(http_reader, rejects_oversized_chunk_metadata) {
     input_source_config config;
     config.http_max_chunk_metadata_size = 4;
