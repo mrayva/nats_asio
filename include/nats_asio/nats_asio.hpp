@@ -76,6 +76,7 @@ namespace ssl = asio::ssl;
 namespace protocol {
     constexpr string_view crlf = "\r\n";
     constexpr string_view pub_fmt = "PUB {} {} {}\r\n";
+    constexpr string_view pub_no_reply_fmt = "PUB {} {}\r\n";
     constexpr string_view hpub_fmt = "HPUB {} {} {} {}\r\n";      // subject reply hdr_len total_len
     constexpr string_view hpub_no_reply_fmt = "HPUB {} {} {}\r\n"; // subject hdr_len total_len
     constexpr string_view sub_fmt = "SUB {} {} {}\r\n";
@@ -1757,16 +1758,25 @@ public:
 
 class subscription : public isubscription {
 public:
-    subscription(uint64_t sid, const on_message_cb& cb, uint32_t max_msgs = 0)
-        : m_cancel(false), m_cb(cb), m_sid(sid), m_max_messages(max_msgs), m_message_count(0) {}
+    subscription(uint64_t sid, const on_message_cb& cb, std::string resubscribe_command,
+                 uint32_t max_msgs = 0)
+        : m_cancel(false), m_cb(cb), m_sid(sid),
+          m_resubscribe_command(std::move(resubscribe_command)),
+          m_max_messages(max_msgs), m_message_count(0) {}
 
     // Constructor with headers callback for JetStream messages
-    subscription(uint64_t sid, const on_message_with_headers_cb& headers_cb, uint32_t max_msgs = 0)
-        : m_cancel(false), m_headers_cb(headers_cb), m_sid(sid), m_max_messages(max_msgs), m_message_count(0) {}
+    subscription(uint64_t sid, const on_message_with_headers_cb& headers_cb,
+                 std::string resubscribe_command, uint32_t max_msgs = 0)
+        : m_cancel(false), m_headers_cb(headers_cb), m_sid(sid),
+          m_resubscribe_command(std::move(resubscribe_command)),
+          m_max_messages(max_msgs), m_message_count(0) {}
 
     // Constructor with zero-copy callback (references internal buffers)
-    subscription(uint64_t sid, const on_message_zero_copy_cb& zero_copy_cb, uint32_t max_msgs = 0)
-        : m_cancel(false), m_zero_copy_cb(zero_copy_cb), m_sid(sid), m_max_messages(max_msgs), m_message_count(0) {}
+    subscription(uint64_t sid, const on_message_zero_copy_cb& zero_copy_cb,
+                 std::string resubscribe_command, uint32_t max_msgs = 0)
+        : m_cancel(false), m_zero_copy_cb(zero_copy_cb), m_sid(sid),
+          m_resubscribe_command(std::move(resubscribe_command)),
+          m_max_messages(max_msgs), m_message_count(0) {}
 
     subscription(const subscription&) = delete;
     subscription& operator=(const subscription&) = delete;
@@ -1811,6 +1821,10 @@ public:
         return m_zero_copy_cb;
     }
 
+    [[nodiscard]] const std::string& resubscribe_command() const noexcept {
+        return m_resubscribe_command;
+    }
+
     // Increment message count and return true if should auto-unsubscribe
     [[nodiscard]] bool increment_and_check() noexcept {
         if (m_max_messages == 0) {
@@ -1826,6 +1840,7 @@ private:
     on_message_with_headers_cb m_headers_cb;
     on_message_zero_copy_cb m_zero_copy_cb;
     uint64_t m_sid;
+    std::string m_resubscribe_command;
     uint32_t m_max_messages;
     std::atomic<uint32_t> m_message_count;
 };
@@ -2301,7 +2316,7 @@ public:
         if (reply_to.has_value()) {
             *header = fmt::format(fmt::runtime(protocol::pub_fmt), subject, reply_to.value(), payload.size());
         } else {
-            *header = fmt::format(fmt::runtime(protocol::pub_fmt), subject, "", payload.size());
+            *header = fmt::format(fmt::runtime(protocol::pub_no_reply_fmt), subject, payload.size());
         }
 
         buffers->emplace_back(asio::buffer(header->data(), header->size()));
@@ -2670,7 +2685,7 @@ public:
                                                             write_status};
         }
 
-        auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
+        auto sub = std::make_shared<subscription>(sid, cb, payload, opts.max_messages);
         {
             std::lock_guard<std::mutex> lock(m_subs_mutex);
             m_subs.emplace(sid, sub);
@@ -2711,7 +2726,7 @@ public:
                                                             write_status};
         }
 
-        auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
+        auto sub = std::make_shared<subscription>(sid, cb, payload, opts.max_messages);
         {
             std::lock_guard<std::mutex> lock(m_subs_mutex);
             m_subs.emplace(sid, sub);
@@ -2752,7 +2767,7 @@ public:
                                                             write_status};
         }
 
-        auto sub = std::make_shared<subscription>(sid, cb, opts.max_messages);
+        auto sub = std::make_shared<subscription>(sid, cb, payload, opts.max_messages);
         {
             std::lock_guard<std::mutex> lock(m_subs_mutex);
             m_subs.emplace(sid, sub);
@@ -3360,12 +3375,9 @@ private:
         // Subscribe to inbox with auto-unsubscribe after 1 message
         auto [sub, sub_status] = co_await subscribe(
             inbox,
-            [state](string_view subj, optional<string_view> reply,
-                   std::span<const char> data) -> asio::awaitable<void> {
+            [state](const message& response) -> asio::awaitable<void> {
                 if (!state->received.exchange(true)) {
-                    state->response.subject = std::string(subj);
-                    if (reply) state->response.reply_to = std::string(*reply);
-                    state->response.payload.assign(data.begin(), data.end());
+                    state->response = response;
                 }
                 co_return;
             },
@@ -3524,7 +3536,9 @@ private:
         consumer_config["replay_policy"] = js_replay_policy_to_string(config.replay);
         consumer_config["deliver_policy"] = js_deliver_policy_to_string(config.deliver);
         consumer_config["ack_wait"] = config.ack_wait.count() * 1000000000LL;  // nanoseconds
-        consumer_config["max_ack_pending"] = static_cast<int64_t>(config.max_ack_pending);
+        if (config.ack != js_ack_policy::none) {
+            consumer_config["max_ack_pending"] = static_cast<int64_t>(config.max_ack_pending);
+        }
 
         if (config.durable_name) {
             consumer_config["durable_name"] = *config.durable_name;
@@ -4510,8 +4524,34 @@ private:
             msg_view.payload = payload_span;
 
             co_await sub->zero_copy_callback()(msg_view);
+        } else if (sub->has_headers_callback()) {
+            message msg;
+            msg.subject = std::string(subject);
+            if (reply_to) msg.reply_to = std::string(*reply_to);
+            msg.payload.assign(payload_span.begin(), payload_span.end());
+            asio::co_spawn(
+                m_strand,
+                [sub, msg = std::move(msg)]() -> asio::awaitable<void> {
+                    co_await sub->headers_callback()(msg);
+                },
+                asio::detached);
         } else {
-            co_await sub->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+            auto subject_copy = std::string(subject);
+            auto reply_copy = reply_to
+                ? optional<std::string>(std::string(*reply_to)) : std::nullopt;
+            auto payload_copy =
+                std::make_shared<std::vector<char>>(payload_span.begin(), payload_span.end());
+            asio::co_spawn(
+                m_strand,
+                [sub, subject_copy = std::move(subject_copy),
+                 reply_copy = std::move(reply_copy), payload_copy]() -> asio::awaitable<void> {
+                    optional<string_view> reply_view = std::nullopt;
+                    if (reply_copy) reply_view = string_view(*reply_copy);
+                    co_await sub->callback()(
+                        subject_copy, reply_view,
+                        std::span<const char>(payload_copy->data(), payload_copy->size()));
+                },
+                asio::detached);
         }
 
         // Check for auto-unsubscribe after delivering message
@@ -4600,10 +4640,30 @@ private:
             msg.headers = parse_headers(headers_sv);
             msg.payload.assign(payload_span.begin(), payload_span.end());
 
-            co_await sub->headers_callback()(msg);
+            asio::co_spawn(
+                m_strand,
+                [sub, msg = std::move(msg)]() -> asio::awaitable<void> {
+                    co_await sub->headers_callback()(msg);
+                },
+                asio::detached);
         } else {
-            // Fall back to regular callback (without headers)
-            co_await sub->callback()(subject, reply_to.has_value() ? reply_to : std::nullopt, payload_span);
+            // Fall back to a regular callback without exposing internal buffers.
+            auto subject_copy = std::string(subject);
+            auto reply_copy = reply_to
+                ? optional<std::string>(std::string(*reply_to)) : std::nullopt;
+            auto payload_copy =
+                std::make_shared<std::vector<char>>(payload_span.begin(), payload_span.end());
+            asio::co_spawn(
+                m_strand,
+                [sub, subject_copy = std::move(subject_copy),
+                 reply_copy = std::move(reply_copy), payload_copy]() -> asio::awaitable<void> {
+                    optional<string_view> reply_view = std::nullopt;
+                    if (reply_copy) reply_view = string_view(*reply_copy);
+                    co_await sub->callback()(
+                        subject_copy, reply_view,
+                        std::span<const char>(payload_copy->data(), payload_copy->size()));
+                },
+                asio::detached);
         }
 
         // Check for auto-unsubscribe after delivering message
@@ -4771,6 +4831,22 @@ private:
 
                 m_is_connected = true;
 
+                // Server-side subscriptions do not survive a TCP reconnect.
+                // Replay every still-active local subscription before invoking
+                // the connected callback so the connection is fully usable.
+                auto resubscribe_status = co_await restore_subscriptions();
+                if (resubscribe_status.failed()) {
+                    m_is_connected = false;
+                    asio::error_code ec;
+                    m_socket.close(ec);
+                    if (m_error_cb) {
+                        co_await m_error_cb(*this, fmt::format(
+                            "failed to restore subscriptions: {}",
+                            resubscribe_status.error()));
+                    }
+                    continue;
+                }
+
                 // Start ping loop if configured
                 if (m_ping_interval_ms > 0 &&
                     !m_ping_loop_running.exchange(true, std::memory_order_acq_rel)) {
@@ -4787,7 +4863,13 @@ private:
                 }
 
                 if (m_connected_cb) {
-                    co_await m_connected_cb(*this);
+                    auto self = this->shared_from_this();
+                    asio::co_spawn(
+                        m_strand,
+                        [self]() -> asio::awaitable<void> {
+                            co_await self->m_connected_cb(*self);
+                        },
+                        asio::detached);
                 }
             }
 
@@ -4815,6 +4897,11 @@ private:
             if (should_disconnect) {
                 fail_pending_js_ack_waiters(
                     status(error_code::connection_closed, "connection disconnected"));
+                if (m_js_ack_subscription) {
+                    m_js_ack_subscription->cancel();
+                    std::lock_guard<std::mutex> lock(m_subs_mutex);
+                    m_subs.erase(m_js_ack_subscription->sid());
+                }
                 m_js_ack_subscription.reset();
                 m_js_ack_inbox_base.clear();
 
@@ -4879,6 +4966,27 @@ private:
 
         m_flush_running.store(false, std::memory_order_release);
         co_return;
+    }
+
+    asio::awaitable<status> restore_subscriptions() {
+        std::vector<std::string> commands;
+        {
+            std::lock_guard<std::mutex> lock(m_subs_mutex);
+            commands.reserve(m_subs.size());
+            for (const auto& [sid, sub] : m_subs) {
+                (void)sid;
+                if (!sub->is_cancelled()) {
+                    commands.push_back(sub->resubscribe_command());
+                }
+            }
+        }
+
+        for (const auto& command : commands) {
+            auto write_status = co_await guarded_socket_write(
+                asio::buffer(command), "resubscribe");
+            if (write_status.failed()) co_return write_status;
+        }
+        co_return status{};
     }
 
     // Drain offline queue after reconnection
@@ -4981,6 +5089,7 @@ private:
         json j = {
             {"verbose", o.verbose}, {"pedantic", o.pedantic}, {"name", name},
             {"lang", lang},         {"version", version},
+            {"headers", true},      {"protocol", 1},
         };
 
         if (o.user.has_value()) {
