@@ -147,6 +147,7 @@ if(NATS_ASIO_BUILD_TESTS)
     add_executable(parser_test
         tests/check1.cpp
         tests/check2.cpp
+        tests/connection_regression.cpp
     )
     target_link_libraries(parser_test 
         PRIVATE 
