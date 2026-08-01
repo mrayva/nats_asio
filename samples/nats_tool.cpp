@@ -39,7 +39,6 @@
 #include "include/fast_json_parser.hpp"
 #include "include/worker.hpp"
 #include "include/batch_publisher.hpp"
-#include "include/js_sliding_window.hpp"
 #include "include/js_stream_utils.hpp"
 #include "include/zerialize_json.hpp"
 

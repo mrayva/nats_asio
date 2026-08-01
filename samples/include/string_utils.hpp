@@ -139,18 +139,37 @@ inline nlohmann::json parse_csv_line(const std::string& line, const std::vector<
     return obj;
 }
 
+// Escape a string for safe inclusion as a single word in a POSIX shell command line.
+// Wraps in single quotes, escaping any embedded single quotes as '\''.
+inline std::string shell_quote(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    out.push_back('\'');
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out.push_back('\'');
+    return out;
+}
+
 // Translate payload through external command
 // Supports {{Subject}} placeholder in command string
 inline std::string translate_payload(const std::string& cmd, std::string_view subject,
                               std::span<const char> payload,
                               const std::shared_ptr<spdlog::logger>& log) {
-    // Replace {{Subject}} placeholder with actual subject
+    // Replace {{Subject}} placeholder with actual subject, shell-quoted since
+    // subject is attacker-controlled (NATS message subject) and reaches sh -c.
     std::string actual_cmd = cmd;
     const std::string placeholder = "{{Subject}}";
+    const std::string quoted_subject = shell_quote(subject);
     std::size_t pos = 0;
     while ((pos = actual_cmd.find(placeholder, pos)) != std::string::npos) {
-        actual_cmd.replace(pos, placeholder.length(), subject);
-        pos += subject.length();
+        actual_cmd.replace(pos, placeholder.length(), quoted_subject);
+        pos += quoted_subject.length();
     }
 
     // Create pipes for stdin/stdout

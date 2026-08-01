@@ -26,6 +26,7 @@ SOFTWARE.
 #pragma once
 
 #include "../include/worker.hpp"
+#include "../include/string_utils.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/posix/stream_descriptor.hpp>
@@ -135,11 +136,12 @@ private:
         } else if (!m_translate_cmd.empty()) {
             // Transform through external command (runs on thread pool to avoid blocking)
             std::string cmd = m_translate_cmd;
-            // Replace {{Subject}} placeholder if present
+            // Replace {{Subject}} placeholder if present, shell-quoted since
+            // subject is attacker-controlled (NATS message subject) and reaches sh -c.
             std::string subject_placeholder = "{{Subject}}";
             size_t pos = cmd.find(subject_placeholder);
             if (pos != std::string::npos) {
-                cmd.replace(pos, subject_placeholder.length(), msg.subject);
+                cmd.replace(pos, subject_placeholder.length(), shell_quote(msg.subject));
             }
 
             // Copy payload for thread-safe access

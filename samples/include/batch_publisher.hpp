@@ -65,19 +65,26 @@ public:
         m_max_size = max_size;
     }
 
+    // Lets push() give up if the consumer side dies (e.g. all writer threads
+    // failed to connect) instead of blocking forever on a full queue that
+    // nothing is ever going to drain.
+    void set_abort_flag(const std::atomic<bool>* flag) {
+        m_abort_flag = flag;
+    }
+
     // Waits for capacity so accepted input is never silently dropped.
-    // Returns false only after the queue has been closed.
+    // Returns false once the queue has been closed or aborted.
     bool push(batch_item item) {
         std::unique_lock<std::mutex> lock(m_mutex);
-        if (m_done) {
+        if (m_done || aborted()) {
             return false;
         }
 
         if (m_max_size > 0) {
-            m_can_push.wait(lock, [this] {
-                return m_done || m_queue.size() < m_max_size;
-            });
-            if (m_done) {
+            while (!m_done && !aborted() && m_queue.size() >= m_max_size) {
+                m_can_push.wait_for(lock, std::chrono::milliseconds(50));
+            }
+            if (m_done || aborted()) {
                 return false;
             }
         }
@@ -123,12 +130,17 @@ public:
     }
 
 private:
+    bool aborted() const {
+        return m_abort_flag && m_abort_flag->load(std::memory_order_acquire);
+    }
+
     mutable std::mutex m_mutex;
     std::condition_variable m_can_push;
     std::condition_variable m_can_pop;
     std::deque<batch_item> m_queue;
     bool m_done{false};
     std::size_t m_max_size = 0;  // 0 = unlimited
+    const std::atomic<bool>* m_abort_flag = nullptr;
 };
 
 // Multi-threaded batch publisher
@@ -151,6 +163,7 @@ public:
           m_file_path(file_path), m_counter(0), m_pending_writes(0), m_running(true),
           m_failed(false) {
         m_queue.set_max_size(max_queue_size);
+        m_queue.set_abort_flag(&m_failed);
         // Pre-build the static part of PUB command: "PUB <topic> "
         m_pub_prefix = "PUB ";
         m_pub_prefix += m_topic;
@@ -479,9 +492,19 @@ private:
         // Run io_context in background to establish connection
         std::thread io_thread([&ioc] { ioc.run(); });
 
-        // Wait for connection
-        while (!conn->is_connected() && m_running) {
+        // Wait for connection. m_failed is checked (not just m_running) because
+        // m_running only flips to false after run() joins this thread, so a
+        // connection that never comes up must be able to break out on its own.
+        while (!conn->is_connected() && m_running && !m_failed.load(std::memory_order_acquire)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+
+        if (!conn->is_connected()) {
+            m_console->error("Writer {} failed to connect", id);
+            conn->stop();
+            ioc.stop();
+            if (io_thread.joinable()) io_thread.join();
+            return;
         }
 
         m_console->info("Writer {} connected", id);
