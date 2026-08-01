@@ -26,6 +26,7 @@ SOFTWARE.
 #pragma once
 
 #include "../include/worker.hpp"
+#include "common.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/posix/stream_descriptor.hpp>
@@ -39,7 +40,6 @@ SOFTWARE.
 #include <string>
 #include <chrono>
 #include <iostream>
-#include <fstream>
 #include <memory>
 #include <unistd.h>
 
@@ -71,27 +71,9 @@ public:
             co_await send_request(m_data);
         } else {
             // Read requests from stdin
-            asio::streambuf buf;
-            for (;;) {
-                auto [ec, bytes_read] = co_await asio::async_read_until(
-                    m_stdin, buf, '\n', asio::as_tuple(asio::use_awaitable));
-
-                if (ec) {
-                    if (ec == asio::error::eof || ec == asio::error::not_found) {
-                        break;
-                    }
-                    m_log->error("stdin read error: {}", ec.message());
-                    break;
-                }
-
-                std::string line;
-                std::istream is(&buf);
-                std::getline(is, line);
-
-                if (!line.empty()) {
-                    co_await send_request(line);
-                }
-            }
+            co_await read_stdin_lines(m_stdin, m_log, [this](const std::string& line) {
+                return send_request(line);
+            });
         }
 
         m_log->info("Requester finished, {} requests sent", m_counter.load());

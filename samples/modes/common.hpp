@@ -26,9 +26,18 @@ SOFTWARE.
 #pragma once
 
 #include <asio/awaitable.hpp>
+#include <asio/as_tuple.hpp>
+#include <asio/posix/stream_descriptor.hpp>
+#include <asio/read_until.hpp>
 #include <asio/steady_timer.hpp>
+#include <asio/streambuf.hpp>
 #include <asio/use_awaitable.hpp>
+#include <functional>
 #include <future>
+#include <istream>
+#include <memory>
+#include <spdlog/spdlog.h>
+#include <string>
 #include <type_traits>
 
 namespace nats_tool {
@@ -50,6 +59,38 @@ asio::awaitable<std::invoke_result_t<Func>> async_run_blocking(Func&& func) {
     }
 
     co_return future.get();
+}
+
+// Reads newline-delimited lines from `stdin_stream` (already dup'd from
+// STDIN_FILENO), invoking on_line(line) for each non-empty line, until EOF
+// or an unrecoverable read error. Shared by requester/pubkv, which only
+// differ in what they do with each line and what happens after the loop
+// ends.
+inline asio::awaitable<void> read_stdin_lines(
+    asio::posix::stream_descriptor& stdin_stream, const std::shared_ptr<spdlog::logger>& log,
+    std::function<asio::awaitable<void>(const std::string&)> on_line) {
+    asio::streambuf buf;
+
+    for (;;) {
+        auto [ec, bytes_read] = co_await asio::async_read_until(
+            stdin_stream, buf, '\n', asio::as_tuple(asio::use_awaitable));
+
+        if (ec) {
+            if (ec == asio::error::eof || ec == asio::error::not_found) {
+                break;
+            }
+            log->error("stdin read error: {}", ec.message());
+            break;
+        }
+
+        std::string line;
+        std::istream is(&buf);
+        std::getline(is, line);
+
+        if (!line.empty()) {
+            co_await on_line(line);
+        }
+    }
 }
 
 } // namespace nats_tool

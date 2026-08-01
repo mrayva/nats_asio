@@ -26,6 +26,7 @@ SOFTWARE.
 #pragma once
 
 #include "../include/worker.hpp"
+#include "common.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/posix/stream_descriptor.hpp>
@@ -38,8 +39,6 @@ SOFTWARE.
 #include <span>
 #include <string>
 #include <chrono>
-#include <iostream>
-#include <fstream>
 #include <memory>
 #include <unistd.h>
 
@@ -59,100 +58,9 @@ public:
     }
 
     asio::awaitable<void> read_and_publish() {
-        asio::streambuf buf;
-
-        for (;;) {
-            // Async read line from stdin
-            auto [ec, bytes_read] = co_await asio::async_read_until(
-                m_stdin, buf, '\n', asio::as_tuple(asio::use_awaitable));
-
-            if (ec) {
-                if (ec == asio::error::eof || ec == asio::error::not_found) {
-                    break;  // EOF or no more data
-                }
-                m_log->error("stdin read error: {}", ec.message());
-                break;
-            }
-
-            // Extract line from buffer (without newline)
-            std::string line;
-            std::istream is(&buf);
-            std::getline(is, line);
-
-            // Skip empty lines
-            if (line.empty()) {
-                continue;
-            }
-
-            // Parse key|value - find first separator
-            auto sep_pos = line.find(m_separator);
-            if (sep_pos == std::string::npos) {
-                m_log->error("invalid line format, missing separator '{}': {}", m_separator, line);
-                continue;
-            }
-
-            std::string key = line.substr(0, sep_pos);
-            std::string value_part = line.substr(sep_pos + m_separator.size());
-
-            if (key.empty()) {
-                m_log->error("empty key in line: {}", line);
-                continue;
-            }
-
-            // Check if this is a delete operation (value starts with separator)
-            bool is_delete = false;
-            if (value_part.size() >= m_separator.size() &&
-                value_part.substr(0, m_separator.size()) == m_separator) {
-                is_delete = true;
-            }
-
-            // Wait until connection is ready
-            while (!m_conn->is_connected()) {
-                asio::steady_timer timer(co_await asio::this_coro::executor);
-                timer.expires_after(std::chrono::milliseconds(100));
-                co_await timer.async_wait(asio::use_awaitable);
-            }
-
-            // Backpressure: wait if too many operations in flight
-            while (m_in_flight >= m_max_in_flight) {
-                asio::steady_timer timer(co_await asio::this_coro::executor);
-                timer.expires_after(std::chrono::milliseconds(5));
-                co_await timer.async_wait(asio::use_awaitable);
-            }
-
-            m_in_flight++;
-
-            // Capture data for async operation
-            auto key_copy = std::make_shared<std::string>(std::move(key));
-            auto value_copy = std::make_shared<std::string>(std::move(value_part));
-
-            // Fire-and-forget: dispatch KV operation without waiting
-            asio::co_spawn(
-                m_ioc,
-                [this, key_copy, value_copy, is_delete]() -> asio::awaitable<void> {
-                    if (is_delete) {
-                        auto [rev, s] = co_await m_conn->kv_delete(m_bucket, *key_copy, m_kv_timeout);
-                        if (s.failed()) {
-                            m_log->error("kv_delete failed for key '{}': {}", *key_copy, s.error());
-                        } else {
-                            m_counter++;
-                            m_log->debug("deleted key '{}' rev={}", *key_copy, rev);
-                        }
-                    } else {
-                        std::span<const char> value_span(value_copy->data(), value_copy->size());
-                        auto [rev, s] = co_await m_conn->kv_put(m_bucket, *key_copy, value_span, m_kv_timeout);
-                        if (s.failed()) {
-                            m_log->error("kv_put failed for key '{}': {}", *key_copy, s.error());
-                        } else {
-                            m_counter++;
-                            m_log->debug("put key '{}' rev={}", *key_copy, rev);
-                        }
-                    }
-                    m_in_flight--;
-                    co_return;
-                },
-                asio::detached);
-        }
+        co_await read_stdin_lines(m_stdin, m_log, [this](const std::string& line) {
+            return handle_line(line);
+        });
 
         // Wait for all in-flight operations to complete
         m_log->info("EOF reached, waiting for {} in-flight KV operations", m_in_flight.load());
@@ -168,6 +76,79 @@ public:
     }
 
 private:
+    asio::awaitable<void> handle_line(const std::string& line) {
+        // Parse key|value - find first separator
+        auto sep_pos = line.find(m_separator);
+        if (sep_pos == std::string::npos) {
+            m_log->error("invalid line format, missing separator '{}': {}", m_separator, line);
+            co_return;
+        }
+
+        std::string key = line.substr(0, sep_pos);
+        std::string value_part = line.substr(sep_pos + m_separator.size());
+
+        if (key.empty()) {
+            m_log->error("empty key in line: {}", line);
+            co_return;
+        }
+
+        // Check if this is a delete operation (value starts with separator)
+        bool is_delete = false;
+        if (value_part.size() >= m_separator.size() &&
+            value_part.substr(0, m_separator.size()) == m_separator) {
+            is_delete = true;
+        }
+
+        // Wait until connection is ready
+        while (!m_conn->is_connected()) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(100));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        // Backpressure: wait if too many operations in flight
+        while (m_in_flight >= m_max_in_flight) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(5));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        m_in_flight++;
+
+        // Capture data for async operation
+        auto key_copy = std::make_shared<std::string>(std::move(key));
+        auto value_copy = std::make_shared<std::string>(std::move(value_part));
+
+        // Fire-and-forget: dispatch KV operation without waiting
+        asio::co_spawn(
+            m_ioc,
+            [this, key_copy, value_copy, is_delete]() -> asio::awaitable<void> {
+                if (is_delete) {
+                    auto [rev, s] = co_await m_conn->kv_delete(m_bucket, *key_copy, m_kv_timeout);
+                    if (s.failed()) {
+                        m_log->error("kv_delete failed for key '{}': {}", *key_copy, s.error());
+                    } else {
+                        m_counter++;
+                        m_log->debug("deleted key '{}' rev={}", *key_copy, rev);
+                    }
+                } else {
+                    std::span<const char> value_span(value_copy->data(), value_copy->size());
+                    auto [rev, s] = co_await m_conn->kv_put(m_bucket, *key_copy, value_span, m_kv_timeout);
+                    if (s.failed()) {
+                        m_log->error("kv_put failed for key '{}': {}", *key_copy, s.error());
+                    } else {
+                        m_counter++;
+                        m_log->debug("put key '{}' rev={}", *key_copy, rev);
+                    }
+                }
+                m_in_flight--;
+                co_return;
+            },
+            asio::detached);
+
+        co_return;
+    }
+
     nats_asio::iconnection_sptr m_conn;
     std::string m_bucket;
     std::atomic<int> m_in_flight;
