@@ -4312,13 +4312,22 @@ private:
 
             // Check for error in response headers (404 means no more messages)
             bool is_error = false;
+            bool has_sequence = false;
             for (const auto& [hdr_key, hdr_val] : response.headers) {
                 if (hdr_key == "Status" && hdr_val.find("404") != std::string::npos) {
                     is_error = true;
                     break;
                 }
+                if (hdr_key == "Nats-Sequence") {
+                    has_sequence = true;
+                }
             }
-            if (is_error) {
+            // The combination of next_by_subj + seq used once we're past the first
+            // entry doesn't always come back with a Status: 404 header once exhausted -
+            // it can be a genuinely empty reply (no payload, no headers at all). Without
+            // a Nats-Sequence header there's nothing to advance last_seq with, so treat
+            // that the same as an explicit 404 or the loop never terminates.
+            if (is_error || !has_sequence) {
                 break;  // No more messages
             }
 
@@ -4402,9 +4411,18 @@ private:
             }
         }
 
-        // Verify this message is for the correct key by checking subject
+        // Verify this message is for the correct key. response.subject is the reply
+        // inbox the direct-get response was delivered to, not the original message's
+        // subject - that's carried in the Nats-Subject header instead.
         std::string expected_subject = m_kv_cache.kv_subject(bucket, key);
-        if (response.subject != expected_subject) {
+        std::string actual_subject;
+        for (const auto& [hdr_key, hdr_val] : response.headers) {
+            if (hdr_key == "Nats-Subject") {
+                actual_subject = hdr_val;
+                break;
+            }
+        }
+        if (actual_subject != expected_subject) {
             co_return std::pair<uint64_t, status>{0, status(fmt::format("revision {} is not for key '{}'", revision, key))};
         }
 
