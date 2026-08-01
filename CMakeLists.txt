@@ -176,6 +176,20 @@ if(NATS_ASIO_BUILD_TESTS)
             COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/nats_tool_cli_validation.sh
                     $<TARGET_FILE:nats_tool>
         )
+
+        # Drives nats_tool's 16 CLI modes against a real nats-server (JetStream/KV
+        # behavior isn't worth faking). Skips (not fails) when no server is
+        # reachable, so it doesn't break `ctest` for anyone without one running.
+        add_test(
+            NAME nats_tool_integration
+            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/nats_tool_integration.sh
+                    $<TARGET_FILE:nats_tool>
+        )
+        set_tests_properties(nats_tool_integration PROPERTIES
+            LABELS "integration"
+            SKIP_RETURN_CODE 125
+            TIMEOUT 180
+        )
     endif()
 endif()
 
