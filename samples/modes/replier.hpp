@@ -27,6 +27,7 @@ SOFTWARE.
 
 #include "../include/worker.hpp"
 #include "../include/string_utils.hpp"
+#include "common.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/posix/stream_descriptor.hpp>
@@ -40,9 +41,7 @@ SOFTWARE.
 #include <string>
 #include <chrono>
 #include <iostream>
-#include <fstream>
 #include <memory>
-#include <unistd.h>
 
 namespace nats_tool {
 
@@ -136,21 +135,21 @@ private:
         } else if (!m_translate_cmd.empty()) {
             // Transform through external command (runs on thread pool to avoid blocking)
             std::string cmd = m_translate_cmd;
-            // Replace {{Subject}} placeholder if present, shell-quoted since
-            // subject is attacker-controlled (NATS message subject) and reaches sh -c.
-            std::string subject_placeholder = "{{Subject}}";
-            size_t pos = cmd.find(subject_placeholder);
-            if (pos != std::string::npos) {
-                cmd.replace(pos, subject_placeholder.length(), shell_quote(msg.subject));
-            }
-
-            // Copy payload for thread-safe access
+            std::string subj = msg.subject;
             std::vector<char> payload_copy(msg.payload.begin(), msg.payload.end());
+            auto log = m_log;
 
             // Run blocking subprocess on background thread
-            reply_payload = co_await async_run_blocking([this, cmd, payload_copy]() {
-                return run_translate_command(cmd, std::span<const char>(payload_copy));
+            reply_payload = co_await async_run_blocking([cmd, subj, payload_copy, log]() {
+                return translate_payload(cmd, subj, std::span<const char>(payload_copy), log);
             });
+
+            // Trim a single trailing newline/CR, mirroring shell command-substitution
+            // semantics ($(...)) since this becomes the literal RPC reply payload.
+            while (!reply_payload.empty() &&
+                   (reply_payload.back() == '\n' || reply_payload.back() == '\r')) {
+                reply_payload.pop_back();
+            }
 
             if (reply_payload.empty()) {
                 m_log->warn("translate command returned empty output");
@@ -171,67 +170,6 @@ private:
         }
 
         co_return;
-    }
-
-    std::string run_translate_command(const std::string& cmd, std::span<const char> input) {
-        int pipe_in[2], pipe_out[2];
-        if (pipe(pipe_in) < 0 || pipe(pipe_out) < 0) {
-            m_log->error("pipe creation failed");
-            return "";
-        }
-
-        pid_t pid = fork();
-        if (pid < 0) {
-            m_log->error("fork failed");
-            close(pipe_in[0]); close(pipe_in[1]);
-            close(pipe_out[0]); close(pipe_out[1]);
-            return "";
-        }
-
-        if (pid == 0) {
-            // Child process
-            close(pipe_in[1]);
-            close(pipe_out[0]);
-            dup2(pipe_in[0], STDIN_FILENO);
-            dup2(pipe_out[1], STDOUT_FILENO);
-            close(pipe_in[0]);
-            close(pipe_out[1]);
-            execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
-            _exit(1);
-        }
-
-        // Parent process
-        close(pipe_in[0]);
-        close(pipe_out[1]);
-
-        // Write input to child
-        if (!input.empty()) {
-            ssize_t written = ::write(pipe_in[1], input.data(), input.size());
-            if (written < 0 || static_cast<size_t>(written) != input.size()) {
-                m_log->warn("translate command: incomplete write to stdin");
-            }
-        }
-        close(pipe_in[1]);
-
-        // Read output from child
-        std::string result;
-        char buf[4096];
-        ssize_t n;
-        while ((n = ::read(pipe_out[0], buf, sizeof(buf))) > 0) {
-            result.append(buf, n);
-        }
-        close(pipe_out[0]);
-
-        // Wait for child
-        int status;
-        waitpid(pid, &status, 0);
-
-        // Trim trailing newline
-        while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-            result.pop_back();
-        }
-
-        return result;
     }
 
     nats_asio::iconnection_sptr m_conn;
