@@ -26,9 +26,8 @@ SOFTWARE.
 #pragma once
 
 #include "../include/worker.hpp"
-#include "../include/string_utils.hpp"
 #include "../include/zerialize_json.hpp"
-#include "common.hpp"
+#include "message_output.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/steady_timer.hpp>
@@ -96,67 +95,22 @@ public:
                         std::ostream* out = m_dump_file ? m_dump_file.get() : &std::cout;
                         const auto& payload = msg.msg.payload;
                         const auto& subject = msg.msg.subject;
+                        std::span<const char> payload_span(payload.data(), payload.size());
 
-                        // Apply translation if configured
-                        std::string translated;
-                        std::span<const char> output_payload(payload.data(), payload.size());
-                        if (!m_translate_cmd.empty()) {
-                            std::string subj_str(subject);
-                            std::vector<char> payload_copy(payload.begin(), payload.end());
-                            auto log = m_log;
-                            std::string cmd = m_translate_cmd;
-                            translated = co_await async_run_blocking([cmd, subj_str, payload_copy, log]() {
-                                return translate_payload(cmd, subj_str, std::span<const char>(payload_copy), log);
-                            });
-                            output_payload = std::span<const char>(translated.data(), translated.size());
-                        }
+                        std::string translated_storage;
+                        auto output_payload = co_await apply_translate_if_configured(
+                            m_translate_cmd, subject, payload_span, m_log, translated_storage);
 
-                        switch (m_output_mode) {
-                            case output_mode::raw:
-                                out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
-                                *out << '\n';
-                                break;
-                            case output_mode::json: {
-                                if (m_format) {
-                                    auto json_result = deserialize_to_json(output_payload, *m_format, m_log);
-                                    if (json_result) {
-                                        m_deserializer_stats.record_success();
-                                        *out << "{\"subject\":\"" << subject << "\""
-                                             << ",\"stream\":\"" << msg.stream << "\""
-                                             << ",\"seq\":" << msg.stream_sequence
-                                             << ",\"payload\":" << *json_result << "}\n";
-                                    } else {
-                                        bool should_exit = m_deserializer_stats.record_failure();
-                                        m_log->warn("Failed to deserialize message on subject '{}' (bad: {}/{}, {:.2f}%)",
-                                                   std::string(subject),
-                                                   m_deserializer_stats.bad_messages(),
-                                                   m_deserializer_stats.total_messages(),
-                                                   m_deserializer_stats.bad_percentage());
-                                        if (should_exit) {
-                                            m_log->error("Error threshold exceeded - exiting");
-                                            m_ioc.stop();
-                                        }
-                                    }
-                                    break;
-                                }
+                        std::string json_suffix_fields = fmt::format(
+                            ",\"stream\":\"{}\",\"seq\":{}", msg.stream, msg.stream_sequence);
 
-                                std::string escaped = escape_json_string(output_payload);
-                                *out << "{\"subject\":\"" << subject << "\""
-                                     << ",\"stream\":\"" << msg.stream << "\""
-                                     << ",\"seq\":" << msg.stream_sequence
-                                     << ",\"payload\":\"" << escaped << "\"}\n";
-                                break;
-                            }
-                            case output_mode::normal:
-                                *out << "[" << subject << "] ";
-                                out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
-                                *out << '\n';
-                                m_log->debug("stream={} consumer={} seq={}/{} delivered={}",
-                                            msg.stream, msg.consumer, msg.stream_sequence,
-                                            msg.consumer_sequence, msg.num_delivered);
-                                break;
-                            case output_mode::none:
-                                break;
+                        emit_message(*out, m_output_mode, subject, output_payload, m_format,
+                                    m_deserializer_stats, m_log, m_ioc, {}, json_suffix_fields);
+
+                        if (m_output_mode == output_mode::normal) {
+                            m_log->debug("stream={} consumer={} seq={}/{} delivered={}",
+                                        msg.stream, msg.consumer, msg.stream_sequence,
+                                        msg.consumer_sequence, msg.num_delivered);
                         }
 
                         if (m_dump_file) {

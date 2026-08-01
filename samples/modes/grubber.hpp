@@ -26,9 +26,8 @@ SOFTWARE.
 #pragma once
 
 #include "../include/worker.hpp"
-#include "../include/string_utils.hpp"
 #include "../include/zerialize_json.hpp"
-#include "common.hpp"
+#include "message_output.hpp"
 #include <nats_asio/nats_asio.hpp>
 #include <asio/awaitable.hpp>
 #include <fmt/format.h>
@@ -67,22 +66,14 @@ public:
 
         std::ostream* out = m_dump_file ? m_dump_file.get() : &std::cout;
 
-        // Apply translation if configured (runs on background thread)
-        std::string translated;
-        std::span<const char> output_payload = payload;
-        if (!m_translate_cmd.empty()) {
-            std::string subj_str(subject);
-            std::vector<char> payload_copy(payload.begin(), payload.end());
-            auto log = m_log;
-            std::string cmd = m_translate_cmd;
-            translated = co_await async_run_blocking([cmd, subj_str, payload_copy, log]() {
-                return translate_payload(cmd, subj_str, std::span<const char>(payload_copy), log);
-            });
-            output_payload = std::span<const char>(translated.data(), translated.size());
-        }
+        std::string translated_storage;
+        auto output_payload = co_await apply_translate_if_configured(
+            m_translate_cmd, subject, payload, m_log, translated_storage);
 
-        // Get timestamp if needed
-        std::string timestamp_str;
+        // Timestamp, if requested, prefixes raw/normal lines and prepends the
+        // JSON envelope's field list; reply_to (if present) appends to it.
+        std::string line_prefix;
+        std::string json_prefix_fields;
         if (m_show_timestamp && m_output_mode != output_mode::none) {
             auto now = std::chrono::system_clock::now();
             auto time_t_now = std::chrono::system_clock::to_time_t(now);
@@ -90,83 +81,20 @@ public:
                 now.time_since_epoch()) % 1000;
             std::tm tm_now{};
             localtime_r(&time_t_now, &tm_now);
-            timestamp_str = fmt::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}.{:03d}",
+            std::string timestamp_str = fmt::format(
+                "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}.{:03d}",
                 tm_now.tm_year + 1900, tm_now.tm_mon + 1, tm_now.tm_mday,
                 tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec, static_cast<int>(ms.count()));
+            line_prefix = fmt::format("[{}] ", timestamp_str);
+            json_prefix_fields = fmt::format("\"timestamp\":\"{}\",", timestamp_str);
+        }
+        std::string json_suffix_fields;
+        if (reply_to) {
+            json_suffix_fields = fmt::format(",\"reply_to\":\"{}\"", *reply_to);
         }
 
-        switch (m_output_mode) {
-            case output_mode::raw:
-                if (m_show_timestamp) {
-                    *out << "[" << timestamp_str << "] ";
-                }
-                out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
-                *out << '\n';
-                break;
-            case output_mode::json: {
-                // If binary format specified, deserialize to JSON
-                if (m_format) {
-                    auto json_result = deserialize_to_json(output_payload, *m_format, m_log);
-                    if (json_result) {
-                        // Success - output the deserialized JSON
-                        m_deserializer_stats.record_success();
-
-                        // Wrap in envelope with metadata if needed
-                        if (m_show_timestamp || reply_to) {
-                            *out << "{";
-                            if (m_show_timestamp) {
-                                *out << "\"timestamp\":\"" << timestamp_str << "\",";
-                            }
-                            *out << "\"subject\":\"" << subject << "\"";
-                            if (reply_to) {
-                                *out << ",\"reply_to\":\"" << *reply_to << "\"";
-                            }
-                            *out << ",\"payload\":" << *json_result << "}\n";
-                        } else {
-                            // Just output the deserialized payload directly
-                            *out << *json_result << '\n';
-                        }
-                    } else {
-                        // Failed to deserialize - skip or exit
-                        bool should_exit = m_deserializer_stats.record_failure();
-                        m_log->warn("Failed to deserialize message on subject '{}' (bad: {}/{}, {:.2f}%)",
-                                   std::string(subject),
-                                   m_deserializer_stats.bad_messages(),
-                                   m_deserializer_stats.total_messages(),
-                                   m_deserializer_stats.bad_percentage());
-
-                        if (should_exit) {
-                            m_log->error("Error threshold exceeded - exiting");
-                            m_ioc.stop();
-                        }
-                    }
-                    break;
-                }
-
-                // No binary format - escape payload as string (original behavior)
-                std::string escaped = escape_json_string(output_payload);
-                *out << "{";
-                if (m_show_timestamp) {
-                    *out << "\"timestamp\":\"" << timestamp_str << "\",";
-                }
-                *out << "\"subject\":\"" << subject << "\"";
-                if (reply_to) {
-                    *out << ",\"reply_to\":\"" << *reply_to << "\"";
-                }
-                *out << ",\"payload\":\"" << escaped << "\"}\n";
-                break;
-            }
-            case output_mode::normal:
-                if (m_show_timestamp) {
-                    *out << "[" << timestamp_str << "] ";
-                }
-                *out << "[" << subject << "] ";
-                out->write(output_payload.data(), static_cast<std::streamsize>(output_payload.size()));
-                *out << '\n';
-                break;
-            case output_mode::none:
-                break;
-        }
+        emit_message(*out, m_output_mode, subject, output_payload, m_format, m_deserializer_stats,
+                    m_log, m_ioc, json_prefix_fields, json_suffix_fields, line_prefix);
 
         if (m_dump_file) {
             m_dump_file->flush();
