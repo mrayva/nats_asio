@@ -215,6 +215,9 @@ private:
         ino_t inode = 0;
         off_t size = 0;
         timespec modified{};
+        // This archive's contribution to m_zip_cumulative_extracted_bytes, so it
+        // can be given back when the archive is replaced or no longer matched.
+        uint64_t extracted_bytes = 0;
     };
 
     static bool same_zip_source(const extracted_zip_state& state, const struct stat& st) {
@@ -379,6 +382,9 @@ private:
                         for (const auto& extracted_path : existing_zip->second.files) {
                             close_file(extracted_path);
                         }
+                        // Give back this archive's share of the aggregate budget now
+                        // that its extracted files are being removed from disk.
+                        m_zip_cumulative_extracted_bytes -= existing_zip->second.extracted_bytes;
                         m_extracted_zips.erase(existing_zip);
                     }
 
@@ -386,8 +392,10 @@ private:
                     if (m_extracted_zips.find(path) == m_extracted_zips.end()) {
                         m_log->info("Detected zip archive: {}", path);
                         std::filesystem::path temp_dir;
+                        uint64_t bytes_before = m_zip_cumulative_extracted_bytes;
                         auto extracted = extract_zip_to_temp(path, m_log, &temp_dir,
-                                                             m_zip_limits);
+                                                             m_zip_limits,
+                                                             &m_zip_cumulative_extracted_bytes);
 
                         if (!extracted.empty()) {
                             // Add all extracted files to current paths and open them
@@ -408,7 +416,8 @@ private:
                                     zip_stat.st_dev,
                                     zip_stat.st_ino,
                                     zip_stat.st_size,
-                                    zip_stat.st_mtim});
+                                    zip_stat.st_mtim,
+                                    m_zip_cumulative_extracted_bytes - bytes_before});
                         }
                     } else {
                         for (const auto& extracted_path : m_extracted_zips.at(path).files) {
@@ -446,6 +455,7 @@ private:
 
         for (auto it = m_extracted_zips.begin(); it != m_extracted_zips.end();) {
             if (current_zip_paths.find(it->first) == current_zip_paths.end()) {
+                m_zip_cumulative_extracted_bytes -= it->second.extracted_bytes;
                 it = m_extracted_zips.erase(it);
             } else {
                 ++it;
@@ -596,6 +606,10 @@ private:
     int m_poll_interval_ms;
     size_t m_max_line_size;
     zip_extraction_limits m_zip_limits;
+    // Persists across scan_for_files() calls so max_total_bytes bounds the
+    // aggregate disk usage of every zip archive this reader has extracted,
+    // not just the most recent one.
+    uint64_t m_zip_cumulative_extracted_bytes = 0;
     bool m_initial_scan = true;
     std::shared_ptr<spdlog::logger> m_log;
 

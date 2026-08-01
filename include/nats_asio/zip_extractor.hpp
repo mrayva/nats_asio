@@ -76,7 +76,11 @@ inline std::optional<std::string> zip_entry_filename(std::string_view name) {
     }
 
     std::string filename = std::filesystem::path(name).filename().string();
-    if (filename.empty()) {
+    // Reject "." and ".." explicitly rather than relying on unique_zip_output_path's
+    // exists()-based fallback (temp_dir/".." always exists, so it happens to fall
+    // through to the flattened name today, but that's incidental to its collision
+    // logic, not a guarantee) to write outside temp_dir.
+    if (filename.empty() || filename == "." || filename == "..") {
         return std::nullopt;
     }
     return filename;
@@ -123,11 +127,18 @@ struct zip_extraction_limits {
 
 // Extract all files from a zip archive to a temporary directory
 // Returns: vector of extracted file paths
+//
+// cumulative_extracted_bytes, if non-null, tracks extraction totals across
+// multiple archives (e.g. all zips matched by one glob pattern): it seeds
+// this call's starting budget and is updated with the running total on
+// success, so limits.max_total_bytes bounds aggregate disk usage across
+// every archive a caller extracts, not just this one.
 inline std::vector<std::string> extract_zip_to_temp(
     const std::string& zip_path,
     std::shared_ptr<spdlog::logger> log,
     std::filesystem::path* extracted_temp_dir = nullptr,
-    zip_extraction_limits limits = {}) {
+    zip_extraction_limits limits = {},
+    uint64_t* cumulative_extracted_bytes = nullptr) {
 
     std::vector<std::string> extracted_files;
 
@@ -164,7 +175,7 @@ inline std::vector<std::string> extract_zip_to_temp(
     }
     log->info("Extracting {} file(s) from zip archive: {}", num_entries, zip_path);
 
-    uint64_t total_extracted_bytes = 0;
+    uint64_t total_extracted_bytes = cumulative_extracted_bytes ? *cumulative_extracted_bytes : 0;
     bool limit_exceeded = false;
 
     // Extract each file
@@ -177,8 +188,14 @@ inline std::vector<std::string> extract_zip_to_temp(
 
         auto filename = zip_entry_filename(name);
         if (!filename) {
-            if (*name == '\0') {
+            std::string_view name_view(name);
+            if (name_view.empty()) {
                 log->warn("Skipping ZIP entry {} with an empty name in {}", i, zip_path);
+            } else if (name_view.back() != '/') {
+                // Not a (silently-expected) directory entry, so this is a
+                // rejected unsafe filename such as "." or "..".
+                log->warn("Skipping ZIP entry {} ({}) with an unsafe filename in {}",
+                          i, name, zip_path);
             }
             continue;
         }
@@ -261,6 +278,11 @@ inline std::vector<std::string> extract_zip_to_temp(
         if (extracted_temp_dir) {
             extracted_temp_dir->clear();
         }
+    } else if (cumulative_extracted_bytes) {
+        // Only commit the running total when this archive's files actually
+        // survived (weren't rolled back above), so a discarded/over-limit
+        // archive doesn't permanently eat into the aggregate budget.
+        *cumulative_extracted_bytes = total_extracted_bytes;
     }
 
     log->info("Successfully extracted {} file(s) from {}", extracted_files.size(), zip_path);
