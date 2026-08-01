@@ -53,7 +53,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <concurrentqueue/moodycamel/concurrentqueue.h>
 #include <deque>
 #include <gtl/lru_cache.hpp>
-#include <iomanip>
 #include <istream>
 #include <magic_enum/magic_enum.hpp>
 #include <memory>
@@ -62,7 +61,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #include <limits>
 #include <random>
 #include <simdjson.h>
-#include <sstream>
 #include <string>
 #include <stringzilla/stringzilla.hpp>
 #include <utility>
@@ -1520,7 +1518,8 @@ private:
 // Specializations for raw_socket
 template <>
 inline void uni_socket<raw_socket>::close(asio::error_code& ec) {
-    m_socket.close(ec);
+    // asio's close(ec) also returns ec by value (deprecated transitional API); it's the same value already in ec.
+    ec = m_socket.close(ec);
 }
 
 template <>
@@ -1547,7 +1546,8 @@ inline asio::awaitable<void> uni_socket<raw_socket>::async_connect(const endpoin
 // Specializations for ssl_socket
 template <>
 inline void uni_socket<ssl_socket>::close(asio::error_code& ec) {
-    m_socket.lowest_layer().close(ec);
+    // asio's close(ec) also returns ec by value (deprecated transitional API); it's the same value already in ec.
+    ec = m_socket.lowest_layer().close(ec);
 }
 
 template <>
@@ -1906,7 +1906,11 @@ public:
     }
 
 private:
-    asio::awaitable<status> send_ack(const js_message& msg, std::string_view ack_body);
+    // ack_body is taken by value (not string_view): callers such as nak() build it
+    // from a temporary (fmt::format), which would otherwise dangle across the
+    // coroutine's suspension points. Taking it by value moves it into the
+    // coroutine frame, which stays alive for the coroutine's full lifetime.
+    asio::awaitable<status> send_ack(const js_message& msg, std::string ack_body);
     asio::awaitable<status> send_ack_batch(const std::vector<js_message>& messages,
                                            std::string_view ack_body);
 
@@ -2036,6 +2040,40 @@ inline js_message parse_js_message_metadata(const message& msg) {
     js_message js_msg;
     js_msg.msg = msg;
 
+    // Primary metadata source: the JetStream ACK reply-to subject. nats-server
+    // does not attach Nats-* metadata headers to ordinary consumer deliveries
+    // (verified against nats-server 2.14.3: push-consumer messages arrive with
+    // zero headers) - the reply-to subject is the actual, always-present carrier:
+    //   no domain:   $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<tm_ns>.<pending>
+    //   with domain: $JS.ACK.<domain>.<accthash>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<tm_ns>.<pending>.<token>
+    // Stream/consumer/domain names can't contain '.', so this split is unambiguous.
+    if (msg.reply_to && msg.reply_to->rfind("$JS.ACK.", 0) == 0) {
+        auto tokens = protocol_parser::split_sv(*msg.reply_to, ".");
+        std::size_t base = 0;
+        if (tokens.size() == 9) {
+            base = 2;
+        } else if (tokens.size() == 12) {
+            base = 4;
+        }
+        if (base != 0) {
+            js_msg.stream = std::string(tokens[base]);
+            js_msg.consumer = std::string(tokens[base + 1]);
+            parse_int(tokens[base + 2], js_msg.num_delivered);
+            parse_int(tokens[base + 3], js_msg.stream_sequence);
+            parse_int(tokens[base + 4], js_msg.consumer_sequence);
+            uint64_t ts_ns = 0;
+            if (parse_int(tokens[base + 5], ts_ns)) {
+                js_msg.timestamp = std::chrono::system_clock::time_point(
+                    std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                        std::chrono::nanoseconds(ts_ns)));
+            }
+            parse_int(tokens[base + 6], js_msg.num_pending);
+        }
+    }
+
+    // Nats-* headers, if ever present (e.g. a future server version or an
+    // intermediary that adds them), take precedence over the subject-derived
+    // values above since they're the more explicit source.
     for (const auto& [key, value] : msg.headers) {
         if (key == "Nats-Stream") {
             js_msg.stream = value;
@@ -3361,6 +3399,28 @@ private:
     asio::awaitable<std::pair<message, status>> request_impl(
         string_view subject, std::span<const char> payload,
         const headers_t& headers, std::chrono::milliseconds timeout) {
+
+        // Every other public entry point (publish, subscribe, ...) redirects onto
+        // m_strand before touching connection state; request_impl must too, since
+        // it both mutates state->response from the strand-bound subscribe callback
+        // and reads it back from this coroutine — without the redirect those two
+        // sides could run on different threads with no ordering between them.
+        if (!m_strand.running_in_this_thread()) {
+            auto subject_copy = std::string(subject);
+            auto payload_copy =
+                std::make_shared<std::vector<char>>(payload.begin(), payload.end());
+            auto headers_copy = headers;
+
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, subject_copy = std::move(subject_copy), payload_copy,
+                 headers_copy = std::move(headers_copy),
+                 timeout]() -> asio::awaitable<std::pair<message, status>> {
+                    std::span<const char> payload_span(payload_copy->data(), payload_copy->size());
+                    co_return co_await request_impl(subject_copy, payload_span, headers_copy, timeout);
+                },
+                asio::use_awaitable);
+        }
 
         if (!m_is_connected) {
             co_return std::pair<message, status>{{}, status(error_code::not_connected)};
@@ -5213,7 +5273,7 @@ private:
 // Implementation of js_subscription::send_ack (needs connection class to be complete)
 template <class SocketType>
 asio::awaitable<status> js_subscription<SocketType>::send_ack(
-    const js_message& msg, std::string_view ack_body) {
+    const js_message& msg, std::string ack_body) {
 
     if (!m_active.load()) {
         co_return status(error_code::invalid_argument, "subscription is not active");
