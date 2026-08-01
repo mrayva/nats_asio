@@ -170,6 +170,21 @@ if(NATS_ASIO_BUILD_TESTS)
     )
     add_test(NAME public_headers_test COMMAND public_headers_test)
 
+    # Regression tests that need a real nats-server rather than the fake
+    # protocol server the tests above use (JetStream ack/nak timing isn't
+    # worth faking). Skips (not fails) when no server is reachable.
+    add_executable(live_server_regression tests/live_server_regression.cpp)
+    target_link_libraries(live_server_regression PRIVATE nats_asio::nats_asio)
+    set_target_properties(live_server_regression PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
+    )
+    add_test(NAME live_server_regression COMMAND live_server_regression)
+    set_tests_properties(live_server_regression PROPERTIES
+        LABELS "integration"
+        SKIP_RETURN_CODE 125
+        TIMEOUT 60
+    )
+
     if(TARGET nats_tool)
         add_test(
             NAME nats_tool_cli_validation

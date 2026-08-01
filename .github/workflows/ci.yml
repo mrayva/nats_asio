@@ -82,20 +82,22 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
         run: ctest --test-dir build-ci --output-on-failure -LE integration
 
-      # nats_tool_integration drives nats_tool's CLI modes against a real
-      # nats-server (JetStream/KV behavior isn't worth faking with a fake
-      # server the way the unit tests do). Runs under the sanitizer builds
-      # too - the previous version of this file didn't even build nats_tool
-      # for the sanitizer entries, so ASan/TSan never saw its code paths at
-      # all. New and informational for now: doesn't block CI on failure.
+      # "integration"-labeled tests (nats_tool_integration, live_server_regression)
+      # need a real nats-server - JetStream/KV behavior isn't worth faking the
+      # way the unit tests above do. Runs under the sanitizer builds too - the
+      # previous version of this file didn't even build nats_tool for the
+      # sanitizer entries, so ASan/TSan never saw its code paths at all (that's
+      # exactly the gap that let a real nak() use-after-free ship undetected
+      # until it was found by hand). New and informational for now: doesn't
+      # block CI on failure.
       - name: Start NATS server for integration tests
-        if: matrix.samples == 'ON'
+        if: matrix.tests == 'ON'
         run: |
           docker run -d --name nats-integration -p 4222:4222 -p 8222:8222 nats:latest -js -m 8222
           timeout 30 bash -c 'until curl -sf http://localhost:8222/varz > /dev/null; do sleep 1; done'
 
       - name: Integration tests (informational)
-        if: matrix.samples == 'ON'
+        if: matrix.tests == 'ON'
         continue-on-error: true
         env:
           ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
