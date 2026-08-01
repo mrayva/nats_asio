@@ -1199,6 +1199,43 @@ private:
 };
 
 // ============================================================================
+// Cross-strand argument capture
+//
+// Every public connection method that touches strand-bound state (m_subs,
+// m_write_queue, the socket, ...) must run on m_strand. If called from
+// another thread, it redirects there via asio::co_spawn(m_strand, ...) -
+// but a view type (string_view/span) argument may point at caller-owned
+// data, including a temporary that only lives for the current full
+// expression, so it must never be captured directly into a coroutine that
+// might resume on a different thread after the caller's expression has
+// already completed. capture_arg() copies a view into storage the
+// redirected coroutine can own; restore_arg() rebuilds the original view
+// from that storage on the other side.
+// ============================================================================
+
+inline std::string capture_arg(string_view sv) {
+    return std::string(sv);
+}
+
+inline optional<std::string> capture_arg(optional<string_view> sv) {
+    return sv ? optional<std::string>(std::string(*sv)) : std::nullopt;
+}
+
+inline std::shared_ptr<std::vector<char>> capture_arg(std::span<const char> sp) {
+    return std::make_shared<std::vector<char>>(sp.begin(), sp.end());
+}
+
+inline string_view restore_arg(const std::string& s) {
+    return string_view(s);
+}
+
+inline optional<string_view> restore_arg(const optional<std::string>& s) {
+    return s ? optional<string_view>(string_view(*s)) : std::nullopt;
+}
+
+inline std::span<const char> restore_arg(const std::shared_ptr<std::vector<char>>& v) {
+    return std::span<const char>(v->data(), v->size());
+}
 
 // Generate unique inbox for request-reply
 inline std::string generate_inbox() {
@@ -2282,22 +2319,16 @@ public:
     virtual asio::awaitable<status> publish(string_view subject, std::span<const char> payload,
                                             optional<string_view> reply_to) override {
         if (!m_strand.running_in_this_thread()) {
-            auto subject_copy = std::string(subject);
-            auto payload_copy =
-                std::make_shared<std::vector<char>>(payload.begin(), payload.end());
-            auto reply_to_copy = reply_to ? std::optional<std::string>(std::string(*reply_to))
-                                          : std::nullopt;
+            auto subject_copy = capture_arg(subject);
+            auto payload_copy = capture_arg(payload);
+            auto reply_to_copy = capture_arg(reply_to);
 
             co_return co_await asio::co_spawn(
                 m_strand,
                 [this, subject_copy = std::move(subject_copy), payload_copy,
                  reply_to_copy = std::move(reply_to_copy)]() -> asio::awaitable<status> {
-                    std::span<const char> payload_span(payload_copy->data(), payload_copy->size());
-                    optional<string_view> reply_to_view = std::nullopt;
-                    if (reply_to_copy.has_value()) {
-                        reply_to_view = string_view(*reply_to_copy);
-                    }
-                    co_return co_await publish(subject_copy, payload_span, reply_to_view);
+                    co_return co_await publish(restore_arg(subject_copy), restore_arg(payload_copy),
+                                                restore_arg(reply_to_copy));
                 },
                 asio::use_awaitable);
         }
@@ -2435,12 +2466,11 @@ public:
     // Write pre-formatted NATS protocol data directly
     virtual asio::awaitable<status> write_raw(std::span<const char> data) override {
         if (!m_strand.running_in_this_thread()) {
-            auto data_copy = std::make_shared<std::vector<char>>(data.begin(), data.end());
+            auto data_copy = capture_arg(data);
             co_return co_await asio::co_spawn(
                 m_strand,
                 [this, data_copy]() -> asio::awaitable<status> {
-                    std::span<const char> data_span(data_copy->data(), data_copy->size());
-                    co_return co_await write_raw(data_span);
+                    co_return co_await write_raw(restore_arg(data_copy));
                 },
                 asio::use_awaitable);
         }
@@ -2819,24 +2849,18 @@ public:
                                             const headers_t& headers,
                                             optional<string_view> reply_to = {}) override {
         if (!m_strand.running_in_this_thread()) {
-            auto subject_copy = std::string(subject);
-            auto payload_copy =
-                std::make_shared<std::vector<char>>(payload.begin(), payload.end());
+            auto subject_copy = capture_arg(subject);
+            auto payload_copy = capture_arg(payload);
             auto headers_copy = headers;
-            auto reply_to_copy = reply_to ? std::optional<std::string>(std::string(*reply_to))
-                                          : std::nullopt;
+            auto reply_to_copy = capture_arg(reply_to);
 
             co_return co_await asio::co_spawn(
                 m_strand,
                 [this, subject_copy = std::move(subject_copy), payload_copy,
                  headers_copy = std::move(headers_copy),
                  reply_to_copy = std::move(reply_to_copy)]() -> asio::awaitable<status> {
-                    std::span<const char> payload_span(payload_copy->data(), payload_copy->size());
-                    optional<string_view> reply_to_view = std::nullopt;
-                    if (reply_to_copy.has_value()) {
-                        reply_to_view = string_view(*reply_to_copy);
-                    }
-                    co_return co_await publish(subject_copy, payload_span, headers_copy, reply_to_view);
+                    co_return co_await publish(restore_arg(subject_copy), restore_arg(payload_copy),
+                                                headers_copy, restore_arg(reply_to_copy));
                 },
                 asio::use_awaitable);
         }
@@ -3406,9 +3430,8 @@ private:
         // and reads it back from this coroutine — without the redirect those two
         // sides could run on different threads with no ordering between them.
         if (!m_strand.running_in_this_thread()) {
-            auto subject_copy = std::string(subject);
-            auto payload_copy =
-                std::make_shared<std::vector<char>>(payload.begin(), payload.end());
+            auto subject_copy = capture_arg(subject);
+            auto payload_copy = capture_arg(payload);
             auto headers_copy = headers;
 
             co_return co_await asio::co_spawn(
@@ -3416,8 +3439,8 @@ private:
                 [this, subject_copy = std::move(subject_copy), payload_copy,
                  headers_copy = std::move(headers_copy),
                  timeout]() -> asio::awaitable<std::pair<message, status>> {
-                    std::span<const char> payload_span(payload_copy->data(), payload_copy->size());
-                    co_return co_await request_impl(subject_copy, payload_span, headers_copy, timeout);
+                    co_return co_await request_impl(restore_arg(subject_copy),
+                                                     restore_arg(payload_copy), headers_copy, timeout);
                 },
                 asio::use_awaitable);
         }
@@ -3508,9 +3531,8 @@ private:
         }
 
         if (!m_strand.running_in_this_thread()) {
-            auto subject_copy = std::string(subject);
-            auto payload_copy =
-                std::make_shared<std::vector<char>>(payload.begin(), payload.end());
+            auto subject_copy = capture_arg(subject);
+            auto payload_copy = capture_arg(payload);
             auto headers_copy = headers;
 
             co_return co_await asio::co_spawn(
@@ -3518,9 +3540,9 @@ private:
                 [this, subject_copy = std::move(subject_copy), payload_copy,
                  headers_copy = std::move(headers_copy), timeout,
                  wait_for_ack]() -> asio::awaitable<std::pair<js_pub_ack, status>> {
-                    std::span<const char> payload_span(payload_copy->data(), payload_copy->size());
                     co_return co_await js_publish_impl(
-                        subject_copy, payload_span, headers_copy, timeout, wait_for_ack);
+                        restore_arg(subject_copy), restore_arg(payload_copy), headers_copy,
+                        timeout, wait_for_ack);
                 },
                 asio::use_awaitable);
         }
