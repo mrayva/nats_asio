@@ -94,6 +94,8 @@ enum class mode { grubber, generator, publisher, requester, replier, benchmarker
 #include "modes/requester.hpp"
 #include "modes/replier.hpp"
 #include "modes/benchmarker.hpp"
+#include "modes/mode_runner.hpp"
+#include "modes/mode_runners.hpp"
 
 using nats_tool::generator;
 using nats_tool::grubber;
@@ -105,6 +107,22 @@ using nats_tool::publisher;
 using nats_tool::requester;
 using nats_tool::replier;
 using nats_tool::benchmarker;
+using nats_tool::mode_context;
+using nats_tool::mode_runner;
+using nats_tool::grubber_runner;
+using nats_tool::js_grubber_runner;
+using nats_tool::kv_watcher_runner;
+using nats_tool::kv_create_runner;
+using nats_tool::kv_update_runner;
+using nats_tool::kv_keys_runner;
+using nats_tool::kv_history_runner;
+using nats_tool::kv_purge_runner;
+using nats_tool::kv_revert_runner;
+using nats_tool::generator_runner;
+using nats_tool::js_fetcher_runner;
+using nats_tool::kv_publisher_runner;
+using nats_tool::requester_runner;
+using nats_tool::replier_runner;
 
 std::string read_file(const std::shared_ptr<spdlog::logger>& console, const std::string& path) {
     try {
@@ -120,6 +138,50 @@ std::string read_file(const std::shared_ptr<spdlog::logger>& console, const std:
     }
 
     return {};
+}
+
+// Constructs the mode_runner for every single-connection CLI mode. publisher
+// and benchmarker manage their own (possibly multiple) connections with
+// genuinely different control flow, so they stay handled separately in
+// main() rather than being forced into this interface.
+std::unique_ptr<mode_runner> make_runner(mode m, asio::io_context& ioc,
+                                         std::shared_ptr<spdlog::logger> console,
+                                         std::atomic<bool>& operation_failed,
+                                         const mode_context& ctx) {
+    switch (m) {
+        case mode::grubber:
+            return std::make_unique<grubber_runner>(ioc, console, operation_failed, ctx);
+        case mode::js_grubber:
+            return std::make_unique<js_grubber_runner>(ioc, console, operation_failed, ctx);
+        case mode::kv_watcher:
+            return std::make_unique<kv_watcher_runner>(ioc, console, operation_failed, ctx);
+        case mode::kv_creator:
+            return std::make_unique<kv_create_runner>(ioc, console, operation_failed, ctx);
+        case mode::kv_updater:
+            return std::make_unique<kv_update_runner>(ioc, console, operation_failed, ctx);
+        case mode::kv_keys_lister:
+            return std::make_unique<kv_keys_runner>(ioc, console, operation_failed, ctx);
+        case mode::kv_history_viewer:
+            return std::make_unique<kv_history_runner>(ioc, console, operation_failed, ctx);
+        case mode::kv_purger:
+            return std::make_unique<kv_purge_runner>(ioc, console, operation_failed, ctx);
+        case mode::kv_reverter:
+            return std::make_unique<kv_revert_runner>(ioc, console, operation_failed, ctx);
+        case mode::generator:
+            return std::make_unique<generator_runner>(ioc, console, operation_failed, ctx);
+        case mode::js_fetcher:
+            return std::make_unique<js_fetcher_runner>(ioc, console, operation_failed, ctx);
+        case mode::kv_publisher:
+            return std::make_unique<kv_publisher_runner>(ioc, console, operation_failed, ctx);
+        case mode::requester:
+            return std::make_unique<requester_runner>(ioc, console, operation_failed, ctx);
+        case mode::replier:
+            return std::make_unique<replier_runner>(ioc, console, operation_failed, ctx);
+        case mode::publisher:
+        case mode::benchmarker:
+            return nullptr;
+    }
+    return nullptr;
 }
 
 int main(int argc, char* argv[]) {
@@ -481,17 +543,10 @@ int main(int argc, char* argv[]) {
 
         asio::io_context ioc;
         auto strand = asio::make_strand(ioc);  // Serialize operations for thread safety
-        std::shared_ptr<grubber> grub_ptr;
-        std::shared_ptr<generator> gen_ptr;
         std::shared_ptr<publisher> pub_ptr;
-        std::shared_ptr<requester> req_ptr;
-        std::shared_ptr<replier> reply_ptr;
         std::shared_ptr<benchmarker> bench_ptr;
         std::shared_ptr<batch_publisher> batch_pub_ptr;
-        std::shared_ptr<js_grubber> js_grub_ptr;
-        std::shared_ptr<js_fetcher> js_fetch_ptr;
-        std::shared_ptr<kv_publisher> kv_pub_ptr;
-        std::shared_ptr<kv_watcher_handler> kv_watch_ptr;
+        std::unique_ptr<mode_runner> runner;
         nats_asio::iconnection_sptr conn;
         std::vector<nats_asio::iconnection_sptr> pub_connections;
         std::vector<std::shared_ptr<asio::io_context>> pub_io_shards;
@@ -659,13 +714,39 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (m == mode::grubber) {
-            grub_ptr = std::make_shared<grubber>(ioc, console, stats_interval, out_mode, dump_file, translate_cmd, show_timestamp, binary_fmt, max_bad_messages, max_bad_percentage);
-        } else if (m == mode::js_grubber) {
-            js_grub_ptr = std::make_shared<js_grubber>(ioc, console, stats_interval, out_mode, auto_ack, dump_file, translate_cmd, binary_fmt, max_bad_messages, max_bad_percentage);
-        } else if (m == mode::kv_watcher) {
-            kv_watch_ptr = std::make_shared<kv_watcher_handler>(ioc, console, stats_interval, print_to_stdout);
-        }
+        mode_context ctx;
+        ctx.stats_interval = stats_interval;
+        ctx.topic = topic;
+        ctx.queue_group = queue_group;
+        ctx.max_msgs = max_msgs;
+        ctx.out_mode = out_mode;
+        ctx.dump_file = dump_file;
+        ctx.translate_cmd = translate_cmd;
+        ctx.show_timestamp = show_timestamp;
+        ctx.binary_fmt = binary_fmt;
+        ctx.max_bad_messages = max_bad_messages;
+        ctx.max_bad_percentage = max_bad_percentage;
+        ctx.js_stream = js_stream;
+        ctx.js_consumer = js_consumer;
+        ctx.js_durable = js_durable;
+        ctx.auto_ack = auto_ack;
+        ctx.batch_size = batch_size;
+        ctx.fetch_interval_ms = fetch_interval_ms;
+        ctx.kv_bucket = kv_bucket;
+        ctx.kv_key = kv_key;
+        ctx.kv_value = kv_value;
+        ctx.kv_revision = kv_revision;
+        ctx.kv_separator = kv_separator;
+        ctx.kv_timeout_ms = kv_timeout_ms;
+        ctx.max_in_flight = max_in_flight;
+        ctx.print_to_stdout = print_to_stdout;
+        ctx.publish_interval_ms = publish_interval;
+        ctx.data_or_stdin = pub_data;  // same underlying --data flag
+        ctx.timeout_ms = result.count("timeout") ? result["timeout"].as<int>() : 5000;
+        ctx.headers = headers;
+        ctx.echo_mode = result.count("echo") > 0;
+
+        runner = make_runner(m, ioc, console, operation_failed, ctx);
 
         // Helper to create a connection
         auto make_connection = [&](asio::io_context& connection_ioc, int conn_id = -1) {
@@ -678,167 +759,8 @@ int main(int argc, char* argv[]) {
                         console->info("on connected");
                     }
 
-                    if (m == mode::grubber) {
-                        nats_asio::subscribe_options sub_opts;
-                        if (!queue_group.empty()) {
-                            sub_opts.queue_group = queue_group;
-                        }
-                        sub_opts.max_messages = max_msgs;
-
-                        auto r = co_await conn->subscribe(
-                            topic,
-                            [grub_ptr](auto v1, auto v2, auto v3) -> asio::awaitable<void> {
-                                return grub_ptr->on_message(v1, v2, v3);
-                            },
-                            sub_opts);
-
-                        if (r.second.failed()) {
-                            console->error("failed to subscribe with error: {}", r.second.error());
-                            operation_failed.store(true, std::memory_order_release);
-                            ioc.stop();
-                        } else if (max_msgs > 0) {
-                            console->info("subscribed to {} (will auto-unsubscribe after {} messages)", topic, max_msgs);
-                        }
-                    } else if (m == mode::js_grubber) {
-                        // Setup JetStream push consumer
-                        nats_asio::js_consumer_config config;
-                        config.stream = js_stream;
-                        config.filter_subject = topic.empty() ? std::nullopt : std::optional<std::string>(topic);
-                        if (!js_durable.empty()) {
-                            config.durable_name = js_durable;
-                        }
-                        config.ack = nats_asio::js_ack_policy::explicit_;
-
-                        auto [sub, s] = co_await conn->js_subscribe(
-                            config,
-                            [js_grub_ptr](nats_asio::ijs_subscription& sub,
-                                         const nats_asio::js_message& msg) -> asio::awaitable<void> {
-                                return js_grub_ptr->on_js_message(sub, msg);
-                            });
-
-                        if (s.failed()) {
-                            console->error("js_subscribe failed: {}", s.error());
-                            operation_failed.store(true, std::memory_order_release);
-                            ioc.stop();
-                        } else {
-                            console->info("JetStream subscription active: stream={} consumer={}",
-                                        sub->info().stream, sub->info().name);
-                        }
-                    } else if (m == mode::kv_watcher) {
-                        // Setup KV watcher
-                        auto [watcher, s] = co_await conn->kv_watch(
-                            kv_bucket,
-                            [kv_watch_ptr](const nats_asio::kv_entry& entry) -> asio::awaitable<void> {
-                                return kv_watch_ptr->on_kv_entry(entry);
-                            },
-                            kv_key);
-
-                        if (s.failed()) {
-                            console->error("kv_watch failed: {}", s.error());
-                            operation_failed.store(true, std::memory_order_release);
-                            ioc.stop();
-                        } else {
-                            if (kv_key.empty()) {
-                                console->info("Watching KV bucket: {}", kv_bucket);
-                            } else {
-                                console->info("Watching KV bucket: {} key: {}", kv_bucket, kv_key);
-                            }
-                        }
-                    } else if (m == mode::kv_creator) {
-                        // Create key (only if doesn't exist)
-                        std::span<const char> value_span(kv_value.data(), kv_value.size());
-                        auto [rev, s] = co_await conn->kv_create(
-                            kv_bucket, kv_key, value_span,
-                            std::chrono::milliseconds(kv_timeout_ms));
-
-                        if (s.failed()) {
-                            console->error("kv_create failed: {}", s.error());
-                            operation_failed.store(true, std::memory_order_release);
-                        } else {
-                            console->info("Created {}/{} revision={}", kv_bucket, kv_key, rev);
-                        }
-                        ioc.stop();
-                    } else if (m == mode::kv_updater) {
-                        // Update key (only if revision matches)
-                        std::span<const char> value_span(kv_value.data(), kv_value.size());
-                        auto [rev, s] = co_await conn->kv_update(
-                            kv_bucket, kv_key, value_span, kv_revision,
-                            std::chrono::milliseconds(kv_timeout_ms));
-
-                        if (s.failed()) {
-                            console->error("kv_update failed: {}", s.error());
-                            operation_failed.store(true, std::memory_order_release);
-                        } else {
-                            console->info("Updated {}/{} revision={} (was {})", kv_bucket, kv_key, rev, kv_revision);
-                        }
-                        ioc.stop();
-                    } else if (m == mode::kv_keys_lister) {
-                        // List all keys in bucket
-                        auto [keys, s] = co_await conn->kv_keys(
-                            kv_bucket, std::chrono::milliseconds(kv_timeout_ms));
-
-                        if (s.failed()) {
-                            console->error("kv_keys failed: {}", s.error());
-                            operation_failed.store(true, std::memory_order_release);
-                        } else {
-                            console->info("Keys in bucket '{}' ({} keys):", kv_bucket, keys.size());
-                            for (const auto& key : keys) {
-                                std::cout << key << std::endl;
-                            }
-                        }
-                        ioc.stop();
-                    } else if (m == mode::kv_history_viewer) {
-                        // Show full history for a key
-                        auto [history, s] = co_await conn->kv_history(
-                            kv_bucket, kv_key, std::chrono::milliseconds(kv_timeout_ms));
-
-                        if (s.failed()) {
-                            console->error("kv_history failed: {}", s.error());
-                            operation_failed.store(true, std::memory_order_release);
-                        } else {
-                            console->info("History for {}/{} ({} revisions):", kv_bucket, kv_key, history.size());
-                            for (const auto& entry : history) {
-                                std::string op_str;
-                                switch (entry.op) {
-                                    case nats_asio::kv_entry::operation::put: op_str = "PUT"; break;
-                                    case nats_asio::kv_entry::operation::del: op_str = "DEL"; break;
-                                    case nats_asio::kv_entry::operation::purge: op_str = "PURGE"; break;
-                                }
-                                std::cout << "rev=" << entry.revision << " [" << op_str << "]";
-                                if (entry.op == nats_asio::kv_entry::operation::put && !entry.value.empty()) {
-                                    std::cout << " value=";
-                                    std::cout.write(entry.value.data(), entry.value.size());
-                                }
-                                std::cout << std::endl;
-                            }
-                        }
-                        ioc.stop();
-                    } else if (m == mode::kv_purger) {
-                        // Purge key (delete and clear history)
-                        auto [rev, s] = co_await conn->kv_purge(
-                            kv_bucket, kv_key, std::chrono::milliseconds(kv_timeout_ms));
-
-                        if (s.failed()) {
-                            console->error("kv_purge failed: {}", s.error());
-                            operation_failed.store(true, std::memory_order_release);
-                        } else {
-                            console->info("Purged {}/{} revision={}", kv_bucket, kv_key, rev);
-                        }
-                        ioc.stop();
-                    } else if (m == mode::kv_reverter) {
-                        // Revert key to a previous revision
-                        auto [rev, s] = co_await conn->kv_revert(
-                            kv_bucket, kv_key, kv_revision,
-                            std::chrono::milliseconds(kv_timeout_ms));
-
-                        if (s.failed()) {
-                            console->error("kv_revert failed: {}", s.error());
-                            operation_failed.store(true, std::memory_order_release);
-                        } else {
-                            console->info("Reverted {}/{} to revision {} -> new revision={}",
-                                         kv_bucket, kv_key, kv_revision, rev);
-                        }
-                        ioc.stop();
+                    if (runner) {
+                        co_await runner->on_connected(conn);
                     }
                     co_return;
                 },
@@ -1005,30 +927,8 @@ int main(int argc, char* argv[]) {
             conn = make_connection(ioc);
             conn->start(conf);
 
-            if (m == mode::generator) {
-                gen_ptr = std::make_shared<generator>(ioc, console, conn, topic, stats_interval,
-                                                      publish_interval);
-            } else if (m == mode::js_fetcher) {
-                js_fetch_ptr = std::make_shared<js_fetcher>(ioc, console, conn, js_stream,
-                                                            js_consumer, stats_interval, print_to_stdout,
-                                                            batch_size, fetch_interval_ms,
-                                                            out_mode, binary_fmt, max_bad_messages,
-                                                            max_bad_percentage, dump_file, translate_cmd);
-            } else if (m == mode::kv_publisher) {
-                kv_pub_ptr = std::make_shared<kv_publisher>(ioc, console, conn, kv_bucket,
-                                                            stats_interval, max_in_flight,
-                                                            kv_separator, kv_timeout_ms);
-            } else if (m == mode::requester) {
-                int req_timeout = result.count("timeout") ? result["timeout"].as<int>() : 5000;
-                std::string req_data = result.count("data") ? result["data"].as<std::string>() : "";
-                req_ptr = std::make_shared<requester>(ioc, console, conn, topic, stats_interval,
-                                                      req_timeout, req_data, out_mode, headers);
-            } else if (m == mode::replier) {
-                std::string reply_data = result.count("data") ? result["data"].as<std::string>() : "";
-                bool echo_mode = result.count("echo") > 0;
-                reply_ptr = std::make_shared<replier>(ioc, console, conn, topic, stats_interval,
-                                                      reply_data, echo_mode, translate_cmd, queue_group, out_mode);
-                asio::co_spawn(ioc, reply_ptr->start(), asio::detached);
+            if (runner) {
+                runner->setup(conn);
             }
         }
 
@@ -1087,14 +987,7 @@ int main(int argc, char* argv[]) {
         pub_ptr.reset();
         batch_pub_ptr.reset();
         bench_ptr.reset();
-        gen_ptr.reset();
-        grub_ptr.reset();
-        js_grub_ptr.reset();
-        js_fetch_ptr.reset();
-        kv_pub_ptr.reset();
-        kv_watch_ptr.reset();
-        req_ptr.reset();
-        reply_ptr.reset();
+        runner.reset();
 
         // Stop and join dedicated publisher io_context shards (if enabled).
         for (const auto& c : pub_connections) {
