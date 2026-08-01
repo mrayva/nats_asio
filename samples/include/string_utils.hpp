@@ -24,6 +24,7 @@ SOFTWARE.
 
 #pragma once
 
+#include <fmt/format.h>
 #include <inja/inja.hpp>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -61,6 +62,30 @@ inline std::vector<std::string> split_string(const std::string& s, char delim) {
     }
 
     return result;
+}
+
+// Escape a payload for embedding as a JSON string value: quote/backslash/
+// control-character escaping, matching what grub/js_grub/js_fetch modes need
+// when writing raw message payloads into their --json output.
+inline std::string escape_json_string(std::span<const char> payload) {
+    std::string escaped;
+    escaped.reserve(payload.size());
+    for (char c : payload) {
+        switch (c) {
+            case '"': escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 32) {
+                    escaped += fmt::format("\\u{:04x}", static_cast<unsigned char>(c));
+                } else {
+                    escaped += c;
+                }
+        }
+    }
+    return escaped;
 }
 
 // Apply template substitution: replace {{field}} with values from JSON object

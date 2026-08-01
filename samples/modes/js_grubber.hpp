@@ -113,23 +113,7 @@ public:
                 }
 
                 // No binary format - escape payload as string (original behavior)
-                std::string escaped;
-                escaped.reserve(output_payload.size());
-                for (char c : output_payload) {
-                    switch (c) {
-                        case '"': escaped += "\\\""; break;
-                        case '\\': escaped += "\\\\"; break;
-                        case '\n': escaped += "\\n"; break;
-                        case '\r': escaped += "\\r"; break;
-                        case '\t': escaped += "\\t"; break;
-                        default:
-                            if (static_cast<unsigned char>(c) < 32) {
-                                escaped += fmt::format("\\u{:04x}", static_cast<unsigned char>(c));
-                            } else {
-                                escaped += c;
-                            }
-                    }
-                }
+                std::string escaped = escape_json_string(output_payload);
                 *out << "{\"subject\":\"" << subject << "\""
                      << ",\"stream\":\"" << msg.stream << "\""
                      << ",\"seq\":" << msg.stream_sequence
