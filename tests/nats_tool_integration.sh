@@ -242,6 +242,50 @@ test_translate_shell_injection() {
     echo "$resp" | grep -qF "GOT:${subj}"
 }
 
+test_dump_file_flushes_on_sigint() {
+    # Regression test for a data-loss risk introduced alongside the
+    # dump_file_writer perf fix: grub --dump only flushes its output file
+    # every flush_every (100) messages instead of every one, for
+    # throughput. grub/js_grub/js_fetch have no natural completion, so the
+    # only way to stop them is Ctrl-C/kill - previously safe (every message
+    # was already durable), but with periodic flushing, an abrupt process
+    # kill could lose up to 99 buffered-but-unflushed messages, since
+    # nats_tool had no signal handling at all. Fixed by catching
+    # SIGINT/SIGTERM and routing through ioc.stop() so the normal (already
+    # correct) teardown path runs and flushes on the way out. This
+    # publishes well under the flush_every threshold, so the dump file can
+    # only end up complete if the signal-triggered graceful shutdown
+    # actually ran the flush - a periodic-only flush would leave it empty.
+    local subj="${RUN_ID}.dump_sigint"
+    local dump_file="${WORKDIR}/dump_sigint.bin"
+    rm -f "$dump_file"
+
+    "$NATS_TOOL" grub --topic "$subj" --dump "$dump_file" --raw > "${WORKDIR}/dump_sigint_grub.log" 2>&1 &
+    local grub_pid=$!
+    sleep 1
+
+    for i in 1 2 3 4 5; do
+        "$NATS_TOOL" pub --topic "$subj" --data "dump-msg-${i}" --count 1 > /dev/null 2>&1
+    done
+    sleep 1
+
+    kill -SIGINT "$grub_pid"
+    wait "$grub_pid"
+    local exit_status=$?
+
+    if [[ $exit_status -ne 0 ]]; then
+        echo "grub did not exit cleanly after SIGINT (status ${exit_status})"
+        return 1
+    fi
+
+    for i in 1 2 3 4 5; do
+        grep -qF "dump-msg-${i}" "$dump_file" || {
+            echo "dump file is missing message ${i} after graceful SIGINT shutdown: $(cat "$dump_file" 2>&1)"
+            return 1
+        }
+    done
+}
+
 test_generator() {
     local subj="${RUN_ID}.gen"
     local grub_out="${WORKDIR}/gen_grub.log"
@@ -489,6 +533,7 @@ run_test "pub with headers" test_pub_headers
 run_test "pub --input_format json preserves key order and resolves templates/fields" test_pub_input_format_json
 run_test "req/reply round trip" test_req_reply
 run_test "--translate shell injection safety" test_translate_shell_injection
+run_test "grub --dump flushes buffered messages on SIGINT" test_dump_file_flushes_on_sigint
 run_test "generator mode" test_generator
 run_test "benchmarker mode" test_bench
 run_test "batch_pub mode" test_batch_pub
