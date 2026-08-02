@@ -548,14 +548,18 @@ asio::awaitable<bool> concurrent_request_and_kv_ops_from_multiple_threads_are_sa
                         std::string key = fmt::format("t{}_key{}", t, i);
                         std::string value = fmt::format("t{}-value{}", t, i);
                         std::span<const char> vspan(value.data(), value.size());
+                        // 5000ms, not 3000: matches the js_publish/stream-create
+                        // timeouts elsewhere in this file, giving some margin
+                        // for the very first op racing the freshly-created
+                        // stream and all 4 threads' startup burst.
                         auto [rev, put_s] = co_await conn->kv_put(
-                            bucket, key, vspan, std::chrono::milliseconds(3000));
+                            bucket, key, vspan, std::chrono::milliseconds(5000));
                         if (put_s.failed()) {
                             kv_failure->fetch_add(1, std::memory_order_relaxed);
                             continue;
                         }
                         auto [entry, get_s] = co_await conn->kv_get(
-                            bucket, key, std::chrono::milliseconds(3000));
+                            bucket, key, std::chrono::milliseconds(5000));
                         std::string got(entry.value.begin(), entry.value.end());
                         if (get_s.ok() && got == value && entry.revision == rev) {
                             kv_success->fetch_add(1, std::memory_order_relaxed);

@@ -3357,6 +3357,27 @@ private:
     }
 
     asio::awaitable<status> ensure_js_ack_router() {
+        // If another coroutine on this strand is already (re)building the
+        // router, wait for it rather than racing to reinitialize shared
+        // state out from under it: subscribe() below has a co_await
+        // suspension point, so two concurrent callers on the same strand
+        // (e.g. from js_publish_impl invoked by different worker threads)
+        // can interleave here even though the strand never runs them truly
+        // in parallel. Without this, a second caller could see
+        // m_js_ack_inbox_base already set by the first, clear/regenerate it,
+        // and leave the first caller publishing with a reply-to subject that
+        // no longer matches the subscription that ends up installed - its
+        // JetStream ack is then never delivered anywhere, and it times out.
+        while (m_js_ack_router_setup_in_progress) {
+            auto waiter = std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+            waiter->expires_at((std::chrono::steady_clock::time_point::max)());
+            m_js_ack_router_waiters.push_back(waiter);
+            auto [wait_ec] = co_await waiter->async_wait(asio::as_tuple(asio::use_awaitable));
+            if (wait_ec && wait_ec != asio::error::operation_aborted) {
+                co_return status(wait_ec.message());
+            }
+        }
+
         if (!m_js_ack_subscription && !m_js_ack_inbox_base.empty()) {
             m_js_ack_inbox_base.clear();
         }
@@ -3365,6 +3386,7 @@ private:
             co_return status();
         }
 
+        m_js_ack_router_setup_in_progress = true;
         m_js_ack_inbox_base = generate_inbox();
         std::string subject_filter = m_js_ack_inbox_base;
         subject_filter += ".*";
@@ -3412,11 +3434,20 @@ private:
 
         if (sub_status.failed()) {
             m_js_ack_inbox_base.clear();
-            co_return sub_status;
+        } else {
+            m_js_ack_subscription = sub;
         }
 
-        m_js_ack_subscription = sub;
-        co_return status();
+        m_js_ack_router_setup_in_progress = false;
+        while (!m_js_ack_router_waiters.empty()) {
+            auto waiter = m_js_ack_router_waiters.front();
+            m_js_ack_router_waiters.pop_front();
+            if (waiter) {
+                waiter->cancel();
+            }
+        }
+
+        co_return sub_status;
     }
 
     // Request implementation
@@ -5261,6 +5292,8 @@ private:
     std::string m_js_ack_inbox_base;
     uint64_t m_js_ack_next_token{0};
     std::unordered_map<uint64_t, std::shared_ptr<js_ack_wait_state>> m_js_ack_waiters;
+    bool m_js_ack_router_setup_in_progress{false};
+    std::deque<std::shared_ptr<asio::steady_timer>> m_js_ack_router_waiters;
 
     on_connected_cb m_connected_cb;
     on_disconnected_cb m_disconnected_cb;
