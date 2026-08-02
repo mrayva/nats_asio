@@ -165,7 +165,10 @@ if(NATS_ASIO_BUILD_TESTS)
         tests/check2.cpp
         tests/connection_regression.cpp
     )
-    target_include_directories(parser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/samples/include)
+    target_include_directories(parser_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/samples
+        ${CMAKE_CURRENT_SOURCE_DIR}/samples/include
+    )
     target_link_libraries(parser_test
         PRIVATE
             nats_asio::nats_asio
@@ -173,10 +176,20 @@ if(NATS_ASIO_BUILD_TESTS)
             GTest::gmock_main
     )
     
+    # message_output.hpp pulls in zerialize_json.hpp (and so zerialize),
+    # which is only fetched/available when samples are built - keep its
+    # tests in a separate TU added conditionally, rather than requiring
+    # zerialize for the BUILD_SAMPLES=OFF/BUILD_TESTS=ON combination.
+    if(TARGET nats_tool)
+        target_sources(parser_test PRIVATE tests/message_output_test.cpp)
+        target_link_libraries(parser_test PRIVATE zerialize)
+        target_compile_definitions(parser_test PRIVATE FLATBUFFERS_LOCALE_INDEPENDENT=0)
+    endif()
+
     set_target_properties(parser_test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
     )
-    
+
     add_test(NAME parser_test COMMAND parser_test)
 
     add_executable(public_headers_test tests/public_headers.cpp)
