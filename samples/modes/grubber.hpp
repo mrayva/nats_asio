@@ -34,7 +34,6 @@ SOFTWARE.
 #include <spdlog/spdlog.h>
 #include <span>
 #include <string>
-#include <fstream>
 #include <memory>
 #include <chrono>
 #include <ctime>
@@ -49,22 +48,15 @@ public:
             std::size_t max_bad_messages = 0, double max_bad_percentage = 0.0)
         : worker(ioc, console, stats_interval), m_output_mode(mode), m_translate_cmd(translate_cmd),
           m_show_timestamp(show_timestamp), m_format(format),
-          m_deserializer_stats(max_bad_messages, max_bad_percentage) {
-        if (!dump_file.empty()) {
-            m_dump_file = std::make_unique<std::ofstream>(dump_file, std::ios::binary);
-            if (!m_dump_file->is_open()) {
-                console->error("Failed to open dump file: {}", dump_file);
-                m_dump_file.reset();
-            }
-        }
-    }
+          m_deserializer_stats(max_bad_messages, max_bad_percentage),
+          m_dump_writer(dump_file, console) {}
 
     asio::awaitable<void> on_message(nats_asio::string_view subject,
                                      nats_asio::optional<nats_asio::string_view> reply_to,
                                      std::span<const char> payload) {
         m_counter++;
 
-        std::ostream* out = m_dump_file ? m_dump_file.get() : &std::cout;
+        std::ostream& out = m_dump_writer.stream();
 
         std::string translated_storage;
         auto output_payload = co_await apply_translate_if_configured(
@@ -93,12 +85,10 @@ public:
             json_suffix_fields = fmt::format(",\"reply_to\":\"{}\"", *reply_to);
         }
 
-        emit_message(*out, m_output_mode, subject, output_payload, m_format, m_deserializer_stats,
+        emit_message(out, m_output_mode, subject, output_payload, m_format, m_deserializer_stats,
                     m_log, m_ioc, json_prefix_fields, json_suffix_fields, line_prefix);
 
-        if (m_dump_file) {
-            m_dump_file->flush();
-        }
+        m_dump_writer.on_message_written();
 
         co_return;
     }
@@ -109,7 +99,7 @@ private:
     bool m_show_timestamp;
     std::optional<binary_format> m_format;
     deserializer_stats m_deserializer_stats;
-    std::unique_ptr<std::ofstream> m_dump_file;
+    dump_file_writer m_dump_writer;
 };
 
 } // namespace nats_tool

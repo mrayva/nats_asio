@@ -37,10 +37,8 @@ SOFTWARE.
 #include <spdlog/spdlog.h>
 #include <span>
 #include <string>
-#include <fstream>
 #include <memory>
 #include <chrono>
-#include <iostream>
 
 namespace nats_tool {
 
@@ -61,14 +59,7 @@ public:
           m_batch_size(batch_size), m_fetch_interval_ms(fetch_interval_ms),
           m_output_mode(mode), m_format(format),
           m_deserializer_stats(max_bad_messages, max_bad_percentage),
-          m_translate_cmd(translate_cmd) {
-        if (!dump_file.empty()) {
-            m_dump_file = std::make_unique<std::ofstream>(dump_file, std::ios::binary);
-            if (!m_dump_file->is_open()) {
-                console->error("Failed to open dump file: {}", dump_file);
-                m_dump_file.reset();
-            }
-        }
+          m_translate_cmd(translate_cmd), m_dump_writer(dump_file, console) {
         asio::co_spawn(ioc, fetch_loop(), asio::detached);
     }
 
@@ -92,7 +83,7 @@ public:
                     m_counter++;
 
                     if (m_print_to_stdout) {
-                        std::ostream* out = m_dump_file ? m_dump_file.get() : &std::cout;
+                        std::ostream& out = m_dump_writer.stream();
                         const auto& payload = msg.msg.payload;
                         const auto& subject = msg.msg.subject;
                         std::span<const char> payload_span(payload.data(), payload.size());
@@ -104,7 +95,7 @@ public:
                         std::string json_suffix_fields = fmt::format(
                             ",\"stream\":\"{}\",\"seq\":{}", msg.stream, msg.stream_sequence);
 
-                        emit_message(*out, m_output_mode, subject, output_payload, m_format,
+                        emit_message(out, m_output_mode, subject, output_payload, m_format,
                                     m_deserializer_stats, m_log, m_ioc, {}, json_suffix_fields);
 
                         if (m_output_mode == output_mode::normal) {
@@ -113,9 +104,7 @@ public:
                                         msg.consumer_sequence, msg.num_delivered);
                         }
 
-                        if (m_dump_file) {
-                            m_dump_file->flush();
-                        }
+                        m_dump_writer.on_message_written();
                     }
 
                     // Acknowledge the message
@@ -151,7 +140,7 @@ private:
     std::optional<binary_format> m_format;
     deserializer_stats m_deserializer_stats;
     std::string m_translate_cmd;
-    std::unique_ptr<std::ofstream> m_dump_file;
+    dump_file_writer m_dump_writer;
 };
 
 } // namespace nats_tool

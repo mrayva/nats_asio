@@ -18,6 +18,7 @@
 #include <asio/executor_work_guard.hpp>
 #include <asio/posix/stream_descriptor.hpp>
 #include <asio/read_until.hpp>
+#include <asio/signal_set.hpp>
 #include <asio/ssl.hpp>
 #include <asio/ip/tcp.hpp>
 #include <concurrentqueue/moodycamel/blockingconcurrentqueue.h>
@@ -547,6 +548,22 @@ int main(int argc, char* argv[]) {
         }
 
         asio::io_context ioc;
+
+        // Long-running modes (grub/js_grub/js_fetch) have no natural
+        // completion - the only way to stop them is Ctrl-C/kill. Without
+        // this, that's an abrupt process termination that skips normal
+        // C++ destructors entirely, discarding anything buffered (e.g.
+        // dump_file_writer's periodic-flush window) rather than flushing
+        // it. Routing the signal through ioc.stop() instead makes run()
+        // return normally below, so the existing teardown (runner.reset()
+        // etc.) runs and flushes as it would on any other clean exit.
+        asio::signal_set signals(ioc, SIGINT, SIGTERM);
+        signals.async_wait([&ioc](const asio::error_code& ec, int /*signal_number*/) {
+            if (!ec) {
+                ioc.stop();
+            }
+        });
+
         auto strand = asio::make_strand(ioc);  // Serialize operations for thread safety
         std::shared_ptr<publisher> pub_ptr;
         std::shared_ptr<benchmarker> bench_ptr;

@@ -4,9 +4,12 @@
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
 #include <asio/io_context.hpp>
+#include <filesystem>
+#include <fstream>
 #include <modes/message_output.hpp>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 
 using namespace nats_tool;
 
@@ -14,6 +17,17 @@ namespace {
 
 std::span<const char> as_span(const std::string& s) {
     return std::span<const char>(s.data(), s.size());
+}
+
+std::filesystem::path unique_temp_path(const std::string& test_name) {
+    return std::filesystem::temp_directory_path() /
+           ("nats_asio_dump_file_test_" + test_name + "_" + std::to_string(::getpid()) + "_" +
+            std::to_string(reinterpret_cast<uintptr_t>(&test_name)));
+}
+
+std::string read_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
 }  // namespace
@@ -230,4 +244,61 @@ TEST(emit_message, json_mode_stops_ioc_when_bad_message_threshold_is_exceeded) {
                  stats, spdlog::default_logger(), ioc);
 
     EXPECT_TRUE(ioc.stopped());
+}
+
+// --- dump_file_writer -------------------------------------------------------
+
+TEST(dump_file_writer, falls_back_to_stdout_when_path_is_empty) {
+    dump_file_writer writer("", spdlog::default_logger());
+    EXPECT_EQ(&writer.stream(), &std::cout);
+}
+
+TEST(dump_file_writer, falls_back_to_stdout_when_path_cannot_be_opened) {
+    // A path inside a directory that doesn't exist can never be opened.
+    dump_file_writer writer("/nonexistent_dir_for_test/out.bin", spdlog::default_logger());
+    EXPECT_EQ(&writer.stream(), &std::cout);
+}
+
+TEST(dump_file_writer, writes_to_the_file_when_path_is_valid) {
+    auto path = unique_temp_path("writes");
+    {
+        dump_file_writer writer(path.string(), spdlog::default_logger());
+        ASSERT_NE(&writer.stream(), &std::cout);
+        writer.stream() << "hello";
+        writer.on_message_written();
+    }  // destructor closes (and flushes) the underlying ofstream.
+
+    EXPECT_EQ(read_file(path), "hello");
+    std::filesystem::remove(path);
+}
+
+TEST(dump_file_writer, flushes_to_disk_once_flush_every_messages_are_written) {
+    auto path = unique_temp_path("flush_cadence");
+    dump_file_writer writer(path.string(), spdlog::default_logger(), /*flush_every=*/3);
+    ASSERT_NE(&writer.stream(), &std::cout);
+
+    writer.stream() << "a";
+    writer.on_message_written();
+    writer.stream() << "b";
+    writer.on_message_written();
+    // Below the flush_every=3 threshold: not guaranteed visible to an
+    // independent reader yet (still fine either way - this isn't asserted).
+
+    writer.stream() << "c";
+    writer.on_message_written();  // 3rd message hits the threshold.
+
+    // Read via a completely independent handle: only an actual flush (not
+    // just buffering inside `writer`'s own ofstream) makes this visible.
+    EXPECT_EQ(read_file(path), "abc");
+
+    std::filesystem::remove(path);
+}
+
+TEST(dump_file_writer, on_message_written_is_a_no_op_for_stdout_fallback) {
+    dump_file_writer writer("", spdlog::default_logger());
+    // Must not crash/misbehave when there's no dump file to flush.
+    for (int i = 0; i < 5; ++i) {
+        writer.on_message_written();
+    }
+    EXPECT_EQ(&writer.stream(), &std::cout);
 }

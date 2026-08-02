@@ -38,6 +38,8 @@ SOFTWARE.
 #include <nats_asio/nats_asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/io_context.hpp>
+#include <fstream>
+#include <iostream>
 #include <memory>
 #include <ostream>
 #include <span>
@@ -47,6 +49,52 @@ SOFTWARE.
 #include <vector>
 
 namespace nats_tool {
+
+// Shared --dump_file handling for grub/js_grub/js_fetch: opens `path` for
+// binary output if non-empty (logging and falling back to stdout on
+// failure), and flushes periodically rather than after every message.
+// Flushing per-message forces a write syscall per line, throttling
+// throughput to per-message syscall latency instead of the buffered writes
+// std::ofstream already gives for free - the core connection's own write
+// path uses the equivalent threshold/interval-based flush strategy rather
+// than flushing per-write, for the same reason.
+class dump_file_writer {
+public:
+    dump_file_writer(const std::string& path, const std::shared_ptr<spdlog::logger>& log,
+                     std::size_t flush_every = 100)
+        : m_flush_every(flush_every) {
+        if (path.empty()) {
+            return;
+        }
+        m_file = std::make_unique<std::ofstream>(path, std::ios::binary);
+        if (!m_file->is_open()) {
+            log->error("Failed to open dump file: {}", path);
+            m_file.reset();
+        }
+    }
+
+    // The stream to write each message to: the dump file if one is open,
+    // stdout otherwise.
+    std::ostream& stream() { return m_file ? *m_file : std::cout; }
+
+    // Call once per message written via stream(). Only the dump-file path
+    // ever needs flushing - stdout's own buffering/flush-on-exit is fine
+    // for terminal/pipe output.
+    void on_message_written() {
+        if (!m_file) {
+            return;
+        }
+        if (++m_pending >= m_flush_every) {
+            m_file->flush();
+            m_pending = 0;
+        }
+    }
+
+private:
+    std::unique_ptr<std::ofstream> m_file;
+    std::size_t m_flush_every;
+    std::size_t m_pending{0};
+};
 
 // Runs `cmd` on `payload` via the shared translate_payload() (on a background
 // thread) if `cmd` is non-empty, writing the result into `storage` and
