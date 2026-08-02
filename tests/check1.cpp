@@ -493,6 +493,170 @@ TEST(circuit_breaker, reset_restores_closed_state_and_zeroes_counters) {
     EXPECT_TRUE(cb.allow_request());
 }
 
+namespace {
+std::span<const char> as_span(const std::string& s) {
+    return std::span<const char>(s.data(), s.size());
+}
+}  // namespace
+
+TEST(offline_queue, disabled_when_max_size_is_zero) {
+    offline_queue q(/*max_size=*/0, /*max_bytes=*/1000);
+    std::string payload = "hello";
+
+    EXPECT_FALSE(q.enqueue("subj", as_span(payload), {}, std::nullopt));
+    EXPECT_TRUE(q.empty());
+    EXPECT_EQ(q.size(), 0u);
+}
+
+TEST(offline_queue, enqueue_succeeds_and_tracks_size_and_bytes) {
+    offline_queue q(/*max_size=*/10, /*max_bytes=*/1000);
+    std::string payload = "hello";
+
+    ASSERT_TRUE(q.enqueue("subj", as_span(payload), {}, std::nullopt));
+
+    EXPECT_EQ(q.size(), 1u);
+    EXPECT_FALSE(q.empty());
+    // "subj" (4) + "hello" (5) = 9 bytes.
+    EXPECT_EQ(q.bytes(), 9u);
+}
+
+TEST(offline_queue, byte_accounting_includes_headers_and_reply_to) {
+    offline_queue q(/*max_size=*/10, /*max_bytes=*/1000);
+    std::string payload = "hi";
+    headers_t headers = {{"k1", "v1"}, {"k2", "v22"}};
+
+    ASSERT_TRUE(q.enqueue("s", as_span(payload), headers, string_view("reply")));
+
+    // "s"(1) + "hi"(2) + "k1"+"v1"(4) + "k2"+"v22"(5) + "reply"(5) = 17.
+    EXPECT_EQ(q.bytes(), 17u);
+}
+
+TEST(offline_queue, rejects_once_max_size_reached) {
+    offline_queue q(/*max_size=*/2, /*max_bytes=*/1000);
+    std::string payload = "x";
+
+    ASSERT_TRUE(q.enqueue("a", as_span(payload), {}, std::nullopt));
+    ASSERT_TRUE(q.enqueue("b", as_span(payload), {}, std::nullopt));
+    EXPECT_FALSE(q.enqueue("c", as_span(payload), {}, std::nullopt));
+    EXPECT_EQ(q.size(), 2u);
+}
+
+TEST(offline_queue, rejects_once_max_bytes_would_be_exceeded) {
+    std::string payload = "1234567890";  // 10 bytes
+    // subject "s" (1) + payload (10) = 11 bytes for one message exactly.
+    offline_queue q(/*max_size=*/100, /*max_bytes=*/11);
+
+    ASSERT_TRUE(q.enqueue("s", as_span(payload), {}, std::nullopt));
+    // Exactly at budget - a second message of any size must be rejected.
+    EXPECT_FALSE(q.enqueue("s", as_span(payload), {}, std::nullopt));
+    EXPECT_EQ(q.size(), 1u);
+    EXPECT_EQ(q.bytes(), 11u);
+}
+
+TEST(offline_queue, drain_returns_messages_in_order_and_empties_the_queue) {
+    offline_queue q(/*max_size=*/10, /*max_bytes=*/1000);
+    std::string p1 = "one";
+    std::string p2 = "two";
+    std::string p3 = "three";
+
+    ASSERT_TRUE(q.enqueue("subj1", as_span(p1), {}, std::nullopt));
+    ASSERT_TRUE(q.enqueue("subj2", as_span(p2), {}, std::nullopt));
+    ASSERT_TRUE(q.enqueue("subj3", as_span(p3), {}, std::nullopt));
+
+    auto drained = q.drain();
+
+    ASSERT_EQ(drained.size(), 3u);
+    EXPECT_EQ(drained[0].subject, "subj1");
+    EXPECT_EQ(drained[1].subject, "subj2");
+    EXPECT_EQ(drained[2].subject, "subj3");
+
+    EXPECT_TRUE(q.empty());
+    EXPECT_EQ(q.size(), 0u);
+    EXPECT_EQ(q.bytes(), 0u);
+
+    // Draining an already-empty queue is safe and returns nothing.
+    EXPECT_TRUE(q.drain().empty());
+}
+
+TEST(offline_queue, drain_preserves_payload_headers_and_reply_to) {
+    offline_queue q(/*max_size=*/10, /*max_bytes=*/1000);
+    std::string payload = "the-payload";
+    headers_t headers = {{"Content-Type", "text/plain"}};
+
+    ASSERT_TRUE(q.enqueue("orders.new", as_span(payload), headers, string_view("reply.inbox")));
+
+    auto drained = q.drain();
+    ASSERT_EQ(drained.size(), 1u);
+    const auto& msg = drained[0];
+
+    EXPECT_EQ(msg.subject, "orders.new");
+    EXPECT_EQ(std::string(msg.payload.begin(), msg.payload.end()), payload);
+    ASSERT_EQ(msg.headers.size(), 1u);
+    EXPECT_EQ(msg.headers[0].first, "Content-Type");
+    EXPECT_EQ(msg.headers[0].second, "text/plain");
+    ASSERT_TRUE(msg.reply_to.has_value());
+    EXPECT_EQ(*msg.reply_to, "reply.inbox");
+}
+
+TEST(offline_queue, enqueue_without_reply_to_leaves_it_unset) {
+    offline_queue q(/*max_size=*/10, /*max_bytes=*/1000);
+    std::string payload = "x";
+
+    ASSERT_TRUE(q.enqueue("subj", as_span(payload), {}, std::nullopt));
+
+    auto drained = q.drain();
+    ASSERT_EQ(drained.size(), 1u);
+    EXPECT_FALSE(drained[0].reply_to.has_value());
+}
+
+TEST(offline_queue, clear_discards_messages_without_returning_them) {
+    offline_queue q(/*max_size=*/10, /*max_bytes=*/1000);
+    std::string payload = "x";
+    ASSERT_TRUE(q.enqueue("subj", as_span(payload), {}, std::nullopt));
+
+    q.clear();
+
+    EXPECT_TRUE(q.empty());
+    EXPECT_EQ(q.size(), 0u);
+    EXPECT_EQ(q.bytes(), 0u);
+    EXPECT_TRUE(q.drain().empty());
+}
+
+TEST(offline_queue, remains_consistent_under_concurrent_producers) {
+    constexpr std::size_t producer_count = 4;
+    constexpr std::size_t messages_per_producer = 5'000;
+    offline_queue q(/*max_size=*/producer_count * messages_per_producer,
+                    /*max_bytes=*/1u << 30);
+    std::string payload = "x";
+    std::atomic<bool> start{false};
+    std::atomic<std::size_t> accepted{0};
+    std::vector<std::thread> producers;
+    producers.reserve(producer_count);
+
+    for (std::size_t i = 0; i < producer_count; ++i) {
+        producers.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (std::size_t n = 0; n < messages_per_producer; ++n) {
+                if (q.enqueue("subj", as_span(payload), {}, std::nullopt)) {
+                    accepted.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    for (auto& producer : producers) {
+        producer.join();
+    }
+
+    EXPECT_EQ(accepted.load(), producer_count * messages_per_producer);
+    EXPECT_EQ(q.size(), accepted.load());
+    auto drained = q.drain();
+    EXPECT_EQ(drained.size(), accepted.load());
+}
+
 TEST(connection_lifetime, queued_start_and_stop_own_connection) {
     asio::io_context ioc;
     auto noop_connected = [](iconnection&) -> asio::awaitable<void> { co_return; };
