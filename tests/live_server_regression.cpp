@@ -327,6 +327,116 @@ asio::awaitable<bool> js_message_metadata_is_populated_from_ack_subject(
     co_return *ok;
 }
 
+// kv_get_impl has no CLI mode exposing it (nats_tool has kvcreate/kvupdate/
+// kvkeys/kvhistory/kvpurge/kvrevert but no kvget), so unlike every other KV
+// operation it had zero exercising test anywhere before this - only ever
+// verified by reading the code. Checks the two things that actually matter
+// for a "get": it returns the latest value after an update (not a stale
+// one), and it reports a clean "not found" for a key that was never put,
+// rather than some other error or a garbage entry.
+asio::awaitable<bool> kv_get_returns_latest_value_and_reports_missing_keys(
+    asio::io_context& ioc, const std::string& host, uint16_t port,
+    std::shared_ptr<spdlog::logger> log) {
+    auto conn = nats_asio::connect(ioc, host, port);
+
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    for (int i = 0; i < 100 && !conn->is_connected(); ++i) {
+        timer.expires_after(std::chrono::milliseconds(50));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+    if (!conn->is_connected()) {
+        log->error("could not connect to nats-server");
+        co_return false;
+    }
+
+    const std::string bucket = "regression_kv_get";
+    const std::string stream = "KV_" + bucket;
+
+    {
+        std::string create_payload =
+            "{\"name\":\"" + stream + "\",\"subjects\":[\"$KV." + bucket +
+            ".>\"],\"retention\":\"limits\",\"max_msgs_per_subject\":10,\"discard\":\"new\","
+            "\"storage\":\"file\",\"num_replicas\":1,\"allow_direct\":true,"
+            "\"allow_rollup_hdrs\":true}";
+        std::span<const char> payload(create_payload.data(), create_payload.size());
+        auto [resp, s] = co_await conn->request("$JS.API.STREAM.CREATE." + stream, payload,
+                                                std::chrono::milliseconds(5000));
+        (void)resp;
+        if (s.failed()) {
+            log->error("failed to create KV bucket stream: {}", s.error());
+            conn->stop();
+            co_return false;
+        }
+    }
+
+    bool ok = true;
+
+    // A key that was never put should come back as not-found, not some
+    // other error and not a garbage/default-constructed entry mistaken for
+    // success.
+    {
+        auto [entry, s] = co_await conn->kv_get(bucket, "never_put", std::chrono::milliseconds(5000));
+        (void)entry;
+        if (s.code() != nats_asio::error_code::key_not_found) {
+            log->error("expected key_not_found for a never-put key, got: {}", s.error());
+            ok = false;
+        }
+    }
+
+    // Put twice, then get: must return the second (latest) value, not the
+    // first - proving it's reading the current head of the key, not just
+    // "a" revision.
+    {
+        std::string v1 = "first-value";
+        std::span<const char> v1_span(v1.data(), v1.size());
+        auto [rev1, s1] = co_await conn->kv_put(bucket, "mykey", v1_span, std::chrono::milliseconds(5000));
+        if (s1.failed()) {
+            log->error("kv_put (first) failed: {}", s1.error());
+            ok = false;
+        }
+
+        std::string v2 = "second-value";
+        std::span<const char> v2_span(v2.data(), v2.size());
+        auto [rev2, s2] = co_await conn->kv_put(bucket, "mykey", v2_span, std::chrono::milliseconds(5000));
+        if (s2.failed()) {
+            log->error("kv_put (second) failed: {}", s2.error());
+            ok = false;
+        }
+
+        auto [entry, s3] = co_await conn->kv_get(bucket, "mykey", std::chrono::milliseconds(5000));
+        if (s3.failed()) {
+            log->error("kv_get failed: {}", s3.error());
+            ok = false;
+        } else {
+            std::string got(entry.value.begin(), entry.value.end());
+            if (got != v2) {
+                log->error("kv_get returned '{}', expected latest value '{}'", got, v2);
+                ok = false;
+            }
+            if (entry.revision != rev2) {
+                log->error("kv_get returned revision {}, expected latest revision {}", entry.revision, rev2);
+                ok = false;
+            }
+            if (entry.op != nats_asio::kv_entry::operation::put) {
+                log->error("kv_get returned unexpected op for a live key");
+                ok = false;
+            }
+        }
+    }
+
+    // Best-effort cleanup; don't fail the test over it.
+    {
+        std::span<const char> empty;
+        auto [resp, s] = co_await conn->request("$JS.API.STREAM.DELETE." + stream, empty,
+                                                std::chrono::milliseconds(3000));
+        (void)resp;
+        (void)s;
+    }
+
+    conn->stop();
+    co_return ok;
+}
+
 using test_case_fn = std::function<asio::awaitable<bool>(
     asio::io_context&, const std::string&, uint16_t, std::shared_ptr<spdlog::logger>)>;
 
@@ -379,6 +489,8 @@ int main() {
                       nak_with_delay_survives_the_wait_for_redelivery) && all_ok;
     all_ok = run_case("js_message_metadata_is_populated_from_ack_subject", host, port, log,
                       js_message_metadata_is_populated_from_ack_subject) && all_ok;
+    all_ok = run_case("kv_get_returns_latest_value_and_reports_missing_keys", host, port, log,
+                      kv_get_returns_latest_value_and_reports_missing_keys) && all_ok;
 
     return all_ok ? 0 : 1;
 }

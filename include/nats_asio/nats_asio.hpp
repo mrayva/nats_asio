@@ -4009,6 +4009,7 @@ private:
         }
 
         // Check for error status in headers
+        bool has_sequence = false;
         for (const auto& [hdr_key, hdr_val] : response.headers) {
             if (hdr_key == "Status") {
                 if (hdr_val == "404") {
@@ -4016,6 +4017,17 @@ private:
                 }
                 co_return std::pair<kv_entry, status>{{}, status(fmt::format("error: {}", hdr_val))};
             }
+            if (hdr_key == "Nats-Sequence") {
+                has_sequence = true;
+            }
+        }
+        // last_by_subj on a subject that's never been published doesn't
+        // always come back with a Status: 404 header - it can be a
+        // genuinely empty reply (no payload, no headers at all; see the
+        // same behavior in kv_history_impl's next_by_subj loop). Without a
+        // Nats-Sequence header there's no real message to parse below.
+        if (!has_sequence) {
+            co_return std::pair<kv_entry, status>{{}, status(error_code::key_not_found)};
         }
 
         // Parse entry from response
