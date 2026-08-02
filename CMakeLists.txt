@@ -165,8 +165,9 @@ if(NATS_ASIO_BUILD_TESTS)
         tests/check2.cpp
         tests/connection_regression.cpp
     )
-    target_link_libraries(parser_test 
-        PRIVATE 
+    target_include_directories(parser_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/samples/include)
+    target_link_libraries(parser_test
+        PRIVATE
             nats_asio::nats_asio
             GTest::gtest_main
             GTest::gmock_main
