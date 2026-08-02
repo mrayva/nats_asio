@@ -43,13 +43,17 @@
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 #include <fmt/format.h>
+#include <js_stream_utils.hpp>
+#include <nlohmann/json.hpp>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -615,6 +619,135 @@ asio::awaitable<bool> concurrent_request_and_kv_ops_from_multiple_threads_are_sa
     co_return ok;
 }
 
+namespace {
+// Returns the "subjects" list from a stream's current config, or nullopt if
+// the stream doesn't exist / the request failed.
+asio::awaitable<std::optional<std::vector<std::string>>> fetch_stream_subjects(
+    nats_asio::iconnection_sptr conn, const std::string& stream) {
+    std::span<const char> empty;
+    auto [resp, s] = co_await conn->request("$JS.API.STREAM.INFO." + stream, empty,
+                                            std::chrono::milliseconds(5000));
+    if (s.failed() || resp.payload.empty()) {
+        co_return std::nullopt;
+    }
+    try {
+        auto info = nlohmann::json::parse(std::string(resp.payload.begin(), resp.payload.end()));
+        if (info.contains("error") || !info.contains("config") ||
+            !info["config"].contains("subjects")) {
+            co_return std::nullopt;
+        }
+        co_return info["config"]["subjects"].get<std::vector<std::string>>();
+    } catch (const std::exception&) {
+        co_return std::nullopt;
+    }
+}
+}  // namespace
+
+// Guards against real bugs in ensure_stream_for_subject() (samples-side,
+// used by publisher.hpp's --create_stream flag on `pub --js`) - untested
+// anywhere before this: neither the unit tests (it needs a live server for
+// real JetStream STREAM.INFO/CREATE/UPDATE semantics) nor the shell
+// integration suite (which always pre-creates streams manually, bypassing
+// this code path entirely). Exercises all three branches: create a
+// never-existing stream, no-op when the stream already includes the
+// subject, and update an existing stream to add a new subject without
+// losing the one it already had.
+asio::awaitable<bool> ensure_stream_for_subject_creates_updates_and_leaves_existing_subjects(
+    asio::io_context& ioc, const std::string& host, uint16_t port,
+    std::shared_ptr<spdlog::logger> log) {
+    auto conn = nats_asio::connect(ioc, host, port);
+
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    for (int i = 0; i < 100 && !conn->is_connected(); ++i) {
+        timer.expires_after(std::chrono::milliseconds(50));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+    if (!conn->is_connected()) {
+        log->error("could not connect to nats-server");
+        co_return false;
+    }
+
+    const std::string stream = "REGRESSION_ENSURE_STREAM";
+    const std::string subject_a = "regression.ensure_stream.a";
+    const std::string subject_b = "regression.ensure_stream.b";
+    bool ok = true;
+
+    // Fresh start: delete any leftover stream from a previous interrupted run.
+    {
+        std::span<const char> empty;
+        auto [resp, s] = co_await conn->request("$JS.API.STREAM.DELETE." + stream, empty,
+                                                std::chrono::milliseconds(3000));
+        (void)resp;
+        (void)s;
+    }
+
+    // 1. Stream doesn't exist yet -> should create it with subject_a.
+    {
+        bool created = co_await nats_tool::ensure_stream_for_subject(conn, stream, subject_a, log);
+        if (!created) {
+            log->error("ensure_stream_for_subject failed to create a new stream");
+            ok = false;
+        }
+        auto subjects = co_await fetch_stream_subjects(conn, stream);
+        if (!subjects || std::find(subjects->begin(), subjects->end(), subject_a) == subjects->end()) {
+            log->error("newly created stream is missing subject_a");
+            ok = false;
+        }
+    }
+
+    // 2. Stream already includes subject_a -> should be a no-op, not
+    // duplicate the subject or otherwise corrupt the stream config.
+    {
+        bool result = co_await nats_tool::ensure_stream_for_subject(conn, stream, subject_a, log);
+        if (!result) {
+            log->error("ensure_stream_for_subject failed on an already-included subject");
+            ok = false;
+        }
+        auto subjects = co_await fetch_stream_subjects(conn, stream);
+        std::size_t count_a =
+            subjects ? std::count(subjects->begin(), subjects->end(), subject_a) : 0;
+        if (count_a != 1) {
+            log->error("subject_a appears {} times after a no-op call, expected exactly 1", count_a);
+            ok = false;
+        }
+    }
+
+    // 3. Stream exists but doesn't include subject_b -> should update the
+    // stream to add it, keeping subject_a too.
+    {
+        bool updated = co_await nats_tool::ensure_stream_for_subject(conn, stream, subject_b, log);
+        if (!updated) {
+            log->error("ensure_stream_for_subject failed to update an existing stream");
+            ok = false;
+        }
+        auto subjects = co_await fetch_stream_subjects(conn, stream);
+        if (!subjects) {
+            log->error("could not fetch stream config after update");
+            ok = false;
+        } else {
+            bool has_a = std::find(subjects->begin(), subjects->end(), subject_a) != subjects->end();
+            bool has_b = std::find(subjects->begin(), subjects->end(), subject_b) != subjects->end();
+            if (!has_a || !has_b) {
+                log->error("stream subjects after update: has_a={} has_b={}, expected both", has_a,
+                          has_b);
+                ok = false;
+            }
+        }
+    }
+
+    // Best-effort cleanup; don't fail the test over it.
+    {
+        std::span<const char> empty;
+        auto [resp, s] = co_await conn->request("$JS.API.STREAM.DELETE." + stream, empty,
+                                                std::chrono::milliseconds(3000));
+        (void)resp;
+        (void)s;
+    }
+
+    conn->stop();
+    co_return ok;
+}
+
 using test_case_fn = std::function<asio::awaitable<bool>(
     asio::io_context&, const std::string&, uint16_t, std::shared_ptr<spdlog::logger>)>;
 
@@ -671,6 +804,10 @@ int main() {
                       kv_get_returns_latest_value_and_reports_missing_keys) && all_ok;
     all_ok = run_case("concurrent_request_and_kv_ops_from_multiple_threads_are_safe", host, port,
                       log, concurrent_request_and_kv_ops_from_multiple_threads_are_safe) && all_ok;
+    all_ok = run_case("ensure_stream_for_subject_creates_updates_and_leaves_existing_subjects",
+                      host, port, log,
+                      ensure_stream_for_subject_creates_updates_and_leaves_existing_subjects) &&
+             all_ok;
 
     return all_ok ? 0 : 1;
 }

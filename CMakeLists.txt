@@ -210,6 +210,7 @@ if(NATS_ASIO_BUILD_TESTS)
     # protocol server the tests above use (JetStream ack/nak timing isn't
     # worth faking). Skips (not fails) when no server is reachable.
     add_executable(live_server_regression tests/live_server_regression.cpp)
+    target_include_directories(live_server_regression PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/samples/include)
     target_link_libraries(live_server_regression PRIVATE nats_asio::nats_asio)
     set_target_properties(live_server_regression PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
