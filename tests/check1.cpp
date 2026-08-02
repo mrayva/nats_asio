@@ -333,6 +333,166 @@ TEST(batch_queue, full_queue_blocks_without_dropping_batch) {
     queue.set_done();
 }
 
+TEST(circuit_breaker, disabled_when_threshold_is_zero) {
+    circuit_breaker_impl cb;
+    cb.configure(/*threshold=*/0, /*timeout_ms=*/30000, /*half_open_max=*/3);
+
+    for (int i = 0; i < 10; ++i) {
+        cb.record_failure();
+    }
+
+    EXPECT_TRUE(cb.allow_request());
+    EXPECT_EQ(cb.stats().state.load(), circuit_state::closed);
+    EXPECT_EQ(cb.stats().failure_count.load(), 0u);
+}
+
+TEST(circuit_breaker, stays_closed_below_threshold) {
+    circuit_breaker_impl cb;
+    cb.configure(/*threshold=*/3, /*timeout_ms=*/30000, /*half_open_max=*/2);
+
+    cb.record_failure();
+    cb.record_failure();
+
+    EXPECT_TRUE(cb.allow_request());
+    EXPECT_EQ(cb.stats().state.load(), circuit_state::closed);
+    EXPECT_EQ(cb.stats().failure_count.load(), 2u);
+}
+
+TEST(circuit_breaker, opens_at_threshold_and_rejects_requests) {
+    circuit_breaker_impl cb;
+    cb.configure(/*threshold=*/3, /*timeout_ms=*/30000, /*half_open_max=*/2);
+
+    cb.record_failure();
+    cb.record_failure();
+    cb.record_failure();
+
+    EXPECT_EQ(cb.stats().state.load(), circuit_state::open);
+    EXPECT_FALSE(cb.allow_request());
+    EXPECT_EQ(cb.stats().rejected_count.load(), 1u);
+    EXPECT_FALSE(cb.allow_request());
+    EXPECT_EQ(cb.stats().rejected_count.load(), 2u);
+}
+
+TEST(circuit_breaker, success_decays_failure_count_while_closed) {
+    circuit_breaker_impl cb;
+    cb.configure(/*threshold=*/3, /*timeout_ms=*/30000, /*half_open_max=*/2);
+
+    cb.record_failure();
+    cb.record_failure();
+    cb.record_success();
+    // Decayed back to 1 failure - one more shouldn't be enough to open
+    // a threshold-3 breaker.
+    cb.record_failure();
+
+    EXPECT_EQ(cb.stats().state.load(), circuit_state::closed);
+    EXPECT_EQ(cb.stats().failure_count.load(), 2u);
+    EXPECT_TRUE(cb.allow_request());
+}
+
+TEST(circuit_breaker, transitions_to_half_open_after_timeout_elapses) {
+    circuit_breaker_impl cb;
+    // timeout_ms=0 makes "timeout elapsed" true as soon as any time has
+    // passed at all, so the open->half_open transition is deterministic
+    // without needing to sleep in the test.
+    cb.configure(/*threshold=*/1, /*timeout_ms=*/0, /*half_open_max=*/2);
+
+    cb.record_failure();
+    ASSERT_EQ(cb.stats().state.load(), circuit_state::open);
+
+    EXPECT_TRUE(cb.allow_request());
+    EXPECT_EQ(cb.stats().state.load(), circuit_state::half_open);
+}
+
+// Regression test for a real bug: allow_request()'s open->half_open
+// transition only resets success_count, never failure_count. The
+// half-open budget check is `success_count + failure_count < half_open_max`,
+// so the stale failure_count left over from *before* the circuit opened
+// counts against the half-open probation budget. With this library's own
+// documented defaults (circuit_breaker_threshold=5, half_open_max=3), a
+// breaker that trips after 5 failures enters half-open with
+// failure_count still at 5, so 5 < 3 is false immediately - every
+// request except the one transitioning call gets rejected. Since any
+// half-open failure immediately reopens the circuit and reaching
+// half_open_max successes is what closes it, there's no path back to a
+// working state: the breaker is permanently stuck rejecting almost
+// everything for any configuration where threshold >= half_open_max.
+TEST(circuit_breaker, half_open_budget_is_not_corrupted_by_stale_pre_open_failure_count) {
+    circuit_breaker_impl cb;
+    cb.configure(/*threshold=*/5, /*timeout_ms=*/0, /*half_open_max=*/3);
+
+    for (int i = 0; i < 5; ++i) {
+        cb.record_failure();
+    }
+    ASSERT_EQ(cb.stats().state.load(), circuit_state::open);
+    ASSERT_EQ(cb.stats().failure_count.load(), 5u);
+
+    ASSERT_TRUE(cb.allow_request());  // open -> half_open (unconditional)
+    ASSERT_EQ(cb.stats().state.load(), circuit_state::half_open);
+
+    // Recovery should be judged on outcomes recorded during half-open, not
+    // whatever failure count caused it to open in the first place.
+    EXPECT_TRUE(cb.allow_request());
+}
+
+TEST(circuit_breaker, half_open_closes_after_enough_successes) {
+    circuit_breaker_impl cb;
+    cb.configure(/*threshold=*/1, /*timeout_ms=*/0, /*half_open_max=*/2);
+
+    cb.record_failure();
+    ASSERT_TRUE(cb.allow_request());  // open -> half_open
+
+    cb.record_success();
+    EXPECT_EQ(cb.stats().state.load(), circuit_state::half_open);
+    cb.record_success();
+
+    EXPECT_EQ(cb.stats().state.load(), circuit_state::closed);
+    EXPECT_EQ(cb.stats().failure_count.load(), 0u);
+    EXPECT_TRUE(cb.allow_request());
+}
+
+TEST(circuit_breaker, half_open_reopens_on_any_failure) {
+    circuit_breaker_impl cb;
+    // Non-zero timeout: with timeout_ms=0, checking allow_request() again
+    // after reopening would immediately transition back to half-open (any
+    // elapsed time satisfies "timeout expired"), masking the reopen this
+    // test is checking for. A real timeout keeps the post-reopen state
+    // observable as genuinely open.
+    cb.configure(/*threshold=*/1, /*timeout_ms=*/30000, /*half_open_max=*/2);
+
+    cb.record_failure();
+    ASSERT_EQ(cb.stats().state.load(), circuit_state::open);
+
+    // Force past the timeout without sleeping: reconfigure to 0 just long
+    // enough to make the one transition call succeed, then restore it so
+    // the reopen below isn't immediately re-eligible to transition again.
+    cb.configure(/*threshold=*/1, /*timeout_ms=*/0, /*half_open_max=*/2);
+    ASSERT_TRUE(cb.allow_request());  // open -> half_open
+    ASSERT_EQ(cb.stats().state.load(), circuit_state::half_open);
+    cb.configure(/*threshold=*/1, /*timeout_ms=*/30000, /*half_open_max=*/2);
+
+    cb.record_failure();
+
+    EXPECT_EQ(cb.stats().state.load(), circuit_state::open);
+    EXPECT_FALSE(cb.allow_request());
+}
+
+TEST(circuit_breaker, reset_restores_closed_state_and_zeroes_counters) {
+    circuit_breaker_impl cb;
+    cb.configure(/*threshold=*/1, /*timeout_ms=*/30000, /*half_open_max=*/2);
+
+    cb.record_failure();
+    ASSERT_EQ(cb.stats().state.load(), circuit_state::open);
+    cb.allow_request();  // rejected - timeout hasn't elapsed
+
+    cb.reset();
+
+    EXPECT_EQ(cb.stats().state.load(), circuit_state::closed);
+    EXPECT_EQ(cb.stats().failure_count.load(), 0u);
+    EXPECT_EQ(cb.stats().success_count.load(), 0u);
+    EXPECT_EQ(cb.stats().rejected_count.load(), 0u);
+    EXPECT_TRUE(cb.allow_request());
+}
+
 TEST(connection_lifetime, queued_start_and_stop_own_connection) {
     asio::io_context ioc;
     auto noop_connected = [](iconnection&) -> asio::awaitable<void> { co_return; };

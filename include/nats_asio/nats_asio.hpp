@@ -386,7 +386,16 @@ public:
                     circuit_state expected = circuit_state::open;
                     if (m_stats.state.compare_exchange_strong(expected, circuit_state::half_open,
                                                               std::memory_order_acq_rel)) {
+                        // Both counters feed the half-open budget check
+                        // below (success_count + failure_count <
+                        // half_open_max) - leaving failure_count at
+                        // whatever caused this open in the first place
+                        // would corrupt that budget with a stale value
+                        // unrelated to half-open probation, potentially
+                        // exceeding half_open_max before a single probe
+                        // runs (e.g. the default threshold=5 > half_open_max=3).
                         m_stats.success_count.store(0, std::memory_order_relaxed);
+                        m_stats.failure_count.store(0, std::memory_order_relaxed);
                     }
                     return true;
                 }
