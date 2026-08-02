@@ -1,5 +1,10 @@
-// mimalloc: drop-in malloc replacement - must be included first
+// mimalloc: drop-in malloc replacement - must be included first.
+// Disabled under NATS_TOOL_USE_MIMALLOC=OFF builds (see CMakeLists.txt) -
+// mimalloc has known ThreadSanitizer-only data races in its own lazy
+// per-thread heap init, unrelated to this codebase.
+#ifdef NATS_TOOL_USE_MIMALLOC
 #include <mimalloc-new-delete.h>
+#endif
 
 #include <fmt/format.h>
 #include <spdlog/sinks/stdout_color_sinks.h>

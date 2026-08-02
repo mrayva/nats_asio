@@ -109,9 +109,21 @@ target_compile_features(nats_asio INTERFACE cxx_std_20)
 
 # Samples
 if(NATS_ASIO_BUILD_SAMPLES)
+    # mimalloc's lazy per-thread heap initialization has known, longstanding
+    # data races under ThreadSanitizer that are internal to mimalloc itself
+    # (see https://github.com/microsoft/mimalloc/issues/130 and #1230) -
+    # reproduces with nothing but a handful of bare std::thread each doing
+    # one allocation, unrelated to any code in this repo. Not something we
+    # can fix here, and it drowns out any real race in nats_tool's own code
+    # since TSan halts on the first one it sees, so CI turns this off for
+    # the thread-sanitizer job specifically (ASan/UBSan don't hit it).
+    option(NATS_ASIO_USE_MIMALLOC "Use mimalloc as nats_tool's global allocator" ON)
+
     find_package(cxxopts CONFIG REQUIRED)
-    find_package(mimalloc CONFIG REQUIRED)
     find_package(simdjson CONFIG REQUIRED)
+    if(NATS_ASIO_USE_MIMALLOC)
+        find_package(mimalloc CONFIG REQUIRED)
+    endif()
 
     # zerialize is only used by nats_tool for binary format conversion.
     include(FetchContent)
@@ -128,12 +140,15 @@ if(NATS_ASIO_BUILD_SAMPLES)
         PRIVATE
             nats_asio::nats_asio
             cxxopts::cxxopts
-            mimalloc
             simdjson::simdjson
             zerialize
             $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
     )
     target_compile_definitions(nats_tool PRIVATE FLATBUFFERS_LOCALE_INDEPENDENT=0)
+    if(NATS_ASIO_USE_MIMALLOC)
+        target_link_libraries(nats_tool PRIVATE mimalloc)
+        target_compile_definitions(nats_tool PRIVATE NATS_TOOL_USE_MIMALLOC)
+    endif()
 
     set_target_properties(nats_tool PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
@@ -203,7 +218,7 @@ if(NATS_ASIO_BUILD_TESTS)
         set_tests_properties(nats_tool_integration PROPERTIES
             LABELS "integration"
             SKIP_RETURN_CODE 125
-            TIMEOUT 180
+            TIMEOUT 300
         )
     endif()
 endif()

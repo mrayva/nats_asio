@@ -18,21 +18,29 @@ jobs:
             samples: "OFF"
             tests: "OFF"
             sanitizer_flags: ""
+            use_mimalloc: "ON"
             run_tests: false
           - name: full
             samples: "ON"
             tests: "ON"
             sanitizer_flags: ""
+            use_mimalloc: "ON"
             run_tests: true
           - name: sanitizers
             samples: "ON"
             tests: "ON"
             sanitizer_flags: "-fsanitize=address,undefined -fno-sanitize=alignment -fno-omit-frame-pointer"
+            use_mimalloc: "ON"
             run_tests: true
           - name: thread-sanitizer
             samples: "ON"
             tests: "ON"
             sanitizer_flags: "-fsanitize=thread -fno-omit-frame-pointer"
+            # mimalloc has known, longstanding ThreadSanitizer-only data races
+            # in its own lazy per-thread heap init (microsoft/mimalloc#130,
+            # #1230) - unrelated to this repo, but it drowns out any real race
+            # in nats_tool's own code since TSan halts on the first one seen.
+            use_mimalloc: "OFF"
             run_tests: true
 
     name: ${{ matrix.name }}
@@ -57,6 +65,7 @@ jobs:
           -DNATS_ASIO_BUILD_SAMPLES=${{ matrix.samples }}
           -DNATS_ASIO_BUILD_TESTS=${{ matrix.tests }}
           -DNATS_ASIO_INSTALL=ON
+          -DNATS_ASIO_USE_MIMALLOC=${{ matrix.use_mimalloc }}
           -DCMAKE_CXX_FLAGS="${{ matrix.sanitizer_flags }}"
           -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.sanitizer_flags }}"
 

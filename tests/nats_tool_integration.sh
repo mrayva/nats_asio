@@ -286,6 +286,77 @@ test_kvwatch() {
     grep -q "wk" "$out"
 }
 
+# --- Concurrency stress -----------------------------------------------------
+# nats_tool has a real history of threading bugs: a segfault from concurrent
+# access to the connection's subscription map under --threads, and (fixed
+# this session) the plain-publish path being spawned onto the raw io_context
+# instead of the connection's strand when --io_shards was in play, letting
+# conn->publish() run from a thread that didn't own the connection. Neither
+# is reachable by any single-threaded/single-connection test above, so
+# correctness here only means anything when this whole suite runs under
+# ThreadSanitizer (see ci.yml) - that's what actually catches a reintroduced
+# race; a clean exit here alone only proves nothing crashed outright.
+
+test_threaded_plain_publish() {
+    # Exercises the exact combination fixed this session: multiple io_context
+    # shards + multiple threads for a non-JetStream (fire-and-forget) publish.
+    local subj="${RUN_ID}.threaded_plain"
+    local out="${WORKDIR}/threaded_grub.log"
+    local pid
+    pid=$(start_bg "$out" grub --topic "$subj" --print)
+    sleep 1
+
+    local count=500
+    timeout 30 "$NATS_TOOL" pub --topic "$subj" --data "stress-msg" --count "$count" \
+        --connections 4 --io_shards 4 --threads 4 > "${WORKDIR}/threaded_pub.log" 2>&1
+    local pub_status=$?
+    sleep 2
+    stop_bg "$pid"
+
+    if [[ $pub_status -ne 0 ]]; then
+        echo "pub exited $pub_status"
+        cat "${WORKDIR}/threaded_pub.log"
+        return 1
+    fi
+    grep -q "All publishes complete" "${WORKDIR}/threaded_pub.log" || return 1
+
+    # Core NATS pub/sub isn't guaranteed delivery, so tolerate a small gap
+    # rather than requiring an exact count - the point is catching a race
+    # that drops/corrupts most or all messages, not micro-counting.
+    local received
+    received=$(grep -c "stress-msg" "$out")
+    local min_expected=$((count * 90 / 100))
+    if [[ "$received" -lt "$min_expected" ]]; then
+        echo "received $received/$count messages (expected >= $min_expected)"
+        return 1
+    fi
+    return 0
+}
+
+test_threaded_js_publish() {
+    # Exercises the original segfault-era path: multiple threads and
+    # connections publishing to JetStream concurrently, which touches the
+    # connection's subscription map and ack-tracking state from more than
+    # one thread if the strand guards regress.
+    local stream="${RUN_ID}_JS_STRESS"
+    local subj="${RUN_ID}.threaded_js"
+    create_js_stream "$stream" "$subj"
+
+    local count=200
+    timeout 30 "$NATS_TOOL" pub --js --stream "$stream" --topic "$subj" --data "stress-msg" \
+        --count "$count" --connections 4 --threads 4 > "${WORKDIR}/threaded_js_pub.log" 2>&1
+    local pub_status=$?
+
+    if [[ $pub_status -ne 0 ]]; then
+        echo "pub exited $pub_status"
+        cat "${WORKDIR}/threaded_js_pub.log"
+        return 1
+    fi
+    # JetStream acks are reliable (unlike core pub/sub), so this is an exact
+    # check: every message must have been acked and none failed.
+    grep -q "acked=${count}, failed=0" "${WORKDIR}/threaded_js_pub.log"
+}
+
 # --- Run ---------------------------------------------------------------------
 
 run_test "grub+pub plain round trip" test_grub_pub
@@ -301,6 +372,8 @@ run_test "pubkv mode" test_pubkv
 run_test "kvcreate/kvupdate/kvkeys" test_kv_create_update_keys
 run_test "kvhistory/kvrevert/kvpurge" test_kv_history_revert_purge
 run_test "kvwatch mode" test_kvwatch
+run_test "threaded plain publish (--io_shards/--threads)" test_threaded_plain_publish
+run_test "threaded JetStream publish (--connections/--threads)" test_threaded_js_publish
 
 echo ""
 echo "=== ${PASS_COUNT} passed, ${FAIL_COUNT} failed ==="
