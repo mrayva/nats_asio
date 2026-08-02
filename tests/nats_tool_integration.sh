@@ -152,6 +152,53 @@ test_req_reply() {
     echo "$resp" | grep -q "ping"
 }
 
+test_translate_shell_injection() {
+    # Regression test for a real shell-injection bug: translate_payload()
+    # (shared by grub/js_grub/js_fetch, and reply via its own call site into
+    # the same function) used to splice the NATS message subject - which is
+    # attacker-controlled, since anyone who can publish controls it - verbatim
+    # into a command string passed to `sh -c`. A subject containing shell
+    # metacharacters could execute arbitrary commands on the subscriber's
+    # host. Fixed by shell-quoting the subject before substitution. Uses
+    # $IFS instead of a literal space since NATS subjects can't contain
+    # whitespace (the wire protocol's own PUB line parsing uses it as a
+    # delimiter), but $IFS expands to whitespace inside the injected sh -c
+    # command, so it's an equivalent injection vector without needing one.
+    local marker="${WORKDIR}/pwned_marker"
+    rm -f "$marker"
+    local subj="${RUN_ID}.inject_test;touch\$IFS${marker};echo"
+
+    local grub_out="${WORKDIR}/inject_grub.log"
+    local grub_pid
+    grub_pid=$(start_bg "$grub_out" grub --topic "$subj" --translate "echo GOT:{{Subject}}")
+    sleep 1
+    "$NATS_TOOL" pub --topic "$subj" --data "hi" --count 1 > /dev/null 2>&1
+    sleep 1
+    stop_bg "$grub_pid"
+
+    if [[ -f "$marker" ]]; then
+        echo "SECURITY REGRESSION: grub --translate executed an injected command"
+        return 1
+    fi
+    grep -qF "GOT:${subj}" "$grub_out" || { echo "grub --translate did not run as expected"; return 1; }
+
+    # Also check reply mode's separate call site into the same shared helper.
+    rm -f "$marker"
+    local reply_out="${WORKDIR}/inject_reply.log"
+    local reply_pid
+    reply_pid=$(start_bg "$reply_out" reply --topic "$subj" --translate "echo GOT:{{Subject}}")
+    sleep 1
+    local resp
+    resp=$("$NATS_TOOL" req --topic "$subj" --data "hi" --timeout 3000 2>&1)
+    stop_bg "$reply_pid"
+
+    if [[ -f "$marker" ]]; then
+        echo "SECURITY REGRESSION: reply --translate executed an injected command"
+        return 1
+    fi
+    echo "$resp" | grep -qF "GOT:${subj}"
+}
+
 test_generator() {
     local subj="${RUN_ID}.gen"
     local grub_out="${WORKDIR}/gen_grub.log"
@@ -362,6 +409,7 @@ test_threaded_js_publish() {
 run_test "grub+pub plain round trip" test_grub_pub
 run_test "pub with headers" test_pub_headers
 run_test "req/reply round trip" test_req_reply
+run_test "--translate shell injection safety" test_translate_shell_injection
 run_test "generator mode" test_generator
 run_test "benchmarker mode" test_bench
 run_test "batch_pub mode" test_batch_pub
