@@ -162,6 +162,16 @@ public:
           m_batch_size(batch_size), m_flush_timeout_ms(flush_timeout_ms),
           m_file_path(file_path), m_counter(0), m_pending_writes(0), m_running(true),
           m_failed(false) {
+        // batch_pub is a one-shot CLI invocation, not a long-lived service -
+        // connect_config's default of unlimited retries means the
+        // connection's error callback (and so m_failed, which the writer
+        // connect-wait loop below depends on to give up) would never fire
+        // against a server that's simply unreachable, hanging forever no
+        // matter what the writer loop itself checks. Bound it here unless
+        // the caller already set an explicit limit.
+        if (m_conf.retry_max_attempts == 0) {
+            m_conf.retry_max_attempts = 3;
+        }
         m_queue.set_max_size(max_queue_size);
         m_queue.set_abort_flag(&m_failed);
         // Pre-build the static part of PUB command: "PUB <topic> "

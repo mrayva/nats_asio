@@ -234,6 +234,41 @@ test_batch_pub() {
     grep -q "line1" "$out" && grep -q "line3" "$out"
 }
 
+test_batch_pub_unreachable_server_does_not_hang() {
+    # Regression test for a real hang bug: a writer thread's connect-wait
+    # loop was `while (!conn->is_connected() && m_running)`, but m_running
+    # only flips false after run() joins the writer threads - which itself
+    # blocks on this very loop. Against an unreachable server, every writer
+    # spun forever waiting for a flag that could never change until the
+    # writer itself exited. Fixed by also checking m_failed (set by the
+    # connection's error callback) in that loop, plus giving the batch
+    # queue an abort flag so a reader_thread blocked on push() (queue full,
+    # nothing consuming) doesn't hang either once all writers have died.
+    #
+    # Port 1 has nothing listening, giving an immediate ECONNREFUSED rather
+    # than a slow connect timeout, so a working fix returns in well under a
+    # second and a regression (hang) is caught decisively by the 15s bound
+    # without the test itself being slow.
+    local subj="${RUN_ID}.batch_unreachable"
+    printf 'line1\nline2\n' | timeout 15 "$NATS_TOOL" pub --topic "$subj" --batch_pub \
+        --address 127.0.0.1 --port 1 > "${WORKDIR}/batch_unreachable.log" 2>&1
+    local status=$?
+
+    if [[ $status -eq 124 ]]; then
+        echo "hung: killed by the 15s safety timeout (regression of the batch_publisher hang bug)"
+        cat "${WORKDIR}/batch_unreachable.log"
+        return 1
+    fi
+    # Publishing against an unreachable server should be reported as a
+    # failure, not silently succeed.
+    if [[ $status -eq 0 ]]; then
+        echo "expected non-zero exit for an unreachable server, got 0"
+        cat "${WORKDIR}/batch_unreachable.log"
+        return 1
+    fi
+    return 0
+}
+
 test_js_publish() {
     local stream="${RUN_ID}_JS_PUB"
     local subj="${RUN_ID}.js_pub"
@@ -413,6 +448,7 @@ run_test "--translate shell injection safety" test_translate_shell_injection
 run_test "generator mode" test_generator
 run_test "benchmarker mode" test_bench
 run_test "batch_pub mode" test_batch_pub
+run_test "batch_pub does not hang on unreachable server" test_batch_pub_unreachable_server_does_not_hang
 run_test "JetStream publish" test_js_publish
 run_test "js_grub push consumer" test_js_grub
 run_test "js_fetch pull consumer" test_js_fetch
