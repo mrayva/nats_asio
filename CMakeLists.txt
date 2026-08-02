@@ -197,7 +197,7 @@ if(NATS_ASIO_BUILD_TESTS)
     set_tests_properties(live_server_regression PROPERTIES
         LABELS "integration"
         SKIP_RETURN_CODE 125
-        TIMEOUT 60
+        TIMEOUT 120
     )
 
     if(TARGET nats_tool)

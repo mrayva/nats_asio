@@ -42,13 +42,17 @@
 #include <asio/ip/tcp.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
+#include <fmt/format.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -437,6 +441,176 @@ asio::awaitable<bool> kv_get_returns_latest_value_and_reports_missing_keys(
     co_return ok;
 }
 
+// Guards against a real bug: unlike publish/subscribe, request() (and
+// everything built on it - create_consumer and every KV op) had no redirect
+// onto m_strand when called from a thread other than the connection's own,
+// so the strand-bound state it touches (state->response written from the
+// strand-bound subscribe callback, read back from the calling coroutine)
+// could be accessed from two different threads with no ordering between
+// them. Fixed by adding the same strand redirect every other method already
+// had. The concurrency stress scenarios in nats_tool_integration.sh only
+// exercise publish this way - this is the equivalent for request()/KV,
+// firing many concurrent operations at a single shared connection from
+// several independent OS threads, none of which is the connection's own.
+// Meaningful mainly under TSan (see ci.yml): a clean exit alone only proves
+// nothing crashed outright, not that there was no race.
+asio::awaitable<bool> concurrent_request_and_kv_ops_from_multiple_threads_are_safe(
+    asio::io_context& ioc, const std::string& host, uint16_t port,
+    std::shared_ptr<spdlog::logger> log) {
+    auto conn = nats_asio::connect(ioc, host, port);
+
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    for (int i = 0; i < 100 && !conn->is_connected(); ++i) {
+        timer.expires_after(std::chrono::milliseconds(50));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+    if (!conn->is_connected()) {
+        log->error("could not connect to nats-server");
+        co_return false;
+    }
+
+    const std::string subject = "regression.concurrent_req.subj";
+    const std::string bucket = "regression_concurrent_kv";
+    const std::string stream = "KV_" + bucket;
+
+    // Echo responder for the request() stress, on the same connection.
+    auto [sub, sub_status] = co_await conn->subscribe(
+        subject,
+        [conn](nats_asio::string_view /*s*/, nats_asio::optional<nats_asio::string_view> reply_to,
+              std::span<const char> payload) -> asio::awaitable<void> {
+            if (reply_to) {
+                co_await conn->publish(*reply_to, payload, std::nullopt);
+            }
+            co_return;
+        });
+    if (sub_status.failed()) {
+        log->error("subscribe failed: {}", sub_status.error());
+        conn->stop();
+        co_return false;
+    }
+
+    {
+        std::string create_payload =
+            "{\"name\":\"" + stream + "\",\"subjects\":[\"$KV." + bucket +
+            ".>\"],\"retention\":\"limits\",\"max_msgs_per_subject\":10,\"discard\":\"new\","
+            "\"storage\":\"file\",\"num_replicas\":1,\"allow_direct\":true,"
+            "\"allow_rollup_hdrs\":true}";
+        std::span<const char> payload(create_payload.data(), create_payload.size());
+        auto [resp, s] = co_await conn->request("$JS.API.STREAM.CREATE." + stream, payload,
+                                                std::chrono::milliseconds(5000));
+        (void)resp;
+        if (s.failed()) {
+            log->error("failed to create KV bucket stream: {}", s.error());
+            conn->stop();
+            co_return false;
+        }
+    }
+
+    constexpr int num_threads = 4;
+    constexpr int ops_per_thread = 25;
+    auto req_success = std::make_shared<std::atomic<int>>(0);
+    auto req_failure = std::make_shared<std::atomic<int>>(0);
+    auto kv_success = std::make_shared<std::atomic<int>>(0);
+    auto kv_failure = std::make_shared<std::atomic<int>>(0);
+    auto threads_done = std::make_shared<std::atomic<int>>(0);
+
+    std::vector<std::thread> workers;
+    workers.reserve(num_threads);
+    for (int t = 0; t < num_threads; ++t) {
+        workers.emplace_back([t, conn, subject, bucket, req_success, req_failure, kv_success,
+                              kv_failure, threads_done]() {
+            asio::io_context worker_ioc;
+            // Bounds worker_ioc.run() regardless of outcome, so the join()
+            // below is always safe to call unconditionally - a stuck
+            // operation fails this test cleanly instead of risking hanging
+            // the whole process past CTest's own process-level timeout.
+            asio::steady_timer worker_timeout(worker_ioc);
+            worker_timeout.expires_after(std::chrono::seconds(15));
+            worker_timeout.async_wait([&](const asio::error_code& ec) {
+                if (!ec) worker_ioc.stop();
+            });
+
+            asio::co_spawn(
+                worker_ioc,
+                [&]() -> asio::awaitable<void> {
+                    for (int i = 0; i < ops_per_thread; ++i) {
+                        std::string payload = fmt::format("t{}-i{}", t, i);
+                        std::span<const char> pspan(payload.data(), payload.size());
+                        auto [resp, s] = co_await conn->request(
+                            subject, pspan, std::chrono::milliseconds(3000));
+                        if (s.ok() &&
+                            std::string(resp.payload.begin(), resp.payload.end()) == payload) {
+                            req_success->fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            req_failure->fetch_add(1, std::memory_order_relaxed);
+                        }
+
+                        std::string key = fmt::format("t{}_key{}", t, i);
+                        std::string value = fmt::format("t{}-value{}", t, i);
+                        std::span<const char> vspan(value.data(), value.size());
+                        auto [rev, put_s] = co_await conn->kv_put(
+                            bucket, key, vspan, std::chrono::milliseconds(3000));
+                        if (put_s.failed()) {
+                            kv_failure->fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        auto [entry, get_s] = co_await conn->kv_get(
+                            bucket, key, std::chrono::milliseconds(3000));
+                        std::string got(entry.value.begin(), entry.value.end());
+                        if (get_s.ok() && got == value && entry.revision == rev) {
+                            kv_success->fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            kv_failure->fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    threads_done->fetch_add(1, std::memory_order_relaxed);
+                    worker_timeout.cancel();
+                    co_return;
+                },
+                asio::detached);
+
+            worker_ioc.run();
+        });
+    }
+
+    // Poll rather than block: this coroutine runs on `ioc`, which is what
+    // actually carries out the strand-redirected work the worker threads
+    // above are waiting on, so it must keep yielding back to `ioc`'s event
+    // loop between checks rather than blocking synchronously.
+    for (int i = 0; i < 400 && threads_done->load(std::memory_order_relaxed) < num_threads; ++i) {
+        timer.expires_after(std::chrono::milliseconds(50));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+
+    // Safe unconditionally: each worker's own hard-timeout bounds its
+    // io_context::run(), so this can't hang even if the poll above timed
+    // out with a thread stuck mid-operation.
+    for (auto& w : workers) {
+        if (w.joinable()) w.join();
+    }
+
+    bool ok = threads_done->load() == num_threads && req_failure->load() == 0 &&
+              req_success->load() == num_threads * ops_per_thread && kv_failure->load() == 0 &&
+              kv_success->load() == num_threads * ops_per_thread;
+    if (!ok) {
+        log->error("threads_done={}/{} req: {} ok / {} failed, kv: {} ok / {} failed",
+                  threads_done->load(), num_threads, req_success->load(), req_failure->load(),
+                  kv_success->load(), kv_failure->load());
+    }
+
+    // Best-effort cleanup; don't fail the test over it.
+    {
+        std::span<const char> empty;
+        auto [resp, s] = co_await conn->request("$JS.API.STREAM.DELETE." + stream, empty,
+                                                std::chrono::milliseconds(3000));
+        (void)resp;
+        (void)s;
+    }
+
+    conn->stop();
+    co_return ok;
+}
+
 using test_case_fn = std::function<asio::awaitable<bool>(
     asio::io_context&, const std::string&, uint16_t, std::shared_ptr<spdlog::logger>)>;
 
@@ -491,6 +665,8 @@ int main() {
                       js_message_metadata_is_populated_from_ack_subject) && all_ok;
     all_ok = run_case("kv_get_returns_latest_value_and_reports_missing_keys", host, port, log,
                       kv_get_returns_latest_value_and_reports_missing_keys) && all_ok;
+    all_ok = run_case("concurrent_request_and_kv_ops_from_multiple_threads_are_safe", host, port,
+                      log, concurrent_request_and_kv_ops_from_multiple_threads_are_safe) && all_ok;
 
     return all_ok ? 0 : 1;
 }
