@@ -1166,3 +1166,94 @@ TEST(escape_json_string, escaped_output_round_trips_through_a_real_json_parser) 
         EXPECT_EQ(parsed.get<std::string>(), payload);
     }
 }
+
+TEST(split_string, splits_on_delimiter_and_trims_whitespace) {
+    EXPECT_EQ(nats_tool::split_string("a,b,c", ','),
+              (std::vector<std::string>{"a", "b", "c"}));
+    EXPECT_EQ(nats_tool::split_string(" a , b ,c ", ','),
+              (std::vector<std::string>{"a", "b", "c"}));
+}
+
+TEST(split_string, drops_empty_fields) {
+    // Empty/whitespace-only fields are dropped entirely, not kept as "".
+    EXPECT_EQ(nats_tool::split_string("a,,b", ','), (std::vector<std::string>{"a", "b"}));
+    EXPECT_EQ(nats_tool::split_string("", ','), std::vector<std::string>{});
+    EXPECT_EQ(nats_tool::split_string(",  ,", ','), std::vector<std::string>{});
+}
+
+TEST(build_payload, dumps_whole_object_when_no_fields_selected) {
+    nlohmann::json obj = {{"a", 1}, {"b", 2}};
+    auto result = nlohmann::json::parse(nats_tool::build_payload(obj, {}));
+    EXPECT_EQ(result, obj);
+}
+
+TEST(build_payload, includes_only_selected_fields_that_are_present) {
+    nlohmann::json obj = {{"a", 1}, {"b", 2}, {"c", 3}};
+    auto result = nlohmann::json::parse(nats_tool::build_payload(obj, {"a", "c", "missing"}));
+    nlohmann::json expected = {{"a", 1}, {"c", 3}};
+    EXPECT_EQ(result, expected);
+}
+
+TEST(apply_template, substitutes_fields_from_json_object) {
+    nlohmann::json obj = {{"subject", "orders.new"}, {"id", 42}};
+    EXPECT_EQ(nats_tool::apply_template("prefix.{{subject}}.{{id}}", obj), "prefix.orders.new.42");
+}
+
+TEST(apply_template, returns_template_unchanged_on_render_error) {
+    nlohmann::json obj = {{"a", 1}};
+    // Malformed placeholder syntax: inja fails to parse, apply_template must
+    // fall back to returning the raw template rather than throwing/crashing.
+    EXPECT_EQ(nats_tool::apply_template("{{unclosed", obj), "{{unclosed");
+}
+
+TEST(parse_csv_line, parses_simple_unquoted_fields) {
+    auto obj = nats_tool::parse_csv_line("a,b,c", {"h1", "h2", "h3"});
+    EXPECT_EQ(obj["h1"], "a");
+    EXPECT_EQ(obj["h2"], "b");
+    EXPECT_EQ(obj["h3"], "c");
+}
+
+TEST(parse_csv_line, trims_whitespace_around_unquoted_fields) {
+    auto obj = nats_tool::parse_csv_line(" a , b ,c ", {"h1", "h2", "h3"});
+    EXPECT_EQ(obj["h1"], "a");
+    EXPECT_EQ(obj["h2"], "b");
+    EXPECT_EQ(obj["h3"], "c");
+}
+
+TEST(parse_csv_line, handles_comma_inside_quoted_field) {
+    auto obj = nats_tool::parse_csv_line("a,\"b,c\",d", {"h1", "h2", "h3"});
+    EXPECT_EQ(obj["h1"], "a");
+    EXPECT_EQ(obj["h2"], "b,c");
+    EXPECT_EQ(obj["h3"], "d");
+}
+
+TEST(parse_csv_line, handles_doubled_quote_as_escaped_quote) {
+    auto obj = nats_tool::parse_csv_line("a,\"he said \"\"hi\"\"\",c", {"h1", "h2", "h3"});
+    EXPECT_EQ(obj["h1"], "a");
+    EXPECT_EQ(obj["h2"], "he said \"hi\"");
+    EXPECT_EQ(obj["h3"], "c");
+}
+
+TEST(parse_csv_line, ignores_extra_values_and_leaves_missing_headers_absent) {
+    auto obj = nats_tool::parse_csv_line("a,b,c", {"h1", "h2"});
+    EXPECT_EQ(obj["h1"], "a");
+    EXPECT_EQ(obj["h2"], "b");
+    EXPECT_EQ(obj.size(), 2u);
+
+    auto obj2 = nats_tool::parse_csv_line("a,b", {"h1", "h2", "h3"});
+    EXPECT_EQ(obj2["h1"], "a");
+    EXPECT_EQ(obj2["h2"], "b");
+    EXPECT_FALSE(obj2.contains("h3"));
+}
+
+// Documents current behavior rather than RFC 4180: the function's own
+// comment says whitespace trimming is for unquoted fields only, but the
+// trim loops run unconditionally after a field is closed regardless of
+// whether it came from a quoted context, so leading/trailing whitespace
+// *inside* quotes is stripped too. If that comment's intent is ever
+// enforced, this test's expectation should flip to "  a  ".
+TEST(parse_csv_line, strips_whitespace_even_inside_quotes_despite_the_unquoted_only_comment) {
+    auto obj = nats_tool::parse_csv_line("\"  a  \",b", {"h1", "h2"});
+    EXPECT_EQ(obj["h1"], "a");
+    EXPECT_EQ(obj["h2"], "b");
+}
