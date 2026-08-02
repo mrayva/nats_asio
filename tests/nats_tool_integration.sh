@@ -140,6 +140,49 @@ test_pub_headers() {
     grep -q "hello-headers" "$out"
 }
 
+test_pub_input_format_json() {
+    # Regression test: --input_format json without --payload_fields used to
+    # rebuild the payload via nlohmann::json's dump(), which sorts object
+    # keys alphabetically - so every publish silently reordered the input's
+    # keys even when no transformation was actually requested. Also covers
+    # --subject_template (needs the same parsed object) and --payload_fields
+    # (field selection), which must keep working since they share the parse.
+    local subj="${RUN_ID}.pub_json"
+    local out="${WORKDIR}/pub_json.log"
+    local pid
+    pid=$(start_bg "$out" grub --topic "${subj}.>" --print)
+    sleep 1
+
+    # No --payload_fields/--subject_template: payload must come through with
+    # its original key order intact, not alphabetically resorted. (--topic
+    # gets a ".plain" suffix so it still falls under the "${subj}.>"
+    # wildcard grub subscribes to below - a bare "$subj" publish wouldn't.)
+    printf '%s\n' '{"zebra":1,"apple":2,"mango":3}' \
+        | "$NATS_TOOL" pub --topic "${subj}.plain" --input_format json > /dev/null 2>&1
+    sleep 1
+
+    # --subject_template + --payload_fields together.
+    printf '%s\n' '{"kind":"orders","zebra":1,"apple":2}' \
+        | "$NATS_TOOL" pub --topic "${subj}.plain" --input_format json \
+            --subject_template "${subj}.{{kind}}" --payload_fields "apple" > /dev/null 2>&1
+    sleep 1
+
+    stop_bg "$pid"
+
+    grep -qF '{"zebra":1,"apple":2,"mango":3}' "$out" || {
+        echo "payload key order was not preserved: $(cat "$out")"
+        return 1
+    }
+    grep -qF "[${subj}.orders]" "$out" || {
+        echo "subject_template did not resolve to ${subj}.orders: $(cat "$out")"
+        return 1
+    }
+    grep -qF '{"apple":2}' "$out" || {
+        echo "payload_fields did not filter to just 'apple': $(cat "$out")"
+        return 1
+    }
+}
+
 test_req_reply() {
     local subj="${RUN_ID}.rpc"
     local out="${WORKDIR}/reply.log"
@@ -443,6 +486,7 @@ test_threaded_js_publish() {
 
 run_test "grub+pub plain round trip" test_grub_pub
 run_test "pub with headers" test_pub_headers
+run_test "pub --input_format json preserves key order and resolves templates/fields" test_pub_input_format_json
 run_test "req/reply round trip" test_req_reply
 run_test "--translate shell injection safety" test_translate_shell_injection
 run_test "generator mode" test_generator

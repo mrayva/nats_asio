@@ -333,8 +333,16 @@ private:
                     subject = apply_template(m_input_cfg.subject_template, obj);
                 }
 
-                // Build payload from selected fields
-                payload = build_payload(obj, m_input_cfg.payload_fields);
+                // Only rebuild the payload when actual field filtering was
+                // requested. build_payload(obj, {}) would otherwise just
+                // re-dump the whole object - wasted work since it's already
+                // JSON, and not even a faithful passthrough: nlohmann::json
+                // sorts object keys alphabetically on dump(), so every
+                // publish would silently reorder the input's keys even
+                // though nothing about the payload was meant to change.
+                if (!m_input_cfg.payload_fields.empty()) {
+                    payload = build_payload(obj, m_input_cfg.payload_fields);
+                }
             } catch (const nlohmann::json::exception& e) {
                 m_log->warn("JSON parse error: {} - line: {}", e.what(), line.substr(0, 50));
                 co_return;
