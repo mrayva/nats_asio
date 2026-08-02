@@ -126,12 +126,19 @@ if(NATS_ASIO_BUILD_SAMPLES)
     endif()
 
     # zerialize is only used by nats_tool for binary format conversion.
+    #
+    # Using mrayva/zerialize (fork of colinator/zerialize) rather than
+    # upstream: fixes a real exception-safety leak in json::RootSerializer,
+    # which used to leak a yyjson_mut_doc on every failed deserialization
+    # when translating any binary format to JSON (msgpack/cbor/flexbuffers/
+    # zera -> json, i.e. nats_tool's grub/js_grub/js_fetch --format path
+    # hitting malformed input) - see mrayva/zerialize@031ad92.
     include(FetchContent)
     set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
     FetchContent_Declare(
         zerialize
-        GIT_REPOSITORY https://github.com/colinator/zerialize.git
-        GIT_TAG        aedaaf2e585dbc0a7f239bca33fd2a6595ed47df
+        GIT_REPOSITORY https://github.com/mrayva/zerialize.git
+        GIT_TAG        031ad920a06a12b6d8fcb6ba1ba01779b71ce52d
     )
     FetchContent_MakeAvailable(zerialize)
 

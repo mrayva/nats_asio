@@ -8,11 +8,6 @@
 #include <sstream>
 #include <string>
 
-#if defined(__SANITIZE_ADDRESS__)
-#define NATS_TOOL_TEST_HAS_ASAN 1
-#include <sanitizer/lsan_interface.h>
-#endif
-
 using namespace nats_tool;
 
 namespace {
@@ -20,23 +15,6 @@ namespace {
 std::span<const char> as_span(const std::string& s) {
     return std::span<const char>(s.data(), s.size());
 }
-
-// zerialize::translate<JSON>() (used by deserialize_to_json() for every
-// binary_format) allocates its destination yyjson document before reading
-// the source, and doesn't free it if that read throws - which it always
-// does on malformed/truncated input, even a completely empty payload. That
-// makes it a real upstream leak (zerialize::json::RootSerializer is missing
-// exception-safe cleanup, not anything in this repo), but it also means
-// there's no "well-formed enough" bad payload that dodges it - any test of
-// emit_message's deserialization-failure path hits it. Scope leak detection
-// off just around those calls rather than losing ASan leak coverage for the
-// rest of this binary.
-struct scoped_lsan_disable {
-#ifdef NATS_TOOL_TEST_HAS_ASAN
-    scoped_lsan_disable() { __lsan_disable(); }
-    ~scoped_lsan_disable() { __lsan_enable(); }
-#endif
-};
 
 }  // namespace
 
@@ -230,16 +208,11 @@ TEST(emit_message, json_mode_with_format_records_failure_and_writes_nothing_on_b
     deserializer_stats stats;
     std::ostringstream out;
     // Empty payload: no msgpack decoder can read even a type byte from zero
-    // bytes, so this reliably fails deserialization. See scoped_lsan_disable
-    // above for why any failing payload here needs leak detection scoped
-    // off, not just this particular choice of "bad" input.
+    // bytes, so this reliably fails deserialization.
     std::string garbage;
 
-    {
-        scoped_lsan_disable lsan_guard;
-        emit_message(out, output_mode::json, "orders.new", as_span(garbage), binary_format::msgpack,
-                     stats, spdlog::default_logger(), ioc);
-    }
+    emit_message(out, output_mode::json, "orders.new", as_span(garbage), binary_format::msgpack,
+                 stats, spdlog::default_logger(), ioc);
 
     EXPECT_TRUE(out.str().empty());
     EXPECT_EQ(stats.total_messages(), 1u);
@@ -253,11 +226,8 @@ TEST(emit_message, json_mode_stops_ioc_when_bad_message_threshold_is_exceeded) {
     std::string garbage;
 
     ASSERT_FALSE(ioc.stopped());
-    {
-        scoped_lsan_disable lsan_guard;
-        emit_message(out, output_mode::json, "orders.new", as_span(garbage), binary_format::msgpack,
-                     stats, spdlog::default_logger(), ioc);
-    }
+    emit_message(out, output_mode::json, "orders.new", as_span(garbage), binary_format::msgpack,
+                 stats, spdlog::default_logger(), ioc);
 
     EXPECT_TRUE(ioc.stopped());
 }
