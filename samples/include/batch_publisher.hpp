@@ -230,41 +230,10 @@ public:
         buf.append("\r\n", 2);
     }
 
-    void run() {
-        // Start writer threads
-        for (int i = 0; i < m_num_writers; i++) {
-            m_writer_threads.emplace_back([this, i] { writer_thread(i); });
-        }
-
-        // Start stats thread
-        if (m_stats_interval > 0) {
-            m_stats_thread = std::thread([this] { stats_thread(); });
-        }
-
-        // Reader runs in main thread
-        reader_thread();
-
-        // Signal done and wait for writers
-        m_queue.set_done();
-        for (auto& t : m_writer_threads) {
-            if (t.joinable()) t.join();
-        }
-
-        m_running = false;
-        if (m_stats_thread.joinable()) {
-            m_stats_thread.join();
-        }
-
-        m_console->info("Batch publisher finished, total messages: {}", m_counter.load());
-    }
-
-    [[nodiscard]] bool failed() const noexcept {
-        return m_failed.load(std::memory_order_acquire);
-    }
-
-private:
     // Validate that a buffer is a concatenation of well-formed
-    // "PUB <subject> <size>\\r\\n<payload>\\r\\n" frames.
+    // "PUB <subject> <size>\\r\\n<payload>\\r\\n" frames. Public (alongside
+    // fast_itoa) since it's a pure static utility with no dependency on
+    // instance state - kept testable without constructing a batch_publisher.
     static bool validate_pub_batch(const std::string& data) {
         std::size_t off = 0;
         while (off < data.size()) {
@@ -309,6 +278,39 @@ private:
         return off == data.size();
     }
 
+    void run() {
+        // Start writer threads
+        for (int i = 0; i < m_num_writers; i++) {
+            m_writer_threads.emplace_back([this, i] { writer_thread(i); });
+        }
+
+        // Start stats thread
+        if (m_stats_interval > 0) {
+            m_stats_thread = std::thread([this] { stats_thread(); });
+        }
+
+        // Reader runs in main thread
+        reader_thread();
+
+        // Signal done and wait for writers
+        m_queue.set_done();
+        for (auto& t : m_writer_threads) {
+            if (t.joinable()) t.join();
+        }
+
+        m_running = false;
+        if (m_stats_thread.joinable()) {
+            m_stats_thread.join();
+        }
+
+        m_console->info("Batch publisher finished, total messages: {}", m_counter.load());
+    }
+
+    [[nodiscard]] bool failed() const noexcept {
+        return m_failed.load(std::memory_order_acquire);
+    }
+
+private:
     void reader_thread() {
         // Open file or use stdin
         int input_fd = STDIN_FILENO;

@@ -14,6 +14,8 @@
 #include <nats_asio/multi_file_reader.hpp>
 #include <nats_asio/nats_asio.hpp>
 #include <nats_asio/zip_extractor.hpp>
+#include <batch_publisher.hpp>
+#include <limits>
 #include <string_utils.hpp>
 #include <thread>
 #include <type_traits>
@@ -1256,4 +1258,99 @@ TEST(parse_csv_line, strips_whitespace_even_inside_quotes_despite_the_unquoted_o
     auto obj = nats_tool::parse_csv_line("\"  a  \",b", {"h1", "h2"});
     EXPECT_EQ(obj["h1"], "a");
     EXPECT_EQ(obj["h2"], "b");
+}
+
+// --- batch_publisher::fast_itoa ---------------------------------------------
+
+namespace {
+std::string fast_itoa_str(std::size_t val) {
+    char buf[24];
+    char* end = nats_tool::batch_publisher::fast_itoa(buf, val);
+    return std::string(buf, static_cast<std::size_t>(end - buf));
+}
+}  // namespace
+
+TEST(batch_publisher_fast_itoa, matches_std_to_string_at_digit_count_boundaries) {
+    for (std::size_t v : {std::size_t{0}, std::size_t{1}, std::size_t{9}, std::size_t{10},
+                          std::size_t{11}, std::size_t{99}, std::size_t{100}, std::size_t{101},
+                          std::size_t{999}, std::size_t{1000}, std::size_t{1001},
+                          std::size_t{9999}, std::size_t{10000},
+                          std::numeric_limits<std::size_t>::max()}) {
+        EXPECT_EQ(fast_itoa_str(v), std::to_string(v)) << "val=" << v;
+    }
+}
+
+TEST(batch_publisher_fast_itoa, matches_std_to_string_across_a_dense_range) {
+    // Exhaustively covers every 1-6 digit transition, not just hand-picked
+    // boundaries - fast_itoa hand-rolls its own digit-pair lookup table
+    // rather than using a library formatter, so it's exactly the kind of
+    // code where an off-by-one is easy to introduce and easy to miss with
+    // sparse spot checks.
+    for (std::size_t v = 0; v < 200000; ++v) {
+        ASSERT_EQ(fast_itoa_str(v), std::to_string(v)) << "val=" << v;
+    }
+}
+
+// --- batch_publisher::validate_pub_batch ------------------------------------
+
+TEST(batch_publisher_validate_pub_batch, accepts_empty_input_as_zero_frames) {
+    EXPECT_TRUE(nats_tool::batch_publisher::validate_pub_batch(""));
+}
+
+TEST(batch_publisher_validate_pub_batch, accepts_a_single_well_formed_frame) {
+    EXPECT_TRUE(nats_tool::batch_publisher::validate_pub_batch("PUB a 1\r\nx\r\n"));
+}
+
+TEST(batch_publisher_validate_pub_batch, accepts_a_zero_length_payload) {
+    EXPECT_TRUE(nats_tool::batch_publisher::validate_pub_batch("PUB a 0\r\n\r\n"));
+}
+
+TEST(batch_publisher_validate_pub_batch, accepts_multiple_concatenated_frames) {
+    EXPECT_TRUE(
+        nats_tool::batch_publisher::validate_pub_batch("PUB a 1\r\nx\r\nPUB bb 2\r\nyz\r\n"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_input_shorter_than_the_minimum_frame) {
+    EXPECT_FALSE(nats_tool::batch_publisher::validate_pub_batch("PUB a 1"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_missing_pub_prefix) {
+    EXPECT_FALSE(nats_tool::batch_publisher::validate_pub_batch("XXXXXXXX"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_a_missing_header_terminator) {
+    EXPECT_FALSE(nats_tool::batch_publisher::validate_pub_batch("PUB a 1xxxxxxxx"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_an_empty_subject) {
+    EXPECT_FALSE(nats_tool::batch_publisher::validate_pub_batch("PUB  1\r\nx\r\n"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_a_non_numeric_size_field) {
+    EXPECT_FALSE(nats_tool::batch_publisher::validate_pub_batch("PUB a x\r\ny\r\n"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_a_negative_size_field) {
+    EXPECT_FALSE(nats_tool::batch_publisher::validate_pub_batch("PUB a -1\r\nx\r\n"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_a_size_field_that_overflows_size_t) {
+    EXPECT_FALSE(nats_tool::batch_publisher::validate_pub_batch(
+        "PUB a 999999999999999999999999\r\nx\r\n"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_a_payload_declared_longer_than_the_buffer) {
+    // Declares size 5 but only 2 payload bytes are actually present.
+    EXPECT_FALSE(nats_tool::batch_publisher::validate_pub_batch("PUB a 5\r\nab\r\n"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_a_payload_missing_its_trailing_crlf) {
+    EXPECT_FALSE(nats_tool::batch_publisher::validate_pub_batch("PUB a 1\r\nxYY"));
+}
+
+TEST(batch_publisher_validate_pub_batch, rejects_a_second_frame_that_is_malformed) {
+    // First frame is well-formed; the corruption is entirely in the second
+    // frame - proving validation doesn't stop checking after frame one.
+    EXPECT_FALSE(
+        nats_tool::batch_publisher::validate_pub_batch("PUB a 1\r\nx\r\nPUB b bogus\r\ny\r\n"));
 }
