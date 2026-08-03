@@ -167,6 +167,26 @@ test_pub_input_format_json() {
             --subject_template "${subj}.{{kind}}" --payload_fields "apple" > /dev/null 2>&1
     sleep 1
 
+    # Malformed JSON on the fast (no template/fields) path: only a syntax
+    # check runs there (simdjson, not nlohmann), so this exercises a
+    # different parser than the two publishes above - must still be
+    # rejected and never delivered, not crash or publish garbage.
+    printf '%s\n' '{"broken":' \
+        | "$NATS_TOOL" pub --topic "${subj}.plain" --input_format json > /dev/null 2>&1
+    sleep 1
+
+    # Malformed JSON on the templated path (nlohmann) - same requirement.
+    printf '%s\n' '{"broken":' \
+        | "$NATS_TOOL" pub --topic "${subj}.plain" --input_format json \
+            --subject_template "${subj}.{{kind}}" --payload_fields "apple" > /dev/null 2>&1
+    sleep 1
+
+    # One more valid message so we can tell "malformed lines were skipped"
+    # apart from "grub/pub stopped working after the malformed lines".
+    printf '%s\n' '{"trailer":true}' \
+        | "$NATS_TOOL" pub --topic "${subj}.plain" --input_format json > /dev/null 2>&1
+    sleep 1
+
     stop_bg "$pid"
 
     grep -qF '{"zebra":1,"apple":2,"mango":3}' "$out" || {
@@ -179,6 +199,14 @@ test_pub_input_format_json() {
     }
     grep -qF '{"apple":2}' "$out" || {
         echo "payload_fields did not filter to just 'apple': $(cat "$out")"
+        return 1
+    }
+    grep -qF '"broken"' "$out" && {
+        echo "malformed JSON was delivered instead of being rejected: $(cat "$out")"
+        return 1
+    }
+    grep -qF '{"trailer":true}' "$out" || {
+        echo "publishing did not recover after malformed JSON lines: $(cat "$out")"
         return 1
     }
 }

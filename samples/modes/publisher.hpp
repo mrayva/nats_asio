@@ -27,8 +27,8 @@ SOFTWARE.
 
 #include "../include/worker.hpp"
 #include "../include/string_utils.hpp"
-#include "../include/fast_json_parser.hpp"
 #include "../include/zerialize_json.hpp"
+#include <simdjson.h>
 #include <nats_asio/nats_asio.hpp>
 #include <nats_asio/compression.hpp>
 #include <nats_asio/http_reader.hpp>
@@ -325,27 +325,39 @@ private:
         std::string payload = line;
 
         if (m_input_cfg.format == input_format::json) {
-            try {
-                auto obj = nlohmann::json::parse(line);
-
-                // Apply subject template if provided
-                if (!m_input_cfg.subject_template.empty()) {
-                    subject = apply_template(m_input_cfg.subject_template, obj);
+            if (m_input_cfg.subject_template.empty() && m_input_cfg.payload_fields.empty()) {
+                // Fast path: nothing needs field access, so just validate
+                // the line is syntactically valid JSON with simdjson instead
+                // of paying for a full nlohmann DOM build only to discard it.
+                // payload is already `line` (set above), unchanged.
+                auto result = m_json_validator.parse(line);
+                if (result.error()) {
+                    m_log->warn("JSON parse error: {} - line: {}",
+                               simdjson::error_message(result.error()), line.substr(0, 50));
+                    co_return;
                 }
+            } else {
+                try {
+                    auto obj = nlohmann::json::parse(line);
 
-                // Only rebuild the payload when actual field filtering was
-                // requested. build_payload(obj, {}) would otherwise just
-                // re-dump the whole object - wasted work since it's already
-                // JSON, and not even a faithful passthrough: nlohmann::json
-                // sorts object keys alphabetically on dump(), so every
-                // publish would silently reorder the input's keys even
-                // though nothing about the payload was meant to change.
-                if (!m_input_cfg.payload_fields.empty()) {
+                    // Apply subject template if provided
+                    if (!m_input_cfg.subject_template.empty()) {
+                        subject = apply_template(m_input_cfg.subject_template, obj);
+                    }
+
+                    // build_payload(obj, {}) would otherwise just re-dump the
+                    // whole object - wasted work since it's already JSON, and
+                    // not even a faithful passthrough: nlohmann::json sorts
+                    // object keys alphabetically on dump(), so every publish
+                    // would silently reorder the input's keys even though
+                    // nothing about the payload was meant to change. The
+                    // fast path above already handles the fields-empty case,
+                    // so payload_fields is guaranteed non-empty here.
                     payload = build_payload(obj, m_input_cfg.payload_fields);
+                } catch (const nlohmann::json::exception& e) {
+                    m_log->warn("JSON parse error: {} - line: {}", e.what(), line.substr(0, 50));
+                    co_return;
                 }
-            } catch (const nlohmann::json::exception& e) {
-                m_log->warn("JSON parse error: {} - line: {}", e.what(), line.substr(0, 50));
-                co_return;
             }
         } else if (m_input_cfg.format == input_format::csv) {
             if (m_input_cfg.csv_headers.empty()) {
@@ -828,6 +840,16 @@ private:
     std::string m_data;
     input_config m_input_cfg;
     input_source_config m_src_cfg;
+    // Validates --input_format json lines when neither --subject_template
+    // nor --payload_fields is set: that's a pure syntax check with the
+    // result immediately discarded, so simdjson (SIMD-accelerated, no
+    // allocation-heavy DOM materialization of values) is a strict win over
+    // building a full nlohmann::json tree just to throw it away. Reused
+    // across calls to avoid re-allocating simdjson's internal buffers per
+    // message; safe unguarded since process_and_publish only ever runs on
+    // m_strand. Templating (inja) and field-filtering still need an actual
+    // nlohmann::json object, so those paths keep using nlohmann::json::parse.
+    simdjson::dom::parser m_json_validator;
     std::optional<binary_format> m_format;
     std::size_t m_msg_number = 0;
     async_input_reader m_input_reader;
