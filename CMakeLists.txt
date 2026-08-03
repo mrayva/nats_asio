@@ -132,13 +132,17 @@ if(NATS_ASIO_BUILD_SAMPLES)
     # which used to leak a yyjson_mut_doc on every failed deserialization
     # when translating any binary format to JSON (msgpack/cbor/flexbuffers/
     # zera -> json, i.e. nats_tool's grub/js_grub/js_fetch --format path
-    # hitting malformed input) - see mrayva/zerialize@031ad92.
+    # hitting malformed input) - see mrayva/zerialize@031ad92. Since then,
+    # further UBSan/ASan findings (null-pointer memcpy/memcmp on empty
+    # buffers in zera, OOB reads in the msgpack/CBOR parsers and Flex
+    # string/key writer) were found and fixed upstream in the same fork -
+    # see mrayva/zerialize@6bc63f4.
     include(FetchContent)
     set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
     FetchContent_Declare(
         zerialize
         GIT_REPOSITORY https://github.com/mrayva/zerialize.git
-        GIT_TAG        031ad920a06a12b6d8fcb6ba1ba01779b71ce52d
+        GIT_TAG        6bc63f4acfcd377a65791798ef6cb64a22f110f9
     )
     FetchContent_MakeAvailable(zerialize)
 
