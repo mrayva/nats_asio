@@ -246,6 +246,152 @@ TEST(emit_message, json_mode_stops_ioc_when_bad_message_threshold_is_exceeded) {
     EXPECT_TRUE(ioc.stopped());
 }
 
+// --- parse_format ------------------------------------------------------
+
+TEST(parse_format, recognizes_all_supported_format_strings) {
+    EXPECT_EQ(parse_format("msgpack"), binary_format::msgpack);
+    EXPECT_EQ(parse_format("cbor"), binary_format::cbor);
+    EXPECT_EQ(parse_format("flexbuffers"), binary_format::flexbuffers);
+    EXPECT_EQ(parse_format("zera"), binary_format::zera);
+}
+
+TEST(parse_format, returns_nullopt_for_unrecognized_strings) {
+    EXPECT_EQ(parse_format(""), std::nullopt);
+    EXPECT_EQ(parse_format("MsgPack"), std::nullopt);  // case-sensitive
+    EXPECT_EQ(parse_format("json"), std::nullopt);     // not a binary format
+    EXPECT_EQ(parse_format("bogus"), std::nullopt);
+}
+
+// --- serialize_from_json / deserialize_to_json ----------------------------
+
+namespace {
+std::string format_name(binary_format f) {
+    switch (f) {
+        case binary_format::msgpack: return "msgpack";
+        case binary_format::cbor: return "cbor";
+        case binary_format::flexbuffers: return "flexbuffers";
+        case binary_format::zera: return "zera";
+    }
+    return "unknown";
+}
+}  // namespace
+
+class binary_format_round_trip : public ::testing::TestWithParam<binary_format> {};
+
+TEST_P(binary_format_round_trip, round_trips_a_json_object_through_the_binary_format) {
+    binary_format format = GetParam();
+    std::string original = R"({"a":1,"b":"hello","c":true,"d":[1,2,3]})";
+
+    auto bytes = serialize_from_json(original, format);
+    ASSERT_TRUE(bytes.has_value());
+    EXPECT_FALSE(bytes->empty());
+
+    std::span<const char> payload(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto json_result = deserialize_to_json(payload, format);
+    ASSERT_TRUE(json_result.has_value());
+
+    // Compare parsed structure rather than raw strings: formats/toolchains
+    // are free to reorder object keys or reformat whitespace, as long as
+    // the actual data round-trips intact.
+    EXPECT_EQ(nlohmann::json::parse(*json_result), nlohmann::json::parse(original));
+}
+
+TEST_P(binary_format_round_trip, deserialize_of_empty_payload) {
+    binary_format format = GetParam();
+    std::string empty;
+    auto result = deserialize_to_json(as_span(empty), format);
+    if (format == binary_format::flexbuffers) {
+        // FlexBuffers represents a zero-length buffer as a valid "null"
+        // root value per the format's own spec, unlike msgpack/cbor/zera
+        // which need at least a type byte to decode anything - so this is
+        // the one format where an empty payload is not an error.
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(*result, "null");
+    } else {
+        EXPECT_FALSE(result.has_value());
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    all_formats, binary_format_round_trip,
+    ::testing::Values(binary_format::msgpack, binary_format::cbor, binary_format::flexbuffers,
+                      binary_format::zera),
+    [](const ::testing::TestParamInfo<binary_format>& info) { return format_name(info.param); });
+
+TEST(serialize_from_json, fails_on_malformed_json_input) {
+    std::string bad_json = "{not valid json";
+    for (auto format : {binary_format::msgpack, binary_format::cbor, binary_format::flexbuffers,
+                        binary_format::zera}) {
+        EXPECT_FALSE(serialize_from_json(bad_json, format).has_value())
+            << "expected failure for format " << format_name(format);
+    }
+}
+
+// --- deserializer_stats -----------------------------------------------------
+
+TEST(deserializer_stats, disabled_thresholds_never_signal_exit) {
+    deserializer_stats stats;  // both thresholds default to 0/0.0 (disabled)
+    for (int i = 0; i < 200; ++i) {
+        EXPECT_FALSE(stats.record_failure());
+    }
+    EXPECT_EQ(stats.total_messages(), 200u);
+    EXPECT_EQ(stats.bad_messages(), 200u);
+}
+
+TEST(deserializer_stats, bad_percentage_is_zero_with_no_messages) {
+    deserializer_stats stats;
+    EXPECT_DOUBLE_EQ(stats.bad_percentage(), 0.0);
+}
+
+TEST(deserializer_stats, percentage_threshold_is_not_checked_before_100_total_messages) {
+    deserializer_stats stats(/*max_bad_messages=*/0, /*max_bad_percentage=*/1.0);
+    // 99 consecutive failures - 100% bad - but total_messages stays below
+    // the 100-message minimum sample size the percentage check requires
+    // (`m_total_messages >= 100`), so it must never signal exit no matter
+    // how bad the ratio is yet.
+    for (int i = 0; i < 99; ++i) {
+        EXPECT_FALSE(stats.record_failure());
+    }
+    EXPECT_EQ(stats.total_messages(), 99u);
+    EXPECT_DOUBLE_EQ(stats.bad_percentage(), 100.0);
+}
+
+TEST(deserializer_stats, percentage_threshold_triggers_once_100_messages_reached_and_ratio_exceeded) {
+    deserializer_stats stats(/*max_bad_messages=*/0, /*max_bad_percentage=*/50.0);
+    for (int i = 0; i < 99; ++i) {
+        EXPECT_FALSE(stats.record_failure());
+    }
+    // 100th message: total_messages hits the 100 minimum and bad_percentage
+    // is 100% (>= 50%), so this call must now signal exit.
+    EXPECT_TRUE(stats.record_failure());
+}
+
+TEST(deserializer_stats, percentage_threshold_does_not_trigger_when_ratio_stays_below_it) {
+    deserializer_stats stats(/*max_bad_messages=*/0, /*max_bad_percentage=*/50.0);
+    for (int i = 0; i < 39; ++i) {
+        EXPECT_FALSE(stats.record_failure());
+    }
+    for (int i = 0; i < 60; ++i) {
+        stats.record_success();
+    }
+    EXPECT_EQ(stats.total_messages(), 99u);
+    // 100th message: 40/100 = 40% bad, below the 50% threshold - must not trigger.
+    EXPECT_FALSE(stats.record_failure());
+    EXPECT_DOUBLE_EQ(stats.bad_percentage(), 40.0);
+}
+
+TEST(deserializer_stats, absolute_threshold_can_trigger_independently_of_percentage_threshold) {
+    // max_bad_messages=5 fires well before the 100-message minimum the
+    // percentage threshold requires, proving the two thresholds are
+    // independent checks - either can trigger on its own.
+    deserializer_stats stats(/*max_bad_messages=*/5, /*max_bad_percentage=*/90.0);
+    for (int i = 0; i < 4; ++i) {
+        EXPECT_FALSE(stats.record_failure());
+    }
+    EXPECT_TRUE(stats.record_failure());
+    EXPECT_EQ(stats.total_messages(), 5u);
+}
+
 // --- dump_file_writer -------------------------------------------------------
 
 TEST(dump_file_writer, falls_back_to_stdout_when_path_is_empty) {
