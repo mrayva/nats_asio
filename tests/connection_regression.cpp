@@ -191,6 +191,90 @@ TEST(connection_callbacks, request_from_message_callback_is_reentrant) {
     EXPECT_TRUE(request_ok.load(std::memory_order_acquire));
 }
 
+// subscribe(..., on_message_zero_copy_cb) had no test coverage anywhere in
+// the repo before this - both the plain path here and the JetStream layer
+// built on top of it (see live_server_regression.cpp's
+// js_zero_copy_subscribe_delivers_correct_payload_and_metadata) were only
+// ever verified by reading the code. This drives it with a real HMSG frame
+// (the plain-message zero-copy path's on_message() counterpart carries no
+// headers at all, since ordinary MSG never does - only HMSG exercises
+// message_view's lazy_headers_view), checking subject/headers/payload all
+// arrive intact through the view rather than the owning message/message_cb
+// paths the rest of this file already covers.
+TEST(connection_callbacks, zero_copy_subscribe_receives_subject_headers_and_payload) {
+    asio::io_context server_ioc;
+    asio::ip::tcp::acceptor acceptor(server_ioc,
+                                     asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    const auto port = acceptor.local_endpoint().port();
+    std::atomic<bool> server_ok{false};
+
+    std::thread server([&] {
+        asio::error_code ec;
+        asio::ip::tcp::socket socket(server_ioc);
+        acceptor.accept(socket, ec);
+        if (ec)
+            return;
+        send_info(socket, ec);
+        asio::streambuf buffer;
+        (void)read_line(socket, buffer, ec); // CONNECT
+        const auto sub = parse_sub(read_line(socket, buffer, ec));
+        if (ec || sub.first != "events")
+            return;
+
+        const std::string headers = "NATS/1.0\r\nX-Test: yes\r\n\r\n";
+        const std::string payload = "zero-copy-payload";
+        const std::string frame =
+            "HMSG events " + sub.second + " " + std::to_string(headers.size()) + " " +
+            std::to_string(headers.size() + payload.size()) + "\r\n" + headers + payload + "\r\n";
+        asio::write(socket, asio::buffer(frame), ec);
+        server_ok.store(!ec, std::memory_order_release);
+    });
+
+    asio::io_context client_ioc;
+    asio::steady_timer watchdog(client_ioc);
+    std::atomic<bool> callback_ok{false};
+    auto conn = create_connection(
+        client_ioc,
+        [&](iconnection& connection) -> asio::awaitable<void> {
+            auto [subscription, status] = co_await connection.subscribe(
+                "events",
+                [&](const message_view& msg) -> asio::awaitable<void> {
+                    const bool header_ok = std::any_of(
+                        msg.headers.begin(), msg.headers.end(), [](const auto& header) {
+                            return header.first == "X-Test" && header.second == "yes";
+                        });
+                    callback_ok.store(
+                        msg.subject == "events" && header_ok &&
+                            std::string(msg.payload.begin(), msg.payload.end()) ==
+                                "zero-copy-payload",
+                        std::memory_order_release);
+                    watchdog.cancel();
+                    connection.stop();
+                    co_return;
+                });
+            if (status.failed())
+                connection.stop();
+            (void)subscription;
+        },
+        [](iconnection&) -> asio::awaitable<void> { co_return; },
+        [](iconnection&, string_view) -> asio::awaitable<void> { co_return; }, std::nullopt);
+
+    connect_config config;
+    config.address = "127.0.0.1";
+    config.port = port;
+    conn->start(config);
+    watchdog.expires_after(std::chrono::seconds(2));
+    watchdog.async_wait([&](const asio::error_code& ec) {
+        if (!ec)
+            conn->stop();
+    });
+    client_ioc.run();
+    server.join();
+
+    EXPECT_TRUE(server_ok.load(std::memory_order_acquire));
+    EXPECT_TRUE(callback_ok.load(std::memory_order_acquire));
+}
+
 TEST(connection_callbacks, request_from_connected_callback_is_reentrant) {
     asio::io_context server_ioc;
     asio::ip::tcp::acceptor acceptor(

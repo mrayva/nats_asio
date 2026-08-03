@@ -1928,6 +1928,10 @@ public:
         return send_ack(msg, "+ACK");
     }
 
+    [[nodiscard]] asio::awaitable<status> ack(const js_message_view& msg) override {
+        return send_ack(msg, "+ACK");
+    }
+
     [[nodiscard]] asio::awaitable<status> ack_batch(
         const std::vector<js_message>& messages) override {
         return send_ack_batch(messages, "+ACK");
@@ -1943,11 +1947,28 @@ public:
         return send_ack(msg, "-NAK");
     }
 
+    [[nodiscard]] asio::awaitable<status> nak(const js_message_view& msg,
+                                               std::chrono::milliseconds delay) override {
+        if (delay.count() > 0) {
+            auto delay_ns = delay.count() * 1000000LL;
+            return send_ack(msg, fmt::format("-NAK {{\"delay\":{}}}", delay_ns));
+        }
+        return send_ack(msg, "-NAK");
+    }
+
     [[nodiscard]] asio::awaitable<status> in_progress(const js_message& msg) override {
         return send_ack(msg, "+WPI");  // Work in Progress
     }
 
+    [[nodiscard]] asio::awaitable<status> in_progress(const js_message_view& msg) override {
+        return send_ack(msg, "+WPI");
+    }
+
     [[nodiscard]] asio::awaitable<status> term(const js_message& msg) override {
+        return send_ack(msg, "+TERM");
+    }
+
+    [[nodiscard]] asio::awaitable<status> term(const js_message_view& msg) override {
         return send_ack(msg, "+TERM");
     }
 
@@ -1957,6 +1978,11 @@ private:
     // coroutine's suspension points. Taking it by value moves it into the
     // coroutine frame, which stays alive for the coroutine's full lifetime.
     asio::awaitable<status> send_ack(const js_message& msg, std::string ack_body);
+    // js_message_view's reply_to is a string_view into the connection's read
+    // buffer, valid only until the delivering on_hmessage() call returns -
+    // callers must co_await this (and so this whole ack) before returning
+    // from their zero-copy callback, same contract as js_message_view itself.
+    asio::awaitable<status> send_ack(const js_message_view& msg, std::string ack_body);
     asio::awaitable<status> send_ack_batch(const std::vector<js_message>& messages,
                                            std::string_view ack_body);
 
@@ -2138,6 +2164,67 @@ inline js_message parse_js_message_metadata(const message& msg) {
             parse_int(value, js_msg.num_pending);
         } else if (key == "Nats-Time-Stamp") {
             js_msg.timestamp = fast_parse_timestamp(value);
+        }
+    }
+
+    return js_msg;
+}
+
+// View-based counterpart of parse_js_message_metadata: same parsing logic,
+// but stream/consumer become string_views (into the reply-to subject, or
+// into the wire buffer for the Nats-* header fallback) instead of owned
+// std::strings, and the header loop is skipped entirely via has_data() when
+// there are no headers to look at (the common case - see the comment above).
+inline js_message_view parse_js_message_metadata_view(const message_view& msg) {
+    js_message_view js_msg;
+    js_msg.msg = msg;
+
+    if (msg.reply_to && msg.reply_to->rfind("$JS.ACK.", 0) == 0) {
+        auto tokens = protocol_parser::split_sv(*msg.reply_to, ".");
+        std::size_t base = 0;
+        if (tokens.size() == 9) {
+            base = 2;
+        } else if (tokens.size() == 12) {
+            base = 4;
+        }
+        if (base != 0) {
+            js_msg.stream = tokens[base];
+            js_msg.consumer = tokens[base + 1];
+            parse_int(tokens[base + 2], js_msg.num_delivered);
+            parse_int(tokens[base + 3], js_msg.stream_sequence);
+            parse_int(tokens[base + 4], js_msg.consumer_sequence);
+            uint64_t ts_ns = 0;
+            if (parse_int(tokens[base + 5], ts_ns)) {
+                js_msg.timestamp = std::chrono::system_clock::time_point(
+                    std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                        std::chrono::nanoseconds(ts_ns)));
+            }
+            parse_int(tokens[base + 6], js_msg.num_pending);
+        }
+    }
+
+    // Nats-* headers, if ever present, take precedence - see
+    // parse_js_message_metadata's comment. has_data() avoids even the lazy
+    // parse when there's nothing to look at.
+    if (msg.headers.has_data()) {
+        for (const auto& [key, value] : msg.headers) {
+            if (key == "Nats-Stream") {
+                js_msg.stream = value;
+            } else if (key == "Nats-Consumer") {
+                js_msg.consumer = value;
+            } else if (key == "Nats-Sequence") {
+                auto space_pos = value.find(' ');
+                if (space_pos != string_view::npos) {
+                    parse_int(value.substr(0, space_pos), js_msg.stream_sequence);
+                    parse_int(value.substr(space_pos + 1), js_msg.consumer_sequence);
+                }
+            } else if (key == "Nats-Num-Delivered") {
+                parse_int(value, js_msg.num_delivered);
+            } else if (key == "Nats-Num-Pending") {
+                parse_int(value, js_msg.num_pending);
+            } else if (key == "Nats-Time-Stamp") {
+                js_msg.timestamp = fast_parse_timestamp(value);
+            }
         }
     }
 
@@ -3164,6 +3251,11 @@ public:
         co_return co_await js_subscribe_impl(config, std::move(cb));
     }
 
+    virtual asio::awaitable<std::pair<ijs_subscription_sptr, status>>
+    js_subscribe(const js_consumer_config& config, on_js_message_zero_copy_cb cb) override {
+        co_return co_await js_subscribe_impl(config, std::move(cb));
+    }
+
     // JetStream fetch (pull consumer)
     virtual asio::awaitable<std::pair<std::vector<js_message>, status>>
     js_fetch(string_view stream, string_view consumer, uint32_t batch,
@@ -3792,6 +3884,60 @@ private:
         }
 
         // Update js_subscription with the underlying subscription
+        js_sub = std::make_shared<js_subscription<SocketType>>(this, consumer_info, underlying_sub);
+
+        co_return std::pair<ijs_subscription_sptr, status>{js_sub, status()};
+    }
+
+    // Zero-copy variant of js_subscribe_impl: identical structure, but
+    // subscribes via on_message_zero_copy_cb (message_view) instead of
+    // on_message_with_headers_cb (message), so no per-message subject/
+    // payload/headers allocation - see js_message_view's own comment.
+    asio::awaitable<std::pair<ijs_subscription_sptr, status>> js_subscribe_impl(
+        const js_consumer_config& config, on_js_message_zero_copy_cb cb) {
+
+        if (!m_is_connected) {
+            co_return std::pair<ijs_subscription_sptr, status>{nullptr, status(error_code::not_connected)};
+        }
+
+        std::string deliver_subject;
+        if (config.deliver_subject) {
+            deliver_subject = *config.deliver_subject;
+        } else {
+            deliver_subject = generate_inbox();
+        }
+
+        auto [consumer_info, create_status] = co_await create_consumer(config, deliver_subject);
+        if (create_status.failed()) {
+            co_return std::pair<ijs_subscription_sptr, status>{nullptr, create_status};
+        }
+
+        auto js_sub = std::make_shared<js_subscription<SocketType>>(this, consumer_info, nullptr);
+
+        on_message_zero_copy_cb zero_copy_callback =
+            [js_sub, cb = std::move(cb)](const message_view& msg) -> asio::awaitable<void> {
+                if (!js_sub->is_active()) {
+                    co_return;
+                }
+
+                auto js_msg = parse_js_message_metadata_view(msg);
+
+                co_await cb(*js_sub, js_msg);
+            };
+
+        auto [underlying_sub, sub_status] = co_await subscribe(
+            deliver_subject,
+            std::move(zero_copy_callback),
+            subscribe_options{
+                .queue_group = config.deliver_group
+                    ? optional<string_view>(*config.deliver_group)
+                    : std::nullopt
+            });
+
+        if (sub_status.failed()) {
+            co_return std::pair<ijs_subscription_sptr, status>{nullptr, sub_status};
+        }
+
         js_sub = std::make_shared<js_subscription<SocketType>>(this, consumer_info, underlying_sub);
 
         co_return std::pair<ijs_subscription_sptr, status>{js_sub, status()};
@@ -5368,6 +5514,22 @@ private:
 template <class SocketType>
 asio::awaitable<status> js_subscription<SocketType>::send_ack(
     const js_message& msg, std::string ack_body) {
+
+    if (!m_active.load()) {
+        co_return status(error_code::invalid_argument, "subscription is not active");
+    }
+
+    if (!msg.msg.reply_to) {
+        co_return status(error_code::invalid_argument, "message has no reply subject for acknowledgment");
+    }
+
+    std::span<const char> payload(ack_body.data(), ack_body.size());
+    co_return co_await m_conn->publish(*msg.msg.reply_to, payload, std::nullopt);
+}
+
+template <class SocketType>
+asio::awaitable<status> js_subscription<SocketType>::send_ack(
+    const js_message_view& msg, std::string ack_body) {
 
     if (!m_active.load()) {
         co_return status(error_code::invalid_argument, "subscription is not active");

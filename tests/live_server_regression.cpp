@@ -335,6 +335,154 @@ asio::awaitable<bool> js_message_metadata_is_populated_from_ack_subject(
     co_return *ok;
 }
 
+// Zero-copy counterpart of js_message_metadata_is_populated_from_ack_subject:
+// same scenario (fresh stream, first delivery, NAK then redelivery/ack), but
+// through js_subscribe's on_js_message_zero_copy_cb overload instead of the
+// owning one. Both the plain message_view zero-copy path this builds on
+// (on_message_zero_copy_cb) and this JetStream-specific layer on top of it
+// had no test coverage before this - this closes both at once, since the JS
+// path can't be exercised without going through the plain one first.
+// Checks the same metadata fields as the owning-path test (proving
+// parse_js_message_metadata_view's token-parsing matches the owning
+// version's), plus the payload itself, which is now a std::span into the
+// connection's read buffer rather than an owned copy - if the zero-copy
+// dispatch ever consumed the buffer before or during the callback instead
+// of only after it returns, this would read garbage or truncated data
+// rather than "hello-metadata-regression-zero-copy".
+asio::awaitable<bool> js_zero_copy_subscribe_delivers_correct_payload_and_metadata(
+    asio::io_context& ioc, const std::string& host, uint16_t port,
+    std::shared_ptr<spdlog::logger> log) {
+    auto conn = nats_asio::connect(ioc, host, port);
+
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    for (int i = 0; i < 100 && !conn->is_connected(); ++i) {
+        timer.expires_after(std::chrono::milliseconds(50));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+    if (!conn->is_connected()) {
+        log->error("could not connect to nats-server");
+        co_return false;
+    }
+
+    const std::string stream = "REGRESSION_JS_METADATA_ZERO_COPY";
+    const std::string subject = "regression.js_metadata_zero_copy.subj";
+    const std::string payload_str = "hello-metadata-regression-zero-copy";
+
+    {
+        std::string create_payload =
+            "{\"name\":\"" + stream + "\",\"subjects\":[\"" + subject +
+            "\"],\"retention\":\"limits\",\"storage\":\"file\",\"num_replicas\":1}";
+        std::span<const char> create_span(create_payload.data(), create_payload.size());
+        auto [resp, s] = co_await conn->request("$JS.API.STREAM.CREATE." + stream, create_span,
+                                                std::chrono::milliseconds(5000));
+        (void)resp;
+        if (s.failed()) {
+            log->error("failed to create stream: {}", s.error());
+            conn->stop();
+            co_return false;
+        }
+    }
+
+    std::span<const char> payload(payload_str.data(), payload_str.size());
+    auto [ack, pub_status] =
+        co_await conn->js_publish(subject, payload, std::chrono::milliseconds(5000), true);
+    if (pub_status.failed()) {
+        log->error("js_publish failed: {}", pub_status.error());
+        conn->stop();
+        co_return false;
+    }
+
+    nats_asio::js_consumer_config config;
+    config.stream = stream;
+    config.filter_subject = subject;
+    config.ack = nats_asio::js_ack_policy::explicit_;
+    config.max_deliver = 5;
+    config.ack_wait = std::chrono::seconds(30);
+
+    auto ok = std::make_shared<bool>(false);
+    auto done = std::make_shared<bool>(false);
+
+    auto [sub, sub_status] = co_await conn->js_subscribe(
+        config,
+        [ok, done, stream, subject, payload_str, log](
+            nats_asio::ijs_subscription& s,
+            const nats_asio::js_message_view& msg) -> asio::awaitable<void> {
+            if (msg.num_delivered <= 1) {
+                bool fields_ok = true;
+                auto check = [&](bool cond, const char* what) {
+                    if (!cond) {
+                        log->error("metadata check failed: {}", what);
+                        fields_ok = false;
+                    }
+                };
+                check(msg.msg.subject == subject, "subject");
+                check(std::string(msg.msg.payload.begin(), msg.msg.payload.end()) == payload_str,
+                     "payload");
+                check(msg.stream == stream, "stream");
+                check(!msg.consumer.empty(), "consumer (server-assigned name)");
+                check(msg.stream_sequence == 1, "stream_sequence == 1");
+                check(msg.consumer_sequence == 1, "consumer_sequence == 1");
+                check(msg.num_delivered == 1, "num_delivered == 1");
+                check(msg.num_pending == 0, "num_pending == 0");
+
+                auto now = std::chrono::system_clock::now();
+                auto age = std::chrono::duration_cast<std::chrono::seconds>(now - msg.timestamp).count();
+                check(age >= -5 && age <= 60, "timestamp is recent (not zero/epoch)");
+
+                if (!fields_ok) {
+                    *done = true;
+                    co_return;
+                }
+
+                auto s2 = co_await s.nak(msg, std::chrono::milliseconds(200));
+                if (s2.failed()) {
+                    log->error("nak failed: {}", s2.error());
+                    *done = true;
+                }
+            } else {
+                if (msg.num_delivered != 2) {
+                    log->error("expected num_delivered == 2 on redelivery, got {}", msg.num_delivered);
+                    *done = true;
+                    co_return;
+                }
+                auto s2 = co_await s.ack(msg);
+                if (s2.failed()) {
+                    log->error("ack failed: {}", s2.error());
+                } else {
+                    *ok = true;
+                }
+                *done = true;
+            }
+            co_return;
+        });
+
+    if (sub_status.failed()) {
+        log->error("js_subscribe failed: {}", sub_status.error());
+        conn->stop();
+        co_return false;
+    }
+
+    for (int i = 0; i < 200 && !*done; ++i) {
+        timer.expires_after(std::chrono::milliseconds(50));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+    if (!*done) {
+        log->error("timed out waiting for redelivery");
+        *ok = false;
+    }
+
+    {
+        std::span<const char> empty;
+        auto [resp, s] = co_await conn->request("$JS.API.STREAM.DELETE." + stream, empty,
+                                                std::chrono::milliseconds(3000));
+        (void)resp;
+        (void)s;
+    }
+
+    conn->stop();
+    co_return *ok;
+}
+
 // kv_get_impl has no CLI mode exposing it (nats_tool has kvcreate/kvupdate/
 // kvkeys/kvhistory/kvpurge/kvrevert but no kvget), so unlike every other KV
 // operation it had zero exercising test anywhere before this - only ever
@@ -800,6 +948,8 @@ int main() {
                       nak_with_delay_survives_the_wait_for_redelivery) && all_ok;
     all_ok = run_case("js_message_metadata_is_populated_from_ack_subject", host, port, log,
                       js_message_metadata_is_populated_from_ack_subject) && all_ok;
+    all_ok = run_case("js_zero_copy_subscribe_delivers_correct_payload_and_metadata", host, port,
+                      log, js_zero_copy_subscribe_delivers_correct_payload_and_metadata) && all_ok;
     all_ok = run_case("kv_get_returns_latest_value_and_reports_missing_keys", host, port, log,
                       kv_get_returns_latest_value_and_reports_missing_keys) && all_ok;
     all_ok = run_case("concurrent_request_and_kv_ops_from_multiple_threads_are_safe", host, port,

@@ -141,6 +141,30 @@ struct js_message {
     std::chrono::system_clock::time_point timestamp;       // message timestamp
 };
 
+// Zero-copy JetStream message view (references internal buffers, valid only
+// during callback execution - same contract as message_view). stream/consumer
+// are views into the delivery's own reply-to subject
+// ($JS.ACK.<stream>.<consumer>...), not copies, so - like msg.payload/headers -
+// building this costs no allocation in the common case (nats-server sends no
+// Nats-* metadata headers on ordinary push-consumer deliveries; see
+// parse_js_message_metadata's comment).
+// WARNING: All data is only valid for the duration of the callback! In
+// particular, ack()/nak()/term()/in_progress() must be called synchronously
+// within that callback, not deferred - there is no zero-copy ack_batch()
+// for the same reason a batch of views can't all stay valid at once (each
+// delivery's buffer region is only guaranteed alive until its own callback
+// returns).
+struct js_message_view {
+    message_view msg;
+    std::string_view stream;
+    std::string_view consumer;
+    uint64_t stream_sequence = 0;
+    uint64_t consumer_sequence = 0;
+    uint64_t num_delivered = 0;
+    uint64_t num_pending = 0;
+    std::chrono::system_clock::time_point timestamp;
+};
+
 // JetStream acknowledgment policy
 enum class js_ack_policy { none, all, explicit_ };
 
@@ -409,6 +433,12 @@ using ijs_subscription_sptr = std::shared_ptr<ijs_subscription>;
 // Callback for JetStream messages
 using on_js_message_cb = std::function<asio::awaitable<void>(ijs_subscription& sub, const js_message& msg)>;
 
+// Zero-copy callback for JetStream messages (references internal buffers).
+// See js_message_view's own warning: ack()/nak()/term()/in_progress() must
+// be called synchronously within this callback.
+using on_js_message_zero_copy_cb =
+    std::function<asio::awaitable<void>(ijs_subscription& sub, const js_message_view& msg)>;
+
 // JetStream subscription interface
 struct ijs_subscription {
     virtual ~ijs_subscription() = default;
@@ -421,20 +451,29 @@ struct ijs_subscription {
 
     // Acknowledge message (mark as processed)
     [[nodiscard]] virtual asio::awaitable<status> ack(const js_message& msg) = 0;
+    [[nodiscard]] virtual asio::awaitable<status> ack(const js_message_view& msg) = 0;
 
-    // Batch acknowledge multiple messages (more efficient than individual acks)
+    // Batch acknowledge multiple messages (more efficient than individual acks).
+    // No js_message_view overload: each delivery's view is only guaranteed
+    // valid until its own callback returns, so a batch of views gathered
+    // across multiple callbacks can't all be valid at once the way a batch
+    // of owned js_message values can.
     [[nodiscard]] virtual asio::awaitable<status> ack_batch(
         const std::vector<js_message>& messages) = 0;
 
     // Negative acknowledge (request redelivery)
     [[nodiscard]] virtual asio::awaitable<status> nak(const js_message& msg,
                                                        std::chrono::milliseconds delay = {}) = 0;
+    [[nodiscard]] virtual asio::awaitable<status> nak(const js_message_view& msg,
+                                                       std::chrono::milliseconds delay = {}) = 0;
 
     // Mark as in-progress (extend ack deadline)
     [[nodiscard]] virtual asio::awaitable<status> in_progress(const js_message& msg) = 0;
+    [[nodiscard]] virtual asio::awaitable<status> in_progress(const js_message_view& msg) = 0;
 
     // Terminate processing (don't redeliver)
     [[nodiscard]] virtual asio::awaitable<status> term(const js_message& msg) = 0;
+    [[nodiscard]] virtual asio::awaitable<status> term(const js_message_view& msg) = 0;
 };
 
 struct subscribe_options {
@@ -781,6 +820,13 @@ struct iconnection {
     // JetStream subscribe (push consumer) - creates/binds consumer and subscribes to delivery subject
     [[nodiscard]] virtual asio::awaitable<std::pair<ijs_subscription_sptr, status>>
     js_subscribe(const js_consumer_config& config, on_js_message_cb cb) = 0;
+
+    // Zero-copy variant: avoids the subject/payload/headers allocation
+    // js_message_cb pays on every delivery. See js_message_view's warning -
+    // the callback must not retain data past its own return, and must call
+    // ack()/nak()/term()/in_progress() synchronously if at all.
+    [[nodiscard]] virtual asio::awaitable<std::pair<ijs_subscription_sptr, status>>
+    js_subscribe(const js_consumer_config& config, on_js_message_zero_copy_cb cb) = 0;
 
     // JetStream fetch (pull consumer) - fetch batch of messages on demand
     [[nodiscard]] virtual asio::awaitable<std::pair<std::vector<js_message>, status>>
