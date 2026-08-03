@@ -197,6 +197,13 @@ if(NATS_ASIO_BUILD_TESTS)
         target_compile_definitions(parser_test PRIVATE FLATBUFFERS_LOCALE_INDEPENDENT=0)
     endif()
 
+    # string_utils.hpp pulls in inja (template rendering), which - like
+    # zerialize above - is only available when samples are built (vcpkg.json's
+    # "samples" feature). Same treatment: its own TU, added conditionally.
+    if(TARGET nats_tool)
+        target_sources(parser_test PRIVATE tests/string_utils_test.cpp)
+    endif()
+
     set_target_properties(parser_test PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests
     )
