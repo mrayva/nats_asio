@@ -1279,6 +1279,20 @@ inline void serialize_headers_to(std::string& out, const headers_t& headers) {
     out += "\r\n";
 }
 
+// Byte length serialize_headers_to() would produce, without building the
+// string - used where only the size is needed (e.g. a max_payload check
+// ahead of the real serialize), so a header-bearing publish doesn't pay for
+// building the wire buffer twice. Must stay in exact sync with
+// serialize_headers_to()'s format.
+inline std::size_t headers_wire_size(const headers_t& headers) {
+    std::size_t size = protocol::nats_hdr_line.size();
+    for (const auto& [key, value] : headers) {
+        size += key.size() + 2 /* ": " */ + value.size() + 2 /* "\r\n" */;
+    }
+    size += 2;  // trailing "\r\n"
+    return size;
+}
+
 // Parse headers from NATS format using StringZilla for SIMD-accelerated search
 inline headers_t parse_headers(string_view data) {
     namespace sz = ashvardanian::stringzilla;
@@ -2983,11 +2997,13 @@ public:
             co_return status(error_code::operation_failed, "circuit breaker is open");
         }
 
-        // Check payload size early
-        pooled_string hdr_data(m_pools.large_strings);
-        serialize_headers_to(*hdr_data, headers);
-        std::size_t hdr_len = hdr_data->size();
-        std::size_t total_len = hdr_len + payload.size();
+        // Check payload size early. publish_impl() (below, via
+        // publish_with_retry_headers()) builds the real header buffer for
+        // the wire write - sizing it here too, via serialize_headers_to(),
+        // would serialize the same headers twice per publish for no reason;
+        // headers_wire_size() gets the same length without building the
+        // string.
+        std::size_t total_len = headers_wire_size(headers) + payload.size();
 
         const auto max_payload = m_max_payload.load(std::memory_order_acquire);
         if (max_payload > 0 && total_len > max_payload) {

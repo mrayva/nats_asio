@@ -264,6 +264,40 @@ TEST(protocol_parser, rejects_invalid_command_prefixes) {
     });
 }
 
+// headers_wire_size() exists purely so publish()'s max_payload pre-check
+// doesn't have to fully serialize headers a second time (publish_impl()
+// does the real serialize for the actual wire write) - it must stay in
+// exact sync with serialize_headers_to()'s output length, or the size
+// check would silently drift from what's actually sent.
+TEST(headers_wire_size, matches_serialize_headers_to_for_no_headers) {
+    headers_t headers;
+    std::string out;
+    serialize_headers_to(out, headers);
+    EXPECT_EQ(headers_wire_size(headers), out.size());
+}
+
+TEST(headers_wire_size, matches_serialize_headers_to_for_a_single_header) {
+    headers_t headers = {{"X-Test", "value"}};
+    std::string out;
+    serialize_headers_to(out, headers);
+    EXPECT_EQ(headers_wire_size(headers), out.size());
+}
+
+TEST(headers_wire_size, matches_serialize_headers_to_for_multiple_headers) {
+    headers_t headers = {{"X-A", "1"}, {"X-B", "22"},
+                         {"X-Really-Long-Header-Name", "a fairly long value here"}};
+    std::string out;
+    serialize_headers_to(out, headers);
+    EXPECT_EQ(headers_wire_size(headers), out.size());
+}
+
+TEST(headers_wire_size, matches_serialize_headers_to_for_empty_key_or_value) {
+    headers_t headers = {{"", "value"}, {"X-Empty", ""}, {"", ""}};
+    std::string out;
+    serialize_headers_to(out, headers);
+    EXPECT_EQ(headers_wire_size(headers), out.size());
+}
+
 TEST(write_queue, tracks_pending_bytes_with_concurrent_producers) {
     constexpr std::size_t producer_count = 4;
     constexpr std::size_t messages_per_producer = 10'000;
