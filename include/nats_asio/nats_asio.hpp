@@ -3433,6 +3433,7 @@ private:
     struct request_state {
         std::atomic<bool> received{false};
         message response;
+        std::shared_ptr<asio::steady_timer> wake_timer;
     };
 
     status parse_js_pub_ack_payload(string_view payload_sv, js_pub_ack& ack) {
@@ -3603,12 +3604,21 @@ private:
         // Create shared state for response
         auto state = std::make_shared<request_state>();
 
-        // Subscribe to inbox with auto-unsubscribe after 1 message
+        // Subscribe to inbox with auto-unsubscribe after 1 message. Cancels
+        // wake_timer below the instant a reply arrives - both this callback
+        // and the wait it wakes run on m_strand (subscribe()'s dispatch for
+        // an on_message_with_headers_cb callback like this one always
+        // co_spawns onto m_strand, and request_impl redirected onto it
+        // above), so there's no race between setting response and the wait
+        // observing it.
         auto [sub, sub_status] = co_await subscribe(
             inbox,
             [state](const message& response) -> asio::awaitable<void> {
                 if (!state->received.exchange(true)) {
                     state->response = response;
+                    if (state->wake_timer) {
+                        state->wake_timer->cancel();
+                    }
                 }
                 co_return;
             },
@@ -3633,26 +3643,21 @@ private:
             co_return std::pair<message, status>{{}, pub_status};
         }
 
-        // Wait for response with timeout using polling
-        asio::steady_timer timer(co_await asio::this_coro::executor);
-        auto deadline = std::chrono::steady_clock::now() + timeout;
+        // Wait for the response: a single timeout-bounded wait, woken early
+        // by the subscribe callback above via wake_timer->cancel() as soon
+        // as the reply arrives, rather than polling and re-checking
+        // received on a fixed interval.
+        state->wake_timer = std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+        state->wake_timer->expires_after(timeout);
+        auto [ec] = co_await state->wake_timer->async_wait(asio::as_tuple(asio::use_awaitable));
 
-        while (!state->received.load()) {
-            auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                co_await unsubscribe(sub);
-                return_inbox(std::move(inbox));
-                co_return std::pair<message, status>{{}, status(error_code::request_timeout)};
-            }
-
-            // Poll every 5ms
-            timer.expires_after(std::chrono::milliseconds(5));
-            auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        if (!state->received.load()) {
+            co_await unsubscribe(sub);
+            return_inbox(std::move(inbox));
             if (ec && ec != asio::error::operation_aborted) {
-                co_await unsubscribe(sub);
-                return_inbox(std::move(inbox));
                 co_return std::pair<message, status>{{}, status(ec.message())};
             }
+            co_return std::pair<message, status>{{}, status(error_code::request_timeout)};
         }
 
         // Return inbox to pool for reuse

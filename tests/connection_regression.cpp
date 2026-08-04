@@ -342,6 +342,99 @@ TEST(connection_callbacks, request_from_connected_callback_is_reentrant) {
     EXPECT_TRUE(request_ok.load(std::memory_order_acquire));
 }
 
+// request_impl() used to wait for a reply by polling state->received every
+// 5ms in a loop; it now uses a single timeout-bounded wait, woken early by
+// the inbox subscribe callback via wake_timer->cancel() when a reply
+// arrives (see the two tests above for that path). This test exercises the
+// other half of that change - the timer's own expiry, when no reply ever
+// comes - and checks two things a polling-loop regression could plausibly
+// break: that it actually returns request_timeout rather than hanging
+// forever waiting on a timer nothing will ever cancel, and that the
+// measured wait lands close to the requested timeout (not near-instant,
+// which would mean the wait isn't really bounded by it).
+TEST(connection_callbacks, request_times_out_promptly_when_no_reply_arrives) {
+    asio::io_context server_ioc;
+    asio::ip::tcp::acceptor acceptor(server_ioc,
+                                     asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    const auto port = acceptor.local_endpoint().port();
+    std::atomic<bool> server_ok{false};
+    std::atomic<bool> client_done{false};
+
+    std::thread server([&] {
+        asio::error_code ec;
+        asio::ip::tcp::socket socket(server_ioc);
+        acceptor.accept(socket, ec);
+        if (ec)
+            return;
+        send_info(socket, ec);
+        asio::streambuf buffer;
+        (void)read_line(socket, buffer, ec); // CONNECT
+        const auto reply_sub = parse_sub(read_line(socket, buffer, ec));
+        const auto request_line = read_line(socket, buffer, ec);
+        (void)read_line(socket, buffer, ec); // empty request payload
+
+        std::istringstream request(request_line);
+        std::string op;
+        std::string subject;
+        std::string reply;
+        std::size_t size = 1;
+        request >> op >> subject >> reply >> size;
+        server_ok.store(!ec && reply_sub.first == reply && subject == "no_replier" && size == 0,
+                        std::memory_order_release);
+        // Deliberately never send a reply - that's the case under test.
+        // Keep the socket (and so the connection) open until the client is
+        // done: closing it here would surface as a disconnect on the
+        // client side, which - independent of the request timeout under
+        // test - can kick off reconnect handling and add unrelated delay
+        // before the client-side coroutine even resumes.
+        while (!client_done.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
+    asio::io_context client_ioc;
+    asio::steady_timer watchdog(client_ioc);
+    std::atomic<bool> timed_out_correctly{false};
+    constexpr auto request_timeout = std::chrono::milliseconds(300);
+    auto conn = create_connection(
+        client_ioc,
+        [&](iconnection& connection) -> asio::awaitable<void> {
+            auto start = std::chrono::steady_clock::now();
+            auto [response, status] = co_await connection.request("no_replier", {}, request_timeout);
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            (void)response;
+            // Generous bounds: must not return near-instantly (proves the
+            // wait was genuinely bounded by the timeout, not short-
+            // circuited by some other path) and must not take drastically
+            // longer (proves it's not silently falling back to polling or
+            // some larger interval).
+            timed_out_correctly.store(
+                status.failed() && elapsed >= request_timeout / 2 &&
+                    elapsed <= request_timeout * 5,
+                std::memory_order_release);
+            client_done.store(true, std::memory_order_release);
+            watchdog.cancel();
+            connection.stop();
+        },
+        [](iconnection&) -> asio::awaitable<void> { co_return; },
+        [](iconnection&, string_view) -> asio::awaitable<void> { co_return; }, std::nullopt);
+
+    connect_config config;
+    config.address = "127.0.0.1";
+    config.port = port;
+    conn->start(config);
+    watchdog.expires_after(std::chrono::seconds(2));
+    watchdog.async_wait([&](const asio::error_code& ec) {
+        if (!ec)
+            conn->stop();
+    });
+    client_ioc.run();
+    server.join();
+
+    EXPECT_TRUE(server_ok.load(std::memory_order_acquire));
+    EXPECT_TRUE(timed_out_correctly.load(std::memory_order_acquire));
+}
+
 TEST(connection_lifecycle, restores_subscription_after_reconnect) {
     asio::io_context server_ioc;
     asio::ip::tcp::acceptor acceptor(server_ioc,
