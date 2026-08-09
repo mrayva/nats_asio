@@ -435,6 +435,25 @@ test_pubkv() {
     echo "$out" | grep -q "k1" && echo "$out" | grep -q "k2"
 }
 
+test_kvkeys_pattern() {
+    # --key doubles as a wildcard pattern for kvkeys (same idea as
+    # `nats kv ls BUCKET "pattern"`): "alice.*" must match only alice's own
+    # sub-keys, not bob's, and not alice's own top-level key.
+    local bucket="${RUN_ID}_kvkeys_pattern"
+    create_kv_bucket "$bucket"
+    printf 'alice.email|a@x.com\nalice.phone|555-1234\nbob.email|b@x.com\nalice|plain\n' \
+        | timeout 5 "$NATS_TOOL" pubkv --bucket "$bucket" > "${WORKDIR}/kvkeys_pattern_seed.log" 2>&1
+
+    local out
+    out=$(timeout 5 "$NATS_TOOL" kvkeys --bucket "$bucket" --key 'alice.*' 2>&1)
+    echo "$out" | grep -q "alice.email" || { echo "missing alice.email: $out"; return 1; }
+    echo "$out" | grep -q "alice.phone" || { echo "missing alice.phone: $out"; return 1; }
+    echo "$out" | grep -q "bob.email" && { echo "pattern leaked bob's key: $out"; return 1; }
+    # bare "alice" has no "." after it, so "alice.*" must not match it either.
+    echo "$out" | grep -qx "alice" && { echo "pattern matched bare 'alice' key: $out"; return 1; }
+    return 0
+}
+
 test_kv_create_update_keys() {
     local bucket="${RUN_ID}_kvcru"
     create_kv_bucket "$bucket"
@@ -583,6 +602,7 @@ run_test "js_grub push consumer" test_js_grub
 run_test "js_fetch pull consumer" test_js_fetch
 run_test "pubkv mode" test_pubkv
 run_test "kvcreate/kvupdate/kvkeys" test_kv_create_update_keys
+run_test "kvkeys wildcard pattern" test_kvkeys_pattern
 run_test "kvhistory/kvrevert/kvpurge" test_kv_history_revert_purge
 run_test "kvwatch mode" test_kvwatch
 run_test "threaded plain publish (--io_shards/--threads)" test_threaded_plain_publish

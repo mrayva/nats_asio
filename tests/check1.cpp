@@ -960,3 +960,55 @@ TEST(kv_entry_parsing, extracts_key_with_embedded_dots) {
 
     EXPECT_EQ(parse_kv_entry_from_message(msg, "mybucket").key, "a.b.c");
 }
+
+// --- validate_kv_pattern -----------------------------------------------
+//
+// Unlike validate_kv_key (a literal key -- '*'/'>' would silently become a
+// wildcard match instead of the exact key someone meant to address), a
+// pattern's whole purpose is wildcard matching, so those characters must be
+// accepted here.
+
+TEST(kv_pattern_validation, accepts_a_plain_literal_key) {
+    EXPECT_TRUE(validate_kv_pattern("alice").empty());
+}
+
+TEST(kv_pattern_validation, accepts_single_token_wildcard) {
+    EXPECT_TRUE(validate_kv_pattern("alice.*").empty());
+}
+
+TEST(kv_pattern_validation, accepts_multi_token_wildcard) {
+    EXPECT_TRUE(validate_kv_pattern("alice.>").empty());
+}
+
+TEST(kv_pattern_validation, accepts_bare_multi_token_wildcard) {
+    EXPECT_TRUE(validate_kv_pattern(">").empty());
+}
+
+TEST(kv_pattern_validation, rejects_empty_pattern) {
+    EXPECT_FALSE(validate_kv_pattern("").empty());
+}
+
+TEST(kv_pattern_validation, rejects_whitespace) {
+    EXPECT_FALSE(validate_kv_pattern("alice .*").empty());
+    EXPECT_FALSE(validate_kv_pattern("alice\t.*").empty());
+}
+
+// --- kv_subject used as a pattern's subjects_filter ----------------------
+//
+// kv_keys_impl builds its subjects_filter via m_kv_cache.kv_subject(bucket,
+// key_pattern) -- plain concatenation, no escaping -- so a pattern's
+// wildcard characters must survive into the filter subject unchanged for
+// JetStream's own subject matching to see them.
+
+TEST(kv_pattern_subject, wildcard_characters_pass_through_unescaped) {
+    EXPECT_EQ(subjects::kv_subject("mybucket", "alice.*"), "$KV.mybucket.alice.*");
+    EXPECT_EQ(subjects::kv_subject("mybucket", "alice.>"), "$KV.mybucket.alice.>");
+}
+
+TEST(kv_pattern_subject, bare_wildcard_matches_kv_wildcard_helper) {
+    // kv_keys(bucket, timeout) (no pattern) delegates to kv_keys_impl(bucket,
+    // ">", timeout) -- confirm that produces the exact same filter subject
+    // as the dedicated kv_wildcard() helper it replaces, so listing "every
+    // key" behaves identically before and after this change.
+    EXPECT_EQ(subjects::kv_subject("mybucket", ">"), subjects::kv_wildcard("mybucket"));
+}

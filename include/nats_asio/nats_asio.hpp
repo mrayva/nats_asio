@@ -2071,6 +2071,24 @@ inline std::string validate_kv_key(string_view key) {
     return {};  // Valid
 }
 
+// Validate a KV key *pattern* (for kv_keys' wildcard-listing overload) --
+// same as validate_kv_key but `*`/`>` are legal here since they're the whole
+// point: a caller passing a pattern wants NATS subject wildcard matching,
+// not a literal key lookup.
+inline std::string validate_kv_pattern(string_view pattern) {
+    if (pattern.empty()) {
+        return "pattern cannot be empty";
+    }
+
+    for (char c : pattern) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            return fmt::format("pattern contains invalid whitespace character: '{}'", pattern);
+        }
+    }
+
+    return {};  // Valid
+}
+
 // Validate KV bucket name
 inline std::string validate_kv_bucket(string_view bucket) {
     if (bucket.empty()) {
@@ -3365,7 +3383,13 @@ public:
     // KV keys (list all keys in bucket)
     virtual asio::awaitable<std::pair<std::vector<std::string>, status>>
     kv_keys(string_view bucket, std::chrono::milliseconds timeout) override {
-        co_return co_await kv_keys_impl(bucket, timeout);
+        co_return co_await kv_keys_impl(bucket, ">", timeout);
+    }
+
+    // KV keys matching a pattern (e.g. "alice.*", "alice.>")
+    virtual asio::awaitable<std::pair<std::vector<std::string>, status>>
+    kv_keys(string_view bucket, string_view key_pattern, std::chrono::milliseconds timeout) override {
+        co_return co_await kv_keys_impl(bucket, key_pattern, timeout);
     }
 
     // KV history (get all revisions of a key)
@@ -4441,12 +4465,16 @@ private:
         co_return std::pair<uint64_t, status>{ack.sequence, status()};
     }
 
-    // KV keys implementation - list all keys in a bucket
+    // KV keys implementation - list keys in a bucket matching a pattern
+    // ("*"/">" wildcards allowed; pass ">" to list every key in the bucket)
     asio::awaitable<std::pair<std::vector<std::string>, status>> kv_keys_impl(
-        string_view bucket, std::chrono::milliseconds timeout) {
+        string_view bucket, string_view key_pattern, std::chrono::milliseconds timeout) {
 
         // Validate bucket
         if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<std::vector<std::string>, status>{{}, status(err)};
+        }
+        if (auto err = validate_kv_pattern(key_pattern); !err.empty()) {
             co_return std::pair<std::vector<std::string>, status>{{}, status(err)};
         }
 
@@ -4457,9 +4485,9 @@ private:
         // Get cached prefixes for this bucket
         auto prefixes = m_kv_cache.get(bucket);
 
-        // Request body with subjects filter to get all subjects (use nlohmann for building)
+        // Request body with subjects filter (use nlohmann for building)
         nlohmann::json req;
-        req["subjects_filter"] = subjects::kv_wildcard(bucket);
+        req["subjects_filter"] = m_kv_cache.kv_subject(bucket, key_pattern);
 
         auto payload_str = req.dump();
         std::span<const char> payload(payload_str.data(), payload_str.size());

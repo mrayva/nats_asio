@@ -883,6 +883,15 @@ struct iconnection {
     kv_keys(string_view bucket,
             std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
 
+    // List keys in a KV bucket matching a NATS subject pattern (e.g. "alice.*"
+    // or "alice.>"), scoped under the bucket the same way a literal key would
+    // be. Unlike a plain key, `*`/`>` are allowed here -- this is the only KV
+    // entry point that treats them as wildcards rather than invalid
+    // characters. Returns vector of key names (without the $KV.bucket. prefix).
+    [[nodiscard]] virtual asio::awaitable<std::pair<std::vector<std::string>, status>>
+    kv_keys(string_view bucket, string_view key_pattern,
+            std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
     // Get full history for a key (all revisions)
     // Returns vector of kv_entry in chronological order (oldest first)
     [[nodiscard]] virtual asio::awaitable<std::pair<std::vector<kv_entry>, status>>

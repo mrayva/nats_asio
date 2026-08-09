@@ -239,11 +239,15 @@ public:
     kv_keys_runner(asio::io_context& ioc, std::shared_ptr<spdlog::logger> console,
                    std::atomic<bool>& operation_failed, const mode_context& ctx)
         : mode_runner(ioc, console, operation_failed), m_kv_bucket(ctx.kv_bucket),
-          m_kv_timeout_ms(ctx.kv_timeout_ms) {}
+          m_kv_pattern(ctx.kv_key), m_kv_timeout_ms(ctx.kv_timeout_ms) {}
 
     asio::awaitable<void> on_connected(nats_asio::iconnection_sptr conn) override {
-        auto [keys, s] = co_await conn->kv_keys(m_kv_bucket,
-                                                std::chrono::milliseconds(m_kv_timeout_ms));
+        // --key doubles as an optional wildcard pattern here (e.g. "test.*",
+        // "alice.>") -- same as `nats kv ls BUCKET "pattern"`; omitted means
+        // every key in the bucket.
+        auto [keys, s] = m_kv_pattern.empty()
+            ? co_await conn->kv_keys(m_kv_bucket, std::chrono::milliseconds(m_kv_timeout_ms))
+            : co_await conn->kv_keys(m_kv_bucket, m_kv_pattern, std::chrono::milliseconds(m_kv_timeout_ms));
         if (s.failed()) {
             m_console->error("kv_keys failed: {}", s.error());
             m_operation_failed.store(true, std::memory_order_release);
@@ -258,6 +262,7 @@ public:
 
 private:
     std::string m_kv_bucket;
+    std::string m_kv_pattern;
     int m_kv_timeout_ms;
 };
 
