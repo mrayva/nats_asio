@@ -871,3 +871,92 @@ TEST(connection_lifecycle, drain_closes_connection_from_outside_strand) {
     EXPECT_TRUE(server_observed_close.load(std::memory_order_relaxed));
     EXPECT_FALSE(conn->is_connected());
 }
+
+// --- parse_kv_entry_from_message: kv_watch's revision extraction -----------
+// Regression coverage for a real bug found downstream (multi_index_lru's
+// iceoryx2 cache POC, using kv_watch-delivered revisions to distinguish a
+// consumer's own write echoed back through its own watch subscription from a
+// genuinely new external write): nats-server does not attach
+// Nats-Sequence/Nats-Time-Stamp headers to ordinary push-consumer deliveries
+// (only to JetStream Direct Get responses, which kv_get uses) - this used to
+// leave kv_entry::revision at its default (0) for every single kv_watch
+// event, silently breaking any revision comparison built on top of it. Fixed
+// to parse the stream sequence out of the JetStream ACK reply-to subject
+// instead, which - unlike the headers - is always present on a
+// push-consumer delivery. See parse_js_message_metadata's comment for the
+// exact subject shape this parses:
+//   no domain:   $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<tm_ns>.<pending>
+//   with domain: $JS.ACK.<domain>.<accthash>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<tm_ns>.<pending>.<token>
+
+TEST(kv_entry_parsing, extracts_revision_from_ack_reply_to_subject_no_domain) {
+    message msg;
+    msg.subject = subjects::kv_subject("mybucket", "mykey");
+    msg.reply_to = "$JS.ACK.KV_mybucket.consumer1.1.42.7.1700000000000000000.0";
+    msg.payload = {'h', 'i'};
+
+    auto entry = parse_kv_entry_from_message(msg, "mybucket");
+    EXPECT_EQ(entry.bucket, "mybucket");
+    EXPECT_EQ(entry.key, "mykey");
+    EXPECT_EQ(entry.revision, 42u);
+    EXPECT_EQ(std::string(entry.value.begin(), entry.value.end()), "hi");
+}
+
+TEST(kv_entry_parsing, extracts_revision_from_ack_reply_to_subject_with_domain) {
+    message msg;
+    msg.subject = subjects::kv_subject("mybucket", "mykey");
+    msg.reply_to = "$JS.ACK.mydomain.abc123.KV_mybucket.consumer1.1.99.3.1700000000000000000.0.tok";
+    msg.payload = {'x'};
+
+    auto entry = parse_kv_entry_from_message(msg, "mybucket");
+    EXPECT_EQ(entry.revision, 99u);
+}
+
+TEST(kv_entry_parsing, revision_stays_zero_without_a_recognized_reply_to) {
+    message no_reply_msg;
+    no_reply_msg.subject = subjects::kv_subject("mybucket", "mykey");
+    no_reply_msg.payload = {'x'};
+    EXPECT_EQ(parse_kv_entry_from_message(no_reply_msg, "mybucket").revision, 0u);
+
+    message unrelated_reply_msg;
+    unrelated_reply_msg.subject = subjects::kv_subject("mybucket", "mykey");
+    unrelated_reply_msg.reply_to = "some.unrelated.subject";
+    unrelated_reply_msg.payload = {'x'};
+    EXPECT_EQ(parse_kv_entry_from_message(unrelated_reply_msg, "mybucket").revision, 0u);
+}
+
+TEST(kv_entry_parsing, nats_sequence_header_takes_precedence_over_reply_to_subject) {
+    // Guards the explicit precedence order the fix's comment documents: if a
+    // future server version (or an intermediary) ever does add Nats-Sequence
+    // headers to ordinary deliveries, that more-explicit source must win
+    // over the subject-derived value, not be silently shadowed by it.
+    message msg;
+    msg.subject = subjects::kv_subject("mybucket", "mykey");
+    msg.reply_to = "$JS.ACK.KV_mybucket.consumer1.1.42.7.1700000000000000000.0";
+    msg.headers.push_back({"Nats-Sequence", "1234"});
+    msg.payload = {'x'};
+
+    EXPECT_EQ(parse_kv_entry_from_message(msg, "mybucket").revision, 1234u);
+}
+
+TEST(kv_entry_parsing, kv_operation_header_selects_delete_and_purge) {
+    message put_msg;
+    put_msg.subject = subjects::kv_subject("b", "k");
+    EXPECT_EQ(parse_kv_entry_from_message(put_msg, "b").op, kv_entry::operation::put);
+
+    message del_msg;
+    del_msg.subject = subjects::kv_subject("b", "k");
+    del_msg.headers.push_back({"KV-Operation", "DEL"});
+    EXPECT_EQ(parse_kv_entry_from_message(del_msg, "b").op, kv_entry::operation::del);
+
+    message purge_msg;
+    purge_msg.subject = subjects::kv_subject("b", "k");
+    purge_msg.headers.push_back({"KV-Operation", "PURGE"});
+    EXPECT_EQ(parse_kv_entry_from_message(purge_msg, "b").op, kv_entry::operation::purge);
+}
+
+TEST(kv_entry_parsing, extracts_key_with_embedded_dots) {
+    message msg;
+    msg.subject = subjects::kv_subject("mybucket", "a.b.c");
+
+    EXPECT_EQ(parse_kv_entry_from_message(msg, "mybucket").key, "a.b.c");
+}

@@ -480,7 +480,19 @@ test_kvwatch() {
     timeout 5 "$NATS_TOOL" kvcreate --bucket "$bucket" --key wk --value wv > /dev/null 2>&1
     sleep 1.5
     stop_bg "$pid"
-    grep -q "wk" "$out"
+    grep -q "wk" "$out" || return 1
+
+    # Regression check: kv_watch events used to always report rev=0 (see
+    # parse_kv_entry_from_message's fix in nats_asio.hpp -- nats-server
+    # doesn't attach Nats-Sequence headers to ordinary consumer deliveries,
+    # only to Direct Get responses, so the revision has to come from the
+    # JetStream ACK reply-to subject instead). A real write must report a
+    # nonzero revision end to end, not just in the unit-level parser test.
+    local line
+    line=$(grep "wk" "$out" | head -1)
+    local rev
+    rev=$(echo "$line" | grep -oP 'rev=\K[0-9]+')
+    [[ -n "$rev" && "$rev" -gt 0 ]]
 }
 
 # --- Concurrency stress -----------------------------------------------------

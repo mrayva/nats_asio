@@ -2103,7 +2103,36 @@ inline kv_entry parse_kv_entry_from_message(const message& msg, string_view buck
         entry.key = msg.subject.substr(prefix.size());
     }
 
-    // Parse metadata from headers
+    // Revision/timestamp: nats-server does not attach Nats-Sequence/
+    // Nats-Time-Stamp headers to ordinary consumer deliveries (only to
+    // JetStream Direct Get responses, which kv_get_impl uses) - the reply-to
+    // subject is the always-present carrier for a push-consumer delivery
+    // like kv_watch's, so parse it from there first. See
+    // parse_js_message_metadata's comment for the exact subject shape.
+    if (msg.reply_to && msg.reply_to->rfind("$JS.ACK.", 0) == 0) {
+        auto tokens = protocol_parser::split_sv(*msg.reply_to, ".");
+        std::size_t base = 0;
+        if (tokens.size() == 9) {
+            base = 2;
+        } else if (tokens.size() == 12) {
+            base = 4;
+        }
+        if (base != 0) {
+            parse_int(tokens[base + 3], entry.revision);
+            uint64_t ts_ns = 0;
+            if (parse_int(tokens[base + 5], ts_ns)) {
+                entry.created = std::chrono::system_clock::time_point(
+                    std::chrono::duration_cast<std::chrono::system_clock::duration>(std::chrono::nanoseconds(ts_ns)));
+            }
+        }
+    }
+
+    // KV-Operation is set by the publishing client at publish time, so
+    // unlike Nats-Sequence/Nats-Time-Stamp it's part of the stored message
+    // and does arrive in msg.headers on redelivery. Nats-Sequence/
+    // Nats-Time-Stamp headers, if ever present (e.g. a future server version
+    // or an intermediary that adds them), take precedence over the
+    // subject-derived values above since they're the more explicit source.
     for (const auto& [key, value] : msg.headers) {
         if (key == "Nats-Sequence") {
             parse_int(value, entry.revision);
