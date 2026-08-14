@@ -30,6 +30,8 @@ SOFTWARE.
 #include <zerialize/protocols/cbor.hpp>
 #include <zerialize/protocols/flex.hpp>
 #include <zerialize/protocols/zera.hpp>
+#include <zerialize/protocols/bson.hpp>
+#include <zerialize/protocols/ion.hpp>
 #include <span>
 #include <string>
 #include <optional>
@@ -42,7 +44,9 @@ enum class binary_format {
     msgpack,
     cbor,
     flexbuffers,
-    zera
+    zera,
+    bson,
+    ion
 };
 
 // Parse format string to enum
@@ -51,6 +55,8 @@ inline std::optional<binary_format> parse_format(const std::string& fmt_str) {
     if (fmt_str == "cbor") return binary_format::cbor;
     if (fmt_str == "flexbuffers") return binary_format::flexbuffers;
     if (fmt_str == "zera") return binary_format::zera;
+    if (fmt_str == "bson") return binary_format::bson;
+    if (fmt_str == "ion") return binary_format::ion;
     return std::nullopt;
 }
 
@@ -83,6 +89,16 @@ inline std::optional<std::string> deserialize_to_json(
             }
             case binary_format::zera: {
                 zerialize::Zera::Deserializer src(bytes);
+                auto json = zerialize::translate<zerialize::JSON>(src);
+                return json.to_string(false);
+            }
+            case binary_format::bson: {
+                zerialize::Bson::Deserializer src(bytes);
+                auto json = zerialize::translate<zerialize::JSON>(src);
+                return json.to_string(false);
+            }
+            case binary_format::ion: {
+                zerialize::Ion::Deserializer src(bytes);
                 auto json = zerialize::translate<zerialize::JSON>(src);
                 return json.to_string(false);
             }
@@ -130,6 +146,10 @@ inline std::optional<std::vector<std::byte>> serialize_from_json(
                 return to_bytes(serialize_as.template operator()<zerialize::Flex>());
             case binary_format::zera:
                 return to_bytes(serialize_as.template operator()<zerialize::Zera>());
+            case binary_format::bson:
+                return to_bytes(serialize_as.template operator()<zerialize::Bson>());
+            case binary_format::ion:
+                return to_bytes(serialize_as.template operator()<zerialize::Ion>());
         }
     } catch (const std::exception& e) {
         if (log) {

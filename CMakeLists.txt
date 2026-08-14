@@ -137,11 +137,10 @@ if(NATS_ASIO_BUILD_SAMPLES)
     # buffers in zera, OOB reads in the msgpack/CBOR parsers and Flex
     # string/key writer) were found and fixed upstream in the same fork -
     # see mrayva/zerialize@6bc63f4. Pinned at v1.2.0 (13f6383), which also
-    # adds BSON and Ion backends and bumps flatbuffers/msgpack-c pins -
-    # neither new backend is wired into nats_tool yet (it only exposes
-    # msgpack/cbor/flexbuffers/zera as --format choices; BEVE remains
-    # unavailable here regardless, since it requires C++23 and this project
-    # targets C++20).
+    # adds BSON and Ion backends, both wired in as --format choices
+    # (msgpack/cbor/flexbuffers/zera/bson/ion), and bumps flatbuffers/
+    # msgpack-c pins. BEVE remains unavailable here regardless, since it
+    # requires C++23 and this project targets C++20.
     include(FetchContent)
     set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
     FetchContent_Declare(
