@@ -32,6 +32,7 @@ SOFTWARE.
 #include <zerialize/protocols/zera.hpp>
 #include <zerialize/protocols/bson.hpp>
 #include <zerialize/protocols/ion.hpp>
+#include <zerialize/protocols/beve.hpp>
 #include <span>
 #include <string>
 #include <optional>
@@ -46,7 +47,8 @@ enum class binary_format {
     flexbuffers,
     zera,
     bson,
-    ion
+    ion,
+    beve
 };
 
 // Parse format string to enum
@@ -57,6 +59,7 @@ inline std::optional<binary_format> parse_format(const std::string& fmt_str) {
     if (fmt_str == "zera") return binary_format::zera;
     if (fmt_str == "bson") return binary_format::bson;
     if (fmt_str == "ion") return binary_format::ion;
+    if (fmt_str == "beve") return binary_format::beve;
     return std::nullopt;
 }
 
@@ -99,6 +102,11 @@ inline std::optional<std::string> deserialize_to_json(
             }
             case binary_format::ion: {
                 zerialize::Ion::Deserializer src(bytes);
+                auto json = zerialize::translate<zerialize::JSON>(src);
+                return json.to_string(false);
+            }
+            case binary_format::beve: {
+                zerialize::Beve::Deserializer src(bytes);
                 auto json = zerialize::translate<zerialize::JSON>(src);
                 return json.to_string(false);
             }
@@ -150,6 +158,8 @@ inline std::optional<std::vector<std::byte>> serialize_from_json(
                 return to_bytes(serialize_as.template operator()<zerialize::Bson>());
             case binary_format::ion:
                 return to_bytes(serialize_as.template operator()<zerialize::Ion>());
+            case binary_format::beve:
+                return to_bytes(serialize_as.template operator()<zerialize::Beve>());
         }
     } catch (const std::exception& e) {
         if (log) {

@@ -256,7 +256,7 @@ int main(int argc, char* argv[]) {
         ("raw", "Output raw payload only (grub/js_grub mode)")
         ("dump", "Dump messages to file (grub/js_grub mode)", cxxopts::value<std::string>())
         ("json", "Output messages as JSON (grub/js_grub mode)")
-        ("format", "Binary format: msgpack, cbor, flexbuffers, zera, bson, ion (grub/js_grub/js_fetch/pub mode)", cxxopts::value<std::string>())
+        ("format", "Binary format: msgpack, cbor, flexbuffers, zera, bson, ion, beve (grub/js_grub/js_fetch/pub mode)", cxxopts::value<std::string>())
         ("max_bad_messages", "Exit after N failed deserializations (default: 0 = disabled)", cxxopts::value<std::size_t>())
         ("max_bad_percentage", "Exit if bad message percentage exceeds threshold (default: 0 = disabled)", cxxopts::value<double>())
         ("translate", "Transform payload through external command (supports {{Subject}})", cxxopts::value<std::string>())
@@ -719,7 +719,7 @@ int main(int argc, char* argv[]) {
             std::string fmt_str = result["format"].as<std::string>();
             binary_fmt = nats_tool::parse_format(fmt_str);
             if (!binary_fmt) {
-                console->error("Invalid format '{}'. Valid formats: msgpack, cbor, flexbuffers, zera, bson, ion", fmt_str);
+                console->error("Invalid format '{}'. Valid formats: msgpack, cbor, flexbuffers, zera, bson, ion, beve", fmt_str);
                 return 1;
             }
         }

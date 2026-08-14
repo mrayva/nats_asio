@@ -22,7 +22,7 @@ project(nats_asio
     LANGUAGES CXX
 )
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -105,7 +105,7 @@ target_link_libraries(nats_asio
         libzip::zip
 )
 
-target_compile_features(nats_asio INTERFACE cxx_std_20)
+target_compile_features(nats_asio INTERFACE cxx_std_23)
 
 # Samples
 if(NATS_ASIO_BUILD_SAMPLES)
@@ -137,10 +137,21 @@ if(NATS_ASIO_BUILD_SAMPLES)
     # buffers in zera, OOB reads in the msgpack/CBOR parsers and Flex
     # string/key writer) were found and fixed upstream in the same fork -
     # see mrayva/zerialize@6bc63f4. Pinned at v1.2.0 (13f6383), which also
-    # adds BSON and Ion backends, both wired in as --format choices
-    # (msgpack/cbor/flexbuffers/zera/bson/ion), and bumps flatbuffers/
-    # msgpack-c pins. BEVE remains unavailable here regardless, since it
-    # requires C++23 and this project targets C++20.
+    # adds BSON and Ion backends, and bumps flatbuffers/msgpack-c pins. All
+    # six of msgpack/cbor/flexbuffers/zera/bson/ion are wired in as
+    # --format choices.
+    #
+    # BEVE (via glaze) is also wired in, but needs its own explanation:
+    # zerialize gates it behind ZERIALIZE_ENABLE_BEVE (default OFF) because
+    # enabling it links glaze, which requires C++23 and would otherwise
+    # force that standard on every consumer of the zerialize target
+    # whether they use BEVE or not. This project bumped its own baseline
+    # from C++20 to C++23 project-wide to take BEVE on deliberately (see
+    # CMAKE_CXX_STANDARD/target_compile_features(nats_asio ...) above) -
+    # verified with a from-scratch build + full test suite + a live
+    # NATS pub/grub round trip before committing to the bump, since it
+    # affects the whole ASIO-coroutine codebase, not just this glue code.
+    set(ZERIALIZE_ENABLE_BEVE ON CACHE BOOL "Enable BEVE (via glaze) for nats_tool's --format" FORCE)
     include(FetchContent)
     set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
     FetchContent_Declare(

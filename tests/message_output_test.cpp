@@ -255,6 +255,7 @@ TEST(parse_format, recognizes_all_supported_format_strings) {
     EXPECT_EQ(parse_format("zera"), binary_format::zera);
     EXPECT_EQ(parse_format("bson"), binary_format::bson);
     EXPECT_EQ(parse_format("ion"), binary_format::ion);
+    EXPECT_EQ(parse_format("beve"), binary_format::beve);
 }
 
 TEST(parse_format, returns_nullopt_for_unrecognized_strings) {
@@ -275,6 +276,7 @@ std::string format_name(binary_format f) {
         case binary_format::zera: return "zera";
         case binary_format::bson: return "bson";
         case binary_format::ion: return "ion";
+        case binary_format::beve: return "beve";
     }
     return "unknown";
 }
@@ -319,13 +321,15 @@ TEST_P(binary_format_round_trip, deserialize_of_empty_payload) {
 INSTANTIATE_TEST_SUITE_P(
     all_formats, binary_format_round_trip,
     ::testing::Values(binary_format::msgpack, binary_format::cbor, binary_format::flexbuffers,
-                      binary_format::zera, binary_format::bson, binary_format::ion),
+                      binary_format::zera, binary_format::bson, binary_format::ion,
+                      binary_format::beve),
     [](const ::testing::TestParamInfo<binary_format>& info) { return format_name(info.param); });
 
 TEST(serialize_from_json, fails_on_malformed_json_input) {
     std::string bad_json = "{not valid json";
     for (auto format : {binary_format::msgpack, binary_format::cbor, binary_format::flexbuffers,
-                        binary_format::zera, binary_format::bson, binary_format::ion}) {
+                        binary_format::zera, binary_format::bson, binary_format::ion,
+                        binary_format::beve}) {
         EXPECT_FALSE(serialize_from_json(bad_json, format).has_value())
             << "expected failure for format " << format_name(format);
     }
