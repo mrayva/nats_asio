@@ -136,13 +136,18 @@ if(NATS_ASIO_BUILD_SAMPLES)
     # further UBSan/ASan findings (null-pointer memcpy/memcmp on empty
     # buffers in zera, OOB reads in the msgpack/CBOR parsers and Flex
     # string/key writer) were found and fixed upstream in the same fork -
-    # see mrayva/zerialize@6bc63f4.
+    # see mrayva/zerialize@6bc63f4. Pinned at v1.2.0 (13f6383), which also
+    # adds BSON and Ion backends and bumps flatbuffers/msgpack-c pins -
+    # neither new backend is wired into nats_tool yet (it only exposes
+    # msgpack/cbor/flexbuffers/zera as --format choices; BEVE remains
+    # unavailable here regardless, since it requires C++23 and this project
+    # targets C++20).
     include(FetchContent)
     set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
     FetchContent_Declare(
         zerialize
         GIT_REPOSITORY https://github.com/mrayva/zerialize.git
-        GIT_TAG        6bc63f4acfcd377a65791798ef6cb64a22f110f9
+        GIT_TAG        13f6383043a47231a097a5a9bee14f2b332f67f7
     )
     FetchContent_MakeAvailable(zerialize)
 
