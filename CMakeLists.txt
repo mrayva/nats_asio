@@ -138,10 +138,9 @@ if(NATS_ASIO_BUILD_SAMPLES)
     # string/key writer) were found and fixed upstream in the same fork -
     # see mrayva/zerialize@6bc63f4. Pinned at v1.2.0 (13f6383), which also
     # adds BSON and Ion backends, and bumps flatbuffers/msgpack-c pins. All
-    # six of msgpack/cbor/flexbuffers/zera/bson/ion are wired in as
-    # --format choices.
-    #
-    # BEVE (via glaze) is also wired in, but needs its own explanation:
+    # seven backends zerialize offers - msgpack/cbor/flexbuffers/zera/bson/
+    # ion/beve - are wired in as --format choices; BEVE needs its own
+    # explanation:
     # zerialize gates it behind ZERIALIZE_ENABLE_BEVE (default OFF) because
     # enabling it links glaze, which requires C++23 and would otherwise
     # force that standard on every consumer of the zerialize target

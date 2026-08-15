@@ -99,12 +99,17 @@ simdjson
 zlib (for gzip decompression)
 zstd (for zstd decompression)
 libzip (for ZIP archive extraction)
+concurrentqueue (moodycamel::ConcurrentQueue, lock-free queues)
+gtl (LRU cache for subject templates)
+magic-enum (enum-to-string conversion)
+stringzilla (SIMD-accelerated string operations)
 ```
 
 ### nats_tool
 ```
 cxxopts
 mimalloc
+inja (templating for --subject_template)
 ```
 [zerialize](https://github.com/mrayva/zerialize) (and, transitively, glaze
 for BEVE) power `--format` and are fetched automatically via CMake
