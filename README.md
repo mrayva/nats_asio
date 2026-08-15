@@ -1,7 +1,7 @@
 # nats-asio
 
 ## Overview
-This is a high-performance [NATS](https://nats.io/) client written in C++20 using [ASIO](https://think-async.com/Asio/) coroutines. This fork includes extensive performance optimizations and feature additions for production use.
+This is a high-performance [NATS](https://nats.io/) client written in C++23 using [ASIO](https://think-async.com/Asio/) coroutines. This fork includes extensive performance optimizations and feature additions for production use.
 
 **Original project**: [antlad/nats_asio](https://github.com/antlad/nats_asio)
 **This fork**: Adds JetStream support, HTTP streaming, batch publishing, performance optimizations, and a feature-rich CLI tool.
@@ -9,7 +9,7 @@ This is a high-performance [NATS](https://nats.io/) client written in C++20 usin
 ## Key Features
 
 ### Core Library
-- **Header-only C++20 NATS client** using standalone ASIO coroutines
+- **Header-only C++23 NATS client** using standalone ASIO coroutines
 - **JetStream support** with publish, subscribe, ACK handling, and KV operations
 - **High-performance optimizations**: simdjson parsing, SIMD string operations, zero-copy buffers
 - **Compression support**: zstd compression for messages
@@ -57,6 +57,21 @@ A comprehensive command-line tool for NATS operations with extensive JetStream s
 - **json**: JSON objects with field templating (`--subject_template`, `--payload_fields`)
 - **csv**: CSV with header support (`--csv_headers`)
 
+#### Binary Payload Formats
+
+`--format` converts NATS message payloads between JSON and a compact binary
+wire format, via [zerialize](https://github.com/mrayva/zerialize) (fetched
+automatically at configure time — no separate install step). On `pub`, the
+input JSON is serialized to the chosen format before publishing; on
+`grub`/`js_grub`/`js_fetch`, the binary payload is deserialized back to JSON
+before output.
+
+- **msgpack**, **cbor**, **flexbuffers**, **zera**, **bson**, **ion**, **beve**
+
+BEVE is the one format with a real cost: it depends on
+[glaze](https://github.com/stephenberry/glaze), which requires a C++23
+compiler — this project targets C++23 project-wide specifically to support it.
+
 #### Performance Features
 - **JetStream sliding window**: Batch ACKs with configurable window size (`--js_window`)
 - **Automatic retry**: Retry timed-out messages (`--js_max_retries`)
@@ -91,6 +106,9 @@ libzip (for ZIP archive extraction)
 cxxopts
 mimalloc
 ```
+[zerialize](https://github.com/mrayva/zerialize) (and, transitively, glaze
+for BEVE) power `--format` and are fetched automatically via CMake
+`FetchContent` — no separate install step.
 
 ### Tests
 ```
@@ -161,6 +179,21 @@ cat data.csv | ./nats_tool pub \
   --input_format csv \
   --csv_headers "symbol,price,volume" \
   --subject_template "quotes.{{symbol}}"
+```
+
+### Binary Payload Formats
+```bash
+# Publish JSON as a compact binary format
+echo '{"symbol":"AAPL","price":150.5}' | ./nats_tool pub --topic quotes.AAPL --format msgpack
+
+# Any of: msgpack, cbor, flexbuffers, zera, bson, ion, beve
+echo '{"symbol":"TSLA","price":245.75}' | ./nats_tool pub --topic quotes.TSLA --format bson
+
+# Subscribe and decode binary payloads back to JSON
+./nats_tool grub --topic "quotes.>" --format msgpack --json
+
+# JetStream fetch with binary decoding
+./nats_tool js_fetch --stream mystream --consumer myconsumer --format bson --json
 ```
 
 ### File Input with Follow Mode
