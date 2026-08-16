@@ -82,7 +82,7 @@ compiler — this project targets C++23 project-wide specifically to support it.
 
 #### Output Options
 - **Raw payload**: Output message payload only (`--raw`)
-- **JSON output**: Structured JSON output (`--json`)
+- **JSON output**: Structured JSON output (`--json`). With `--format`, a successfully-decoded binary payload is written bare (just the decoded JSON) unless a message also has a timestamp, reply-to, or headers to show — those force the `{"subject":...,"payload":...}` envelope form, with `"timestamp"`/`"reply_to"`/`"headers"` added only when actually present (`--timestamp` shows the first; the other two come from the message itself, no flag needed)
 - **Dump to file**: Save messages to file (`--dump`)
 - **Transform**: Pipe payload through external command (`--translate`)
 
@@ -294,6 +294,9 @@ Input safety defaults:
 
 # Output as JSON
 ./nats_tool grub --topic "events.*" --json
+
+# JSON with timestamp and any message headers (e.g. {"timestamp":"...","subject":"events.new","headers":{"X-Trace-Id":"..."},"payload":...})
+./nats_tool grub --topic "events.*" --json --timestamp
 
 # Dump to file
 ./nats_tool grub --topic "logs.>" --dump /tmp/logs.txt

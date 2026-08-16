@@ -97,17 +97,18 @@ jobs:
       # previous version of this file didn't even build nats_tool for the
       # sanitizer entries, so ASan/TSan never saw its code paths at all (that's
       # exactly the gap that let a real nak() use-after-free ship undetected
-      # until it was found by hand). New and informational for now: doesn't
-      # block CI on failure.
+      # until it was found by hand). Was informational (continue-on-error)
+      # while new; promoted to blocking after confirming a clean run history
+      # (8+ consecutive green runs since introduction, spot-checked both the
+      # oldest and newest available at promotion time).
       - name: Start NATS server for integration tests
         if: matrix.tests == 'ON'
         run: |
           docker run -d --name nats-integration -p 4222:4222 -p 8222:8222 nats:latest -js -m 8222
           timeout 30 bash -c 'until curl -sf http://localhost:8222/varz > /dev/null; do sleep 1; done'
 
-      - name: Integration tests (informational)
+      - name: Integration tests
         if: matrix.tests == 'ON'
-        continue-on-error: true
         env:
           ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
