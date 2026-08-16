@@ -168,13 +168,22 @@ if(NATS_ASIO_BUILD_SAMPLES)
     # call, for every protocol) - translate<JSON>() is exactly what
     # zerialize_json.hpp's deserialize_to_json() calls on every --format
     # --json message, across all 7 wire formats.
+    #
+    # fd4710e adds zerialize::expand_columnar()/collapse_columnar() - row
+    # <-> columnar (SoA) shape conversion, format-agnostic like translate<>().
+    # deserialize_to_json()'s new expand_columnar_records parameter
+    # (nats_tool's --expand_columnar flag, grub/js_grub/js_fetch --json)
+    # calls expand_columnar<JSON>() instead of translate<JSON>() when set, to
+    # turn a columnar-shaped record - every top-level field an equal-length
+    # array, e.g. pg_zerialize's rows_to_<fmt>_columnar() output - back into
+    # a JSON array of per-row objects.
     set(ZERIALIZE_ENABLE_BEVE ON CACHE BOOL "Enable BEVE (via glaze) for nats_tool's --format" FORCE)
     include(FetchContent)
     set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
     FetchContent_Declare(
         zerialize
         GIT_REPOSITORY https://github.com/mrayva/zerialize.git
-        GIT_TAG        e67ed82c90c611db4c65aec946810409d962b3fc
+        GIT_TAG        fd4710e2251a24a6ccf7fd32e67546f6242c408c
     )
     FetchContent_MakeAvailable(zerialize)
 

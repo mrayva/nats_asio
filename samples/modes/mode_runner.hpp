@@ -56,6 +56,7 @@ struct mode_context {
     std::optional<binary_format> binary_fmt;
     std::size_t max_bad_messages = 0;
     double max_bad_percentage = 0.0;
+    bool expand_columnar_records = false;
 
     // JetStream
     std::string js_stream;

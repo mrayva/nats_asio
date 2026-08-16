@@ -288,6 +288,72 @@ TEST(emit_message, json_mode_stops_ioc_when_bad_message_threshold_is_exceeded) {
     EXPECT_TRUE(ioc.stopped());
 }
 
+// --- emit_message: expand_columnar_records --------------------------------
+// See zerialize_json.hpp's deserialize_to_json() doc comment / columnar.hpp
+// for what "columnar-shaped" means. expand_columnar_records is emit_message()'s
+// last parameter, forwarded straight through to deserialize_to_json().
+
+TEST(emit_message, expand_columnar_records_false_leaves_columnar_payload_as_is) {
+    asio::io_context ioc;
+    deserializer_stats stats;
+    std::ostringstream out;
+
+    auto bytes = serialize_from_json(R"({"id":[1,2,3],"name":["a","b","c"]})", binary_format::msgpack);
+    ASSERT_TRUE(bytes.has_value());
+    std::span<const char> payload(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+
+    emit_message(out, output_mode::json, "orders.new", payload, binary_format::msgpack, stats,
+                 spdlog::default_logger(), ioc, {}, {}, {}, /*expand_columnar_records=*/false);
+
+    auto parsed = nlohmann::json::parse(out.str(), nullptr, /*allow_exceptions=*/false);
+    ASSERT_FALSE(parsed.is_discarded()) << "not valid JSON: " << out.str();
+    EXPECT_TRUE(parsed.is_object());
+    EXPECT_EQ(parsed["id"], nlohmann::json::array({1, 2, 3}));
+    EXPECT_EQ(stats.bad_messages(), 0u);
+}
+
+TEST(emit_message, expand_columnar_records_true_expands_to_a_row_array) {
+    asio::io_context ioc;
+    deserializer_stats stats;
+    std::ostringstream out;
+
+    auto bytes = serialize_from_json(R"({"id":[1,2,3],"name":["a","b","c"]})", binary_format::msgpack);
+    ASSERT_TRUE(bytes.has_value());
+    std::span<const char> payload(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+
+    emit_message(out, output_mode::json, "orders.new", payload, binary_format::msgpack, stats,
+                 spdlog::default_logger(), ioc, {}, {}, {}, /*expand_columnar_records=*/true);
+
+    auto parsed = nlohmann::json::parse(out.str(), nullptr, /*allow_exceptions=*/false);
+    ASSERT_FALSE(parsed.is_discarded()) << "not valid JSON: " << out.str();
+    ASSERT_TRUE(parsed.is_array());
+    ASSERT_EQ(parsed.size(), 3u);
+    EXPECT_EQ(parsed[0]["id"], 1);
+    EXPECT_EQ(parsed[0]["name"], "a");
+    EXPECT_EQ(parsed[2]["id"], 3);
+    EXPECT_EQ(parsed[2]["name"], "c");
+    EXPECT_EQ(stats.bad_messages(), 0u);
+}
+
+TEST(emit_message, expand_columnar_records_true_on_non_columnar_payload_records_failure) {
+    asio::io_context ioc;
+    deserializer_stats stats;
+    std::ostringstream out;
+
+    // A plain (non-columnar) row object - fields aren't arrays, so
+    // expand_columnar() throws, and that's handled the same as any other
+    // malformed payload (see deserialize_to_json()'s try/catch).
+    auto bytes = serialize_from_json(R"({"a":1,"b":"x"})", binary_format::msgpack);
+    ASSERT_TRUE(bytes.has_value());
+    std::span<const char> payload(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+
+    emit_message(out, output_mode::json, "orders.new", payload, binary_format::msgpack, stats,
+                 spdlog::default_logger(), ioc, {}, {}, {}, /*expand_columnar_records=*/true);
+
+    EXPECT_TRUE(out.str().empty());
+    EXPECT_EQ(stats.bad_messages(), 1u);
+}
+
 // --- parse_format ------------------------------------------------------
 
 TEST(parse_format, recognizes_all_supported_format_strings) {

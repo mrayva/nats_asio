@@ -48,11 +48,12 @@ public:
     grubber(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console, int stats_interval,
             output_mode mode, const std::string& dump_file = {}, const std::string& translate_cmd = {},
             bool show_timestamp = false, std::optional<binary_format> format = std::nullopt,
-            std::size_t max_bad_messages = 0, double max_bad_percentage = 0.0)
+            std::size_t max_bad_messages = 0, double max_bad_percentage = 0.0,
+            bool expand_columnar_records = false)
         : worker(ioc, console, stats_interval), m_output_mode(mode), m_translate_cmd(translate_cmd),
           m_show_timestamp(show_timestamp), m_format(format),
           m_deserializer_stats(max_bad_messages, max_bad_percentage),
-          m_dump_writer(dump_file, console),
+          m_dump_writer(dump_file, console), m_expand_columnar_records(expand_columnar_records),
           m_writer_thread([this] { writer_loop(); }) {}
 
     // Stops and joins the writer thread, draining anything still queued
@@ -191,7 +192,7 @@ private:
         std::ostream& out = m_dump_writer.stream();
         emit_message(out, m_output_mode, qm.subject, std::span<const char>(qm.payload), m_format,
                     m_deserializer_stats, m_log, m_ioc, qm.json_prefix_fields, qm.json_suffix_fields,
-                    qm.line_prefix);
+                    qm.line_prefix, m_expand_columnar_records);
         m_dump_writer.on_message_written();
     }
 
@@ -201,6 +202,7 @@ private:
     std::optional<binary_format> m_format;
     deserializer_stats m_deserializer_stats;
     dump_file_writer m_dump_writer;
+    bool m_expand_columnar_records;
 
     moodycamel::BlockingConcurrentQueue<queued_message> m_queue;
     std::atomic<bool> m_stop{false};

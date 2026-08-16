@@ -59,7 +59,8 @@ public:
           m_grub(std::make_shared<grubber>(ioc, m_console, ctx.stats_interval, ctx.out_mode,
                                             ctx.dump_file, ctx.translate_cmd, ctx.show_timestamp,
                                             ctx.binary_fmt, ctx.max_bad_messages,
-                                            ctx.max_bad_percentage)) {}
+                                            ctx.max_bad_percentage,
+                                            ctx.expand_columnar_records)) {}
 
     asio::awaitable<void> on_connected(nats_asio::iconnection_sptr conn) override {
         nats_asio::subscribe_options sub_opts;
@@ -102,7 +103,8 @@ public:
           m_js_grub(std::make_shared<js_grubber>(ioc, m_console, ctx.stats_interval, ctx.out_mode,
                                                   ctx.auto_ack, ctx.dump_file, ctx.translate_cmd,
                                                   ctx.binary_fmt, ctx.max_bad_messages,
-                                                  ctx.max_bad_percentage)) {}
+                                                  ctx.max_bad_percentage,
+                                                  ctx.expand_columnar_records)) {}
 
     asio::awaitable<void> on_connected(nats_asio::iconnection_sptr conn) override {
         nats_asio::js_consumer_config config;
@@ -391,7 +393,7 @@ public:
             m_ioc, m_console, conn, m_ctx.js_stream, m_ctx.js_consumer, m_ctx.stats_interval,
             m_ctx.print_to_stdout, m_ctx.batch_size, m_ctx.fetch_interval_ms, m_ctx.out_mode,
             m_ctx.binary_fmt, m_ctx.max_bad_messages, m_ctx.max_bad_percentage, m_ctx.dump_file,
-            m_ctx.translate_cmd);
+            m_ctx.translate_cmd, m_ctx.expand_columnar_records);
     }
 
 private:

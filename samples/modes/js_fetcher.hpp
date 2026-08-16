@@ -53,13 +53,15 @@ public:
                std::optional<binary_format> format = std::nullopt,
                std::size_t max_bad_messages = 0, double max_bad_percentage = 0.0,
                const std::string& dump_file = {},
-               const std::string& translate_cmd = {})
+               const std::string& translate_cmd = {},
+               bool expand_columnar_records = false)
         : worker(ioc, console, stats_interval), m_conn(conn), m_stream(stream),
           m_consumer(consumer), m_print_to_stdout(print_to_stdout),
           m_batch_size(batch_size), m_fetch_interval_ms(fetch_interval_ms),
           m_output_mode(mode), m_format(format),
           m_deserializer_stats(max_bad_messages, max_bad_percentage),
-          m_translate_cmd(translate_cmd), m_dump_writer(dump_file, console) {
+          m_translate_cmd(translate_cmd), m_dump_writer(dump_file, console),
+          m_expand_columnar_records(expand_columnar_records) {
         asio::co_spawn(ioc, fetch_loop(), asio::detached);
     }
 
@@ -97,7 +99,8 @@ public:
                         json_suffix_fields += format_headers_json_suffix(msg.msg.headers);
 
                         emit_message(out, m_output_mode, subject, output_payload, m_format,
-                                    m_deserializer_stats, m_log, m_ioc, {}, json_suffix_fields);
+                                    m_deserializer_stats, m_log, m_ioc, {}, json_suffix_fields,
+                                    {}, m_expand_columnar_records);
 
                         if (m_output_mode == output_mode::normal) {
                             m_log->debug("stream={} consumer={} seq={}/{} delivered={}",
@@ -142,6 +145,7 @@ private:
     deserializer_stats m_deserializer_stats;
     std::string m_translate_cmd;
     dump_file_writer m_dump_writer;
+    bool m_expand_columnar_records;
 };
 
 } // namespace nats_tool

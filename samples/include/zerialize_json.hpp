@@ -65,51 +65,44 @@ inline std::optional<binary_format> parse_format(const std::string& fmt_str) {
 
 // Deserialize binary payload to compact JSON string
 // Returns nullopt on error (malformed data)
+//
+// expand_columnar: when true, a columnar-shaped record - every top-level
+// field an equal-length array, e.g. what pg_zerialize's
+// rows_to_<fmt>_columnar() produces - is expanded back into a JSON array
+// of per-row objects (zerialize::expand_columnar(), see columnar.hpp)
+// instead of translated as-is. A message that isn't columnar-shaped (root
+// isn't an object, a field isn't an array, array lengths don't match)
+// throws, which this function's existing try/catch already turns into the
+// same nullopt-plus-debug-log outcome as any other malformed payload - no
+// separate handling needed.
 inline std::optional<std::string> deserialize_to_json(
     std::span<const char> payload,
     binary_format format,
-    std::shared_ptr<spdlog::logger> log = nullptr) {
+    std::shared_ptr<spdlog::logger> log = nullptr,
+    bool expand_columnar_records = false) {
 
     try {
         auto bytes = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
 
+        auto to_json = [&]<class SrcP>() -> std::string {
+            typename SrcP::Deserializer src(bytes);
+            if (expand_columnar_records) {
+                auto json = zerialize::expand_columnar<zerialize::JSON>(src);
+                return json.to_string(false);
+            }
+            auto json = zerialize::translate<zerialize::JSON>(src);
+            return json.to_string(false);
+        };
+
         switch (format) {
-            case binary_format::msgpack: {
-                zerialize::MsgPack::Deserializer src(bytes);
-                auto json = zerialize::translate<zerialize::JSON>(src);
-                return json.to_string(false);
-            }
-            case binary_format::cbor: {
-                zerialize::CBOR::Deserializer src(bytes);
-                auto json = zerialize::translate<zerialize::JSON>(src);
-                return json.to_string(false);
-            }
-            case binary_format::flexbuffers: {
-                zerialize::Flex::Deserializer src(bytes);
-                auto json = zerialize::translate<zerialize::JSON>(src);
-                return json.to_string(false);
-            }
-            case binary_format::zera: {
-                zerialize::Zera::Deserializer src(bytes);
-                auto json = zerialize::translate<zerialize::JSON>(src);
-                return json.to_string(false);
-            }
-            case binary_format::bson: {
-                zerialize::Bson::Deserializer src(bytes);
-                auto json = zerialize::translate<zerialize::JSON>(src);
-                return json.to_string(false);
-            }
-            case binary_format::ion: {
-                zerialize::Ion::Deserializer src(bytes);
-                auto json = zerialize::translate<zerialize::JSON>(src);
-                return json.to_string(false);
-            }
-            case binary_format::beve: {
-                zerialize::Beve::Deserializer src(bytes);
-                auto json = zerialize::translate<zerialize::JSON>(src);
-                return json.to_string(false);
-            }
+            case binary_format::msgpack:     return to_json.template operator()<zerialize::MsgPack>();
+            case binary_format::cbor:        return to_json.template operator()<zerialize::CBOR>();
+            case binary_format::flexbuffers: return to_json.template operator()<zerialize::Flex>();
+            case binary_format::zera:        return to_json.template operator()<zerialize::Zera>();
+            case binary_format::bson:        return to_json.template operator()<zerialize::Bson>();
+            case binary_format::ion:         return to_json.template operator()<zerialize::Ion>();
+            case binary_format::beve:        return to_json.template operator()<zerialize::Beve>();
         }
     } catch (const std::exception& e) {
         if (log) {

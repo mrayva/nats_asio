@@ -45,11 +45,12 @@ public:
                output_mode mode, bool auto_ack, const std::string& dump_file = {},
                const std::string& translate_cmd = {},
                std::optional<binary_format> format = std::nullopt,
-               std::size_t max_bad_messages = 0, double max_bad_percentage = 0.0)
+               std::size_t max_bad_messages = 0, double max_bad_percentage = 0.0,
+               bool expand_columnar_records = false)
         : worker(ioc, console, stats_interval), m_output_mode(mode), m_auto_ack(auto_ack),
           m_translate_cmd(translate_cmd), m_format(format),
           m_deserializer_stats(max_bad_messages, max_bad_percentage),
-          m_dump_writer(dump_file, console) {}
+          m_dump_writer(dump_file, console), m_expand_columnar_records(expand_columnar_records) {}
 
     asio::awaitable<void> on_js_message(nats_asio::ijs_subscription& sub,
                                          const nats_asio::js_message& msg) {
@@ -69,7 +70,7 @@ public:
         json_suffix_fields += format_headers_json_suffix(msg.msg.headers);
 
         emit_message(out, m_output_mode, subject, output_payload, m_format, m_deserializer_stats,
-                    m_log, m_ioc, {}, json_suffix_fields);
+                    m_log, m_ioc, {}, json_suffix_fields, {}, m_expand_columnar_records);
 
         if (m_output_mode == output_mode::normal) {
             m_log->debug("stream={} consumer={} seq={}/{} delivered={}",
@@ -97,6 +98,7 @@ private:
     std::optional<binary_format> m_format;
     deserializer_stats m_deserializer_stats;
     dump_file_writer m_dump_writer;
+    bool m_expand_columnar_records;
 };
 
 } // namespace nats_tool

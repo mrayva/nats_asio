@@ -155,12 +155,18 @@ inline std::string format_headers_json_suffix(const HeaderRange& headers) {
 //     (no envelope) rather than needlessly wrapping it.
 //   - normal: line_prefix (if any), then "[subject] payload"
 //   - none: nothing
+//
+// expand_columnar_records: forwarded to deserialize_to_json() - see its own
+// doc comment (zerialize_json.hpp). A message that isn't columnar-shaped is
+// treated the same as any other malformed payload (failed deserialize,
+// counted against `stats`), not a separate error path.
 inline void emit_message(std::ostream& out, output_mode mode, nats_asio::string_view subject,
                          std::span<const char> payload, std::optional<binary_format> format,
                          deserializer_stats& stats, const std::shared_ptr<spdlog::logger>& log,
                          asio::io_context& ioc, std::string_view json_prefix_fields = {},
                          std::string_view json_suffix_fields = {},
-                         std::string_view line_prefix = {}) {
+                         std::string_view line_prefix = {},
+                         bool expand_columnar_records = false) {
     switch (mode) {
         case output_mode::raw:
             out << line_prefix;
@@ -169,7 +175,7 @@ inline void emit_message(std::ostream& out, output_mode mode, nats_asio::string_
             break;
         case output_mode::json: {
             if (format) {
-                auto json_result = deserialize_to_json(payload, *format, log);
+                auto json_result = deserialize_to_json(payload, *format, log, expand_columnar_records);
                 if (json_result) {
                     stats.record_success();
                     if (json_prefix_fields.empty() && json_suffix_fields.empty()) {
