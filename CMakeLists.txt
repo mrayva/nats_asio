@@ -136,10 +136,22 @@ if(NATS_ASIO_BUILD_SAMPLES)
     # further UBSan/ASan findings (null-pointer memcpy/memcmp on empty
     # buffers in zera, OOB reads in the msgpack/CBOR parsers and Flex
     # string/key writer) were found and fixed upstream in the same fork -
-    # see mrayva/zerialize@6bc63f4. Pinned at v1.2.0 (13f6383), which also
-    # adds BSON and Ion backends, and bumps flatbuffers/msgpack-c pins. All
-    # seven backends zerialize offers - msgpack/cbor/flexbuffers/zera/bson/
-    # ion/beve - are wired in as --format choices; BEVE needs its own
+    # see mrayva/zerialize@6bc63f4. Bumped again to acf46e4: json.hpp's
+    # double_() handed non-finite doubles straight to yyjson_mut_real()
+    # with no isfinite/isnan check, and yyjson_mut_write() (finish())
+    # refuses to serialize *any* document containing a non-finite double
+    # at all with no write flag passed, throwing std::runtime_error for
+    # the whole document rather than just the one bad value. That broke
+    # deserialize_to_json for every --format whenever the payload
+    # contained Infinity/-Infinity/NaN, since all of them funnel through
+    # zerialize::translate<JSON>() -- found via an actual end-to-end test
+    # (Postgres row w/ Infinity floats -> pg_zerialize -> pgnats -> NATS ->
+    # nats_tool), not proactively. Fixed upstream to write those as
+    # "NaN"/"Infinity"/"-Infinity" strings, the same convention
+    # pg_zerialize's own decoders already used. v1.2.0 (13f6383) also
+    # added BSON and Ion backends, and bumped flatbuffers/msgpack-c pins.
+    # All seven backends zerialize offers - msgpack/cbor/flexbuffers/zera/
+    # bson/ion/beve - are wired in as --format choices; BEVE needs its own
     # explanation:
     # zerialize gates it behind ZERIALIZE_ENABLE_BEVE (default OFF) because
     # enabling it links glaze, which requires C++23 and would otherwise
@@ -156,7 +168,7 @@ if(NATS_ASIO_BUILD_SAMPLES)
     FetchContent_Declare(
         zerialize
         GIT_REPOSITORY https://github.com/mrayva/zerialize.git
-        GIT_TAG        13f6383043a47231a097a5a9bee14f2b332f67f7
+        GIT_TAG        acf46e4441736bdb55ebc20f1134c46e947c1aeb
     )
     FetchContent_MakeAvailable(zerialize)
 
