@@ -66,6 +66,7 @@ public:
 
         std::string json_suffix_fields =
             fmt::format(",\"stream\":\"{}\",\"seq\":{}", msg.stream, msg.stream_sequence);
+        json_suffix_fields += format_headers_json_suffix(msg.msg.headers);
 
         emit_message(out, m_output_mode, subject, output_payload, m_format, m_deserializer_stats,
                     m_log, m_ioc, {}, json_suffix_fields);

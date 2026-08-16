@@ -51,19 +51,27 @@ public:
           m_deserializer_stats(max_bad_messages, max_bad_percentage),
           m_dump_writer(dump_file, console) {}
 
-    asio::awaitable<void> on_message(nats_asio::string_view subject,
-                                     nats_asio::optional<nats_asio::string_view> reply_to,
-                                     std::span<const char> payload) {
+    // Takes the zero-copy message_view (rather than separate subject/
+    // reply_to/payload args) specifically to get at msg.headers -- the
+    // legacy on_message_cb subscribe() overload this used to bind to has
+    // no headers at all. subject/reply_to/payload/headers here alias the
+    // connection's own read buffer and are only valid until this
+    // coroutine's next real suspension point (see message_view's own
+    // warning) -- matches the existing reply_to usage below, which reads
+    // it after the same co_await for the same reason: apply_translate_if_
+    // configured() only actually suspends when --translate is given, and
+    // copies subject/payload to owned storage itself before it does.
+    asio::awaitable<void> on_message(const nats_asio::message_view& msg) {
         m_counter++;
 
         std::ostream& out = m_dump_writer.stream();
 
         std::string translated_storage;
         auto output_payload = co_await apply_translate_if_configured(
-            m_translate_cmd, subject, payload, m_log, translated_storage);
+            m_translate_cmd, msg.subject, msg.payload, m_log, translated_storage);
 
         // Timestamp, if requested, prefixes raw/normal lines and prepends the
-        // JSON envelope's field list; reply_to (if present) appends to it.
+        // JSON envelope's field list; reply_to/headers (if present) append to it.
         std::string line_prefix;
         std::string json_prefix_fields;
         if (m_show_timestamp && m_output_mode != output_mode::none) {
@@ -81,11 +89,14 @@ public:
             json_prefix_fields = fmt::format("\"timestamp\":\"{}\",", timestamp_str);
         }
         std::string json_suffix_fields;
-        if (reply_to) {
-            json_suffix_fields = fmt::format(",\"reply_to\":\"{}\"", *reply_to);
+        if (msg.reply_to) {
+            json_suffix_fields = fmt::format(",\"reply_to\":\"{}\"", *msg.reply_to);
+        }
+        if (msg.headers.has_data()) {
+            json_suffix_fields += format_headers_json_suffix(msg.headers.get());
         }
 
-        emit_message(out, m_output_mode, subject, output_payload, m_format, m_deserializer_stats,
+        emit_message(out, m_output_mode, msg.subject, output_payload, m_format, m_deserializer_stats,
                     m_log, m_ioc, json_prefix_fields, json_suffix_fields, line_prefix);
 
         m_dump_writer.on_message_written();

@@ -117,6 +117,33 @@ inline asio::awaitable<std::span<const char>> apply_translate_if_configured(
     co_return std::span<const char>(storage.data(), storage.size());
 }
 
+// Formats NATS message headers as a `,"headers":{...}` json_suffix_fields
+// fragment, or an empty string when there are none -- the same
+// only-add-the-field-when-present convention emit_message already uses for
+// reply_to (grubber) and stream/seq (js_grubber/js_fetcher). Works with any
+// range of key/value pairs whose members are convertible to
+// std::string_view, so it takes nats_asio::headers_t (owned, js_grubber's
+// js_message::headers) and nats_asio::headers_view_t (zero-copy, what
+// lazy_headers_view::get() returns) equally well without a second overload.
+template <typename HeaderRange>
+inline std::string format_headers_json_suffix(const HeaderRange& headers) {
+    if (headers.empty()) return {};
+
+    std::string out = ",\"headers\":{";
+    bool first = true;
+    for (const auto& [key, value] : headers) {
+        if (!first) out += ',';
+        first = false;
+        out += '"';
+        out += escape_json_string(std::span<const char>(key.data(), key.size()));
+        out += "\":\"";
+        out += escape_json_string(std::span<const char>(value.data(), value.size()));
+        out += '"';
+    }
+    out += '}';
+    return out;
+}
+
 // Formats and writes one message to `out` per output_mode:
 //   - raw: line_prefix (if any) followed by the payload
 //   - json: deserializes via `format` if set (tracking failures in `stats`,

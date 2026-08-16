@@ -71,8 +71,8 @@ public:
         auto grub = m_grub;
         auto r = co_await conn->subscribe(
             m_topic,
-            [grub](auto v1, auto v2, auto v3) -> asio::awaitable<void> {
-                return grub->on_message(v1, v2, v3);
+            [grub](const nats_asio::message_view& msg) -> asio::awaitable<void> {
+                return grub->on_message(msg);
             },
             sub_opts);
 

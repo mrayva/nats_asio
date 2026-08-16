@@ -176,6 +176,48 @@ TEST(emit_message, json_mode_without_format_inserts_prefix_and_suffix_fields) {
     EXPECT_EQ(parsed["payload"], "hi");
 }
 
+TEST(format_headers_json_suffix, empty_range_yields_empty_string) {
+    nats_asio::headers_t headers;
+    EXPECT_EQ(format_headers_json_suffix(headers), "");
+}
+
+TEST(format_headers_json_suffix, formats_owned_headers_t_as_a_json_object) {
+    nats_asio::headers_t headers{{"X-Trace-Id", "abc-123"}, {"X-Row", "42"}};
+    EXPECT_EQ(format_headers_json_suffix(headers),
+              R"(,"headers":{"X-Trace-Id":"abc-123","X-Row":"42"})");
+}
+
+TEST(format_headers_json_suffix, formats_zero_copy_headers_view_t_the_same_way) {
+    // nats_asio::headers_view_t (string_view pairs) is what
+    // lazy_headers_view::get() returns -- confirm the helper works
+    // identically on the zero-copy type, not just the owned one.
+    nats_asio::headers_view_t headers{{"X-Trace-Id", "abc-123"}};
+    EXPECT_EQ(format_headers_json_suffix(headers), R"(,"headers":{"X-Trace-Id":"abc-123"})");
+}
+
+TEST(format_headers_json_suffix, escapes_keys_and_values) {
+    nats_asio::headers_t headers{{"say", "hello \"world\"\n"}};
+    EXPECT_EQ(format_headers_json_suffix(headers), R"(,"headers":{"say":"hello \"world\"\n"})");
+}
+
+TEST(emit_message, json_mode_includes_headers_when_present) {
+    asio::io_context ioc;
+    deserializer_stats stats;
+    std::ostringstream out;
+    std::string payload = "hi";
+    nats_asio::headers_t headers{{"X-Meta", "yes"}};
+
+    emit_message(out, output_mode::json, "orders.new", as_span(payload), std::nullopt, stats,
+                 spdlog::default_logger(), ioc, /*json_prefix_fields=*/{},
+                 format_headers_json_suffix(headers));
+
+    auto parsed = nlohmann::json::parse(out.str(), nullptr, /*allow_exceptions=*/false);
+    ASSERT_FALSE(parsed.is_discarded()) << "not valid JSON: " << out.str();
+    EXPECT_EQ(parsed["subject"], "orders.new");
+    EXPECT_EQ(parsed["headers"]["X-Meta"], "yes");
+    EXPECT_EQ(parsed["payload"], "hi");
+}
+
 TEST(emit_message, json_mode_with_format_writes_bare_deserialized_json_when_no_envelope_fields) {
     asio::io_context ioc;
     deserializer_stats stats;
