@@ -1004,14 +1004,13 @@ int main(int argc, char* argv[]) {
         exit_status = ((pub_ptr && pub_ptr->failed()) ||
                        operation_failed.load(std::memory_order_acquire)) ? 1 : 0;
 
-        // Explicitly release mode handlers before tearing down publisher shard io_contexts.
-        // This guarantees connection/socket destruction happens while shard reactors are alive.
-        pub_ptr.reset();
-        batch_pub_ptr.reset();
-        bench_ptr.reset();
-        runner.reset();
-
-        // Stop and join dedicated publisher io_context shards (if enabled).
+        // Stop and join dedicated publisher io_context shards (if enabled) BEFORE
+        // releasing the mode handlers below. Shard reactor threads may still be
+        // dispatching in-flight completion handlers (e.g. JetStream ACKs) that
+        // call back into pub_ptr; resetting pub_ptr while those threads are
+        // still running is a real race (TSan-caught: publisher's per-connection
+        // std::deque<std::mutex> destroyed on the main thread concurrently with
+        // on_ack_message() locking one of those mutexes on a shard thread).
         for (const auto& c : pub_connections) {
             c->stop();
         }
@@ -1026,6 +1025,13 @@ int main(int argc, char* argv[]) {
                 t.join();
             }
         }
+
+        // Now safe: no other thread can still be touching these.
+        pub_ptr.reset();
+        batch_pub_ptr.reset();
+        bench_ptr.reset();
+        runner.reset();
+
         // Only release connection ownership after shard threads are fully stopped,
         // so detached connection coroutines cannot outlive their owning object.
         pub_connections.clear();
