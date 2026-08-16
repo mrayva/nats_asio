@@ -162,13 +162,19 @@ if(NATS_ASIO_BUILD_SAMPLES)
     # verified with a from-scratch build + full test suite + a live
     # NATS pub/grub round trip before committing to the bump, since it
     # affects the whole ASIO-coroutine codebase, not just this glue code.
+    #
+    # e67ed82 fixes zerialize::translate() being O(n^2) in container size for
+    # maps/arrays (operator[] re-scans its container from the start on every
+    # call, for every protocol) - translate<JSON>() is exactly what
+    # zerialize_json.hpp's deserialize_to_json() calls on every --format
+    # --json message, across all 7 wire formats.
     set(ZERIALIZE_ENABLE_BEVE ON CACHE BOOL "Enable BEVE (via glaze) for nats_tool's --format" FORCE)
     include(FetchContent)
     set(JSONCONS_BUILD_TESTS OFF CACHE BOOL "Disable jsoncons tests when vendored" FORCE)
     FetchContent_Declare(
         zerialize
         GIT_REPOSITORY https://github.com/mrayva/zerialize.git
-        GIT_TAG        acf46e4441736bdb55ebc20f1134c46e947c1aeb
+        GIT_TAG        e67ed82c90c611db4c65aec946810409d962b3fc
     )
     FetchContent_MakeAvailable(zerialize)
 
