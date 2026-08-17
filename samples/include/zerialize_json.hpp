@@ -38,9 +38,18 @@ SOFTWARE.
 #include <optional>
 #include <spdlog/spdlog.h>
 
+#ifdef NATS_TOOL_HAS_ARROW
+#include "arrow_json.hpp"
+#endif
+
 namespace nats_tool {
 
-// Supported binary formats for deserialization
+// Supported binary formats for deserialization. `arrow` always exists here
+// regardless of whether NATS_TOOL_HAS_ARROW is defined (build option
+// NATS_ASIO_ENABLE_ARROW), so --format parsing/help text stay stable across
+// build configs - only deserialize_to_json()'s actual arrow case is gated,
+// falling back to a clear "not compiled in" failure otherwise. Decode-only:
+// no encode direction exists for arrow (see arrow_json.hpp's own comment).
 enum class binary_format {
     msgpack,
     cbor,
@@ -48,7 +57,8 @@ enum class binary_format {
     zera,
     bson,
     ion,
-    beve
+    beve,
+    arrow
 };
 
 // Parse format string to enum
@@ -60,6 +70,7 @@ inline std::optional<binary_format> parse_format(const std::string& fmt_str) {
     if (fmt_str == "bson") return binary_format::bson;
     if (fmt_str == "ion") return binary_format::ion;
     if (fmt_str == "beve") return binary_format::beve;
+    if (fmt_str == "arrow") return binary_format::arrow;
     return std::nullopt;
 }
 
@@ -103,6 +114,21 @@ inline std::optional<std::string> deserialize_to_json(
             case binary_format::bson:        return to_json.template operator()<zerialize::Bson>();
             case binary_format::ion:         return to_json.template operator()<zerialize::Ion>();
             case binary_format::beve:        return to_json.template operator()<zerialize::Beve>();
+            case binary_format::arrow:
+                // Not a zerialize protocol - bypasses the to_json lambda
+                // entirely and decodes directly against libarrow (see
+                // arrow_json.hpp). Only wired in when this build was
+                // configured with -DNATS_ASIO_ENABLE_ARROW=ON (the default;
+                // requires libarrow-dev).
+#ifdef NATS_TOOL_HAS_ARROW
+                return deserialize_arrow_to_json(payload, expand_columnar_records);
+#else
+                if (log) {
+                    log->debug("--format arrow was requested, but this nats_tool build was compiled "
+                              "without Arrow support (NATS_ASIO_ENABLE_ARROW=OFF)");
+                }
+                return std::nullopt;
+#endif
         }
     } catch (const std::exception& e) {
         if (log) {
@@ -153,6 +179,14 @@ inline std::optional<std::vector<std::byte>> serialize_from_json(
                 return to_bytes(serialize_as.template operator()<zerialize::Ion>());
             case binary_format::beve:
                 return to_bytes(serialize_as.template operator()<zerialize::Beve>());
+            case binary_format::arrow:
+                // Decode-only (see arrow_json.hpp / binary_format's own
+                // comment) - there's no "pub --format arrow" direction.
+                if (log) {
+                    log->debug("arrow has no encode direction (rows_to_arrow() is a SQL-side "
+                              "batch construct, not something --format arrow can build from JSON input)");
+                }
+                return std::nullopt;
         }
     } catch (const std::exception& e) {
         if (log) {

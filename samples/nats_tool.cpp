@@ -256,7 +256,7 @@ int main(int argc, char* argv[]) {
         ("raw", "Output raw payload only (grub/js_grub mode)")
         ("dump", "Dump messages to file (grub/js_grub mode)", cxxopts::value<std::string>())
         ("json", "Output messages as JSON (grub/js_grub mode)")
-        ("format", "Binary format: msgpack, cbor, flexbuffers, zera, bson, ion, beve (grub/js_grub/js_fetch/pub mode)", cxxopts::value<std::string>())
+        ("format", "Binary format: msgpack, cbor, flexbuffers, zera, bson, ion, beve, arrow (grub/js_grub/js_fetch/pub mode - arrow is decode-only, not valid for pub mode)", cxxopts::value<std::string>())
         ("expand_columnar", "Expand a columnar-shaped record (every top-level field an equal-length array, e.g. pg_zerialize's rows_to_<fmt>_columnar output) into a JSON array of per-row objects (grub/js_grub/js_fetch mode, requires --json)")
         ("max_bad_messages", "Exit after N failed deserializations (default: 0 = disabled)", cxxopts::value<std::size_t>())
         ("max_bad_percentage", "Exit if bad message percentage exceeds threshold (default: 0 = disabled)", cxxopts::value<double>())

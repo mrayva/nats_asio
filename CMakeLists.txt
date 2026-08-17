@@ -187,6 +187,35 @@ if(NATS_ASIO_BUILD_SAMPLES)
     )
     FetchContent_MakeAvailable(zerialize)
 
+    # Arrow is NOT a zerialize protocol (see pg_arrow's own README for why:
+    # its physical layout - validity bitmaps, typed column buffers,
+    # FlatBuffers-encoded IPC framing - doesn't fit zerialize's per-value
+    # Writer interface), so --format arrow's decode path (arrow_json.hpp)
+    # links the real libarrow C++ library directly instead of going through
+    # zerialize at all. Optional/gated the same way ZERIALIZE_ENABLE_BEVE
+    # is: not every machine building nats_tool will have libarrow-dev
+    # installed (apt.arrow.apache.org; this project uses the system
+    # package, like pg_arrow does, not a vendored copy - Arrow is too large
+    # to vendor the way the smaller header-only zerialize deps are).
+    # Defaults ON since it's confirmed available in this dev environment;
+    # flip to OFF with -DNATS_ASIO_ENABLE_ARROW=OFF where it isn't.
+    # Decode-only, matching pg_arrow's own columnar-batch-only design -
+    # there's no "pub --format arrow" encode path, since rows_to_arrow()
+    # is a SQL-side batch construct nats_tool's line/json/csv input model
+    # has no natural equivalent of.
+    option(NATS_ASIO_ENABLE_ARROW "Enable --format arrow decode support in nats_tool (requires libarrow-dev)" ON)
+    if(NATS_ASIO_ENABLE_ARROW)
+        # See cmake/unofficial-utf8procConfig.cmake's own comment: Arrow's
+        # ArrowConfig.cmake transitively needs a package named
+        # "unofficial-utf8proc" under vcpkg's toolchain, and the actual
+        # vcpkg utf8proc port's modern target collides with Arrow's own
+        # compatibility shim for it - this shim resolves that against the
+        # system libutf8proc-dev package instead (confirmed via an actual
+        # failed configure first, not guessed preemptively).
+        list(APPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+        find_package(Arrow CONFIG REQUIRED)
+    endif()
+
     add_executable(nats_tool samples/nats_tool.cpp)
     target_link_libraries(nats_tool
         PRIVATE
@@ -194,12 +223,26 @@ if(NATS_ASIO_BUILD_SAMPLES)
             cxxopts::cxxopts
             simdjson::simdjson
             zerialize
+            nlohmann_json::nlohmann_json
             $<IF:$<TARGET_EXISTS:zstd::libzstd_shared>,zstd::libzstd_shared,zstd::libzstd_static>
     )
     target_compile_definitions(nats_tool PRIVATE FLATBUFFERS_LOCALE_INDEPENDENT=0)
     if(NATS_ASIO_USE_MIMALLOC)
         target_link_libraries(nats_tool PRIVATE mimalloc)
         target_compile_definitions(nats_tool PRIVATE NATS_TOOL_USE_MIMALLOC)
+    endif()
+    if(NATS_ASIO_ENABLE_ARROW)
+        target_link_libraries(nats_tool PRIVATE Arrow::arrow_shared)
+        target_compile_definitions(nats_tool PRIVATE NATS_TOOL_HAS_ARROW)
+        # libarrow.so pulls in the system libprotobuf.so.32, which itself
+        # has undefined refs to CXXABI_1.3.15 symbols that DO exist in the
+        # system libstdc++.so.6 (verified via objdump -T) but only get
+        # resolved at runtime by the dynamic loader. Binutils ld 2.45+
+        # checks transitively-loaded shared libs' undefined symbols at
+        # link time by default and fails here even though the runtime
+        # load is fine - this restores the traditional (and correct for
+        # this case) behavior of deferring that resolution to runtime.
+        target_link_options(nats_tool PRIVATE "-Wl,--allow-shlib-undefined")
     endif()
 
     set_target_properties(nats_tool PROPERTIES
@@ -234,8 +277,17 @@ if(NATS_ASIO_BUILD_TESTS)
     # zerialize for the BUILD_SAMPLES=OFF/BUILD_TESTS=ON combination.
     if(TARGET nats_tool)
         target_sources(parser_test PRIVATE tests/message_output_test.cpp)
-        target_link_libraries(parser_test PRIVATE zerialize)
+        target_link_libraries(parser_test PRIVATE zerialize nlohmann_json::nlohmann_json)
         target_compile_definitions(parser_test PRIVATE FLATBUFFERS_LOCALE_INDEPENDENT=0)
+        # NATS_ASIO_ENABLE_ARROW is only set at all when the samples block
+        # above ran (this whole if(TARGET nats_tool) block already implies
+        # that), so this mirrors nats_tool's own conditional Arrow linkage
+        # for message_output_test.cpp's --format arrow tests.
+        if(NATS_ASIO_ENABLE_ARROW)
+            target_link_libraries(parser_test PRIVATE Arrow::arrow_shared)
+            target_compile_definitions(parser_test PRIVATE NATS_TOOL_HAS_ARROW)
+            target_link_options(parser_test PRIVATE "-Wl,--allow-shlib-undefined")
+        endif()
     endif()
 
     # string_utils.hpp pulls in inja (template rendering), which - like

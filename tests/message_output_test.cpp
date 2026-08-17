@@ -11,6 +11,12 @@
 #include <string>
 #include <unistd.h>
 
+#ifdef NATS_TOOL_HAS_ARROW
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <arrow/ipc/api.h>
+#endif
+
 using namespace nats_tool;
 
 namespace {
@@ -385,6 +391,7 @@ std::string format_name(binary_format f) {
         case binary_format::bson: return "bson";
         case binary_format::ion: return "ion";
         case binary_format::beve: return "beve";
+        case binary_format::arrow: return "arrow";
     }
     return "unknown";
 }
@@ -432,6 +439,90 @@ INSTANTIATE_TEST_SUITE_P(
                       binary_format::zera, binary_format::bson, binary_format::ion,
                       binary_format::beve),
     [](const ::testing::TestParamInfo<binary_format>& info) { return format_name(info.param); });
+
+// --- arrow (decode-only) ---------------------------------------------------
+#ifdef NATS_TOOL_HAS_ARROW
+
+namespace {
+// Builds a real 2-row, 2-column Arrow IPC stream ({"id":[1,2],
+// "name":["a","b"]} in columnar terms) via libarrow's own API directly -
+// there's no serialize_from_json() path for arrow (decode-only, see
+// binary_format's own comment), so tests need to construct real bytes this
+// way rather than round-tripping through this project's own encoder.
+std::string make_test_arrow_bytes() {
+    auto id_builder = std::make_shared<arrow::Int64Builder>();
+    EXPECT_TRUE(id_builder->AppendValues({1, 2}).ok());
+    std::shared_ptr<arrow::Array> id_array;
+    EXPECT_TRUE(id_builder->Finish(&id_array).ok());
+
+    arrow::StringBuilder name_builder;
+    EXPECT_TRUE(name_builder.AppendValues({"a", "b"}).ok());
+    std::shared_ptr<arrow::Array> name_array;
+    EXPECT_TRUE(name_builder.Finish(&name_array).ok());
+
+    auto schema = arrow::schema({arrow::field("id", arrow::int64()), arrow::field("name", arrow::utf8())});
+    auto batch = arrow::RecordBatch::Make(schema, 2, {id_array, name_array});
+
+    auto stream = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    auto writer = arrow::ipc::MakeStreamWriter(stream, schema).ValueOrDie();
+    EXPECT_TRUE(writer->WriteRecordBatch(*batch).ok());
+    EXPECT_TRUE(writer->Close().ok());
+    auto buffer = stream->Finish().ValueOrDie();
+    return std::string(reinterpret_cast<const char*>(buffer->data()), buffer->size());
+}
+}  // namespace
+
+TEST(emit_message, json_mode_arrow_columnar) {
+    asio::io_context ioc;
+    deserializer_stats stats;
+    std::ostringstream out;
+    std::string bytes = make_test_arrow_bytes();
+
+    emit_message(out, output_mode::json, "orders.new", as_span(bytes), binary_format::arrow, stats,
+                 spdlog::default_logger(), ioc);
+
+    auto parsed = nlohmann::json::parse(out.str(), nullptr, /*allow_exceptions=*/false);
+    ASSERT_FALSE(parsed.is_discarded()) << "not valid JSON: " << out.str();
+    EXPECT_EQ(parsed, nlohmann::json::parse(R"({"id":[1,2],"name":["a","b"]})"));
+    EXPECT_EQ(stats.bad_messages(), 0u);
+}
+
+TEST(emit_message, json_mode_arrow_expand_columnar) {
+    asio::io_context ioc;
+    deserializer_stats stats;
+    std::ostringstream out;
+    std::string bytes = make_test_arrow_bytes();
+
+    emit_message(out, output_mode::json, "orders.new", as_span(bytes), binary_format::arrow, stats,
+                 spdlog::default_logger(), ioc, {}, {}, {}, /*expand_columnar_records=*/true);
+
+    auto parsed = nlohmann::json::parse(out.str(), nullptr, /*allow_exceptions=*/false);
+    ASSERT_FALSE(parsed.is_discarded()) << "not valid JSON: " << out.str();
+    EXPECT_EQ(parsed, nlohmann::json::parse(R"([{"id":1,"name":"a"},{"id":2,"name":"b"}])"));
+}
+
+TEST(emit_message, json_mode_arrow_malformed_payload_records_failure) {
+    asio::io_context ioc;
+    deserializer_stats stats;
+    std::ostringstream out;
+    std::string garbage = "not a real arrow ipc stream";
+
+    emit_message(out, output_mode::json, "orders.new", as_span(garbage), binary_format::arrow, stats,
+                 spdlog::default_logger(), ioc);
+
+    EXPECT_TRUE(out.str().empty());
+    EXPECT_EQ(stats.bad_messages(), 1u);
+}
+
+TEST(serialize_from_json, arrow_has_no_encode_direction) {
+    EXPECT_FALSE(serialize_from_json(R"({"a":1})", binary_format::arrow).has_value());
+}
+
+TEST(parse_format, recognizes_arrow) {
+    EXPECT_EQ(parse_format("arrow"), binary_format::arrow);
+}
+
+#endif  // NATS_TOOL_HAS_ARROW
 
 TEST(serialize_from_json, fails_on_malformed_json_input) {
     std::string bad_json = "{not valid json";

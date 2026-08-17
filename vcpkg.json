@@ -21,7 +21,8 @@
       "dependencies": [
         "cxxopts",
         "inja",
-        "mimalloc"
+        "mimalloc",
+        "re2"
       ]
     },
     "tests": {
