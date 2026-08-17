@@ -51,6 +51,19 @@ jobs:
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
 
+      # NATS_ASIO_ENABLE_ARROW (default ON) only takes effect when samples
+      # are built - core-only has samples=OFF and never calls
+      # find_package(Arrow), so it doesn't need this. libarrow-dev isn't in
+      # Ubuntu's default apt repos, hence Apache's own apt source.
+      - name: Install libarrow-dev
+        if: matrix.samples == 'ON'
+        run: >-
+          sudo apt-get install -y -V ca-certificates lsb-release wget &&
+          wget -q https://packages.apache.org/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb &&
+          sudo apt-get install -y -V ./apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb &&
+          sudo apt-get update &&
+          sudo apt-get install -y -V libarrow-dev
+
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11.6
         with:
