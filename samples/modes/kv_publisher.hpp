@@ -88,7 +88,7 @@ public:
                  int kv_timeout_ms)
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
           m_shards(std::move(shards)),
-          m_bucket(bucket), m_in_flight(0), m_max_in_flight(max_in_flight),
+          m_bucket(bucket), m_in_flight(m_connections.size()), m_max_in_flight(max_in_flight),
           m_separator(separator), m_kv_timeout(std::chrono::milliseconds(kv_timeout_ms)),
           m_stdin(ioc, ::dup(STDIN_FILENO)), m_next_conn(0) {
         assert(m_shards.empty() || m_shards.size() == m_connections.size());
@@ -101,8 +101,8 @@ public:
         });
 
         // Wait for all in-flight operations to complete
-        m_log->info("EOF reached, waiting for {} in-flight KV operations", m_in_flight.load());
-        while (m_in_flight > 0) {
+        m_log->info("EOF reached, waiting for {} in-flight KV operations", total_in_flight());
+        while (total_in_flight() > 0) {
             asio::steady_timer timer(co_await asio::this_coro::executor);
             timer.expires_after(std::chrono::milliseconds(50));
             co_await timer.async_wait(asio::use_awaitable);
@@ -144,19 +144,33 @@ private:
             co_await timer.async_wait(asio::use_awaitable);
         }
 
-        // Backpressure: wait if too many operations in flight
-        while (m_in_flight >= m_max_in_flight) {
+        // Pick this operation's connection once, up front - it keeps
+        // using the same one for its whole lifetime, same as
+        // publisher::get_next_connection_with_index()'s callers. Picked
+        // before the backpressure check below so that check (and the
+        // in-flight counter it gates) is per-connection, not shared
+        // across every connection - a single counter incremented by the
+        // main thread and decremented by whichever of N shard threads
+        // happens to finish an op is a real, measured source of
+        // cross-thread cache-line contention (confirmed via perf: a
+        // meaningful chunk of __pv_queued_spin_lock_slowpath/
+        // pthread_mutex_lock time). Splitting it per connection still
+        // crosses threads (main increments, that connection's one shard
+        // thread decrements), but only ever between those same two
+        // threads instead of all of them fighting over one cache line.
+        auto [conn, idx] = get_next_connection();
+
+        // Backpressure: wait if too many operations in flight *on this
+        // connection* - --max_in_flight is a per-connection cap, same as
+        // it always effectively was (round-robin already spread load
+        // across connections; this just makes the counter match that).
+        while (m_in_flight[idx] >= m_max_in_flight) {
             asio::steady_timer timer(co_await asio::this_coro::executor);
             timer.expires_after(std::chrono::milliseconds(5));
             co_await timer.async_wait(asio::use_awaitable);
         }
 
-        m_in_flight++;
-
-        // Pick this operation's connection once, up front - it keeps
-        // using the same one for its whole lifetime, same as
-        // publisher::get_next_connection_with_index()'s callers.
-        auto [conn, idx] = get_next_connection();
+        m_in_flight[idx]++;
 
         // Dispatch onto that connection's own dedicated shard when one
         // exists, so the connection is only ever touched from the single
@@ -173,7 +187,7 @@ private:
         // Fire-and-forget: dispatch KV operation without waiting
         asio::co_spawn(
             target_ioc,
-            [this, conn, key_copy, value_copy, is_delete]() -> asio::awaitable<void> {
+            [this, conn, idx, key_copy, value_copy, is_delete]() -> asio::awaitable<void> {
                 if (is_delete) {
                     auto [rev, s] = co_await conn->kv_delete(m_bucket, *key_copy, m_kv_timeout);
                     if (s.failed()) {
@@ -192,7 +206,7 @@ private:
                         m_log->debug("put key '{}' rev={}", *key_copy, rev);
                     }
                 }
-                m_in_flight--;
+                m_in_flight[idx]--;
                 co_return;
             },
             asio::detached);
@@ -225,10 +239,23 @@ private:
         return {m_connections[0], 0};
     }
 
+    // Only used for the EOF drain-wait log/poll, which happens once per
+    // run (not per message) - summing every connection's counter here is
+    // fine, unlike doing it on the hot per-message path.
+    int total_in_flight() const {
+        int total = 0;
+        for (const auto& c : m_in_flight) {
+            total += c.load(std::memory_order_relaxed);
+        }
+        return total;
+    }
+
     std::vector<nats_asio::iconnection_sptr> m_connections;
     std::vector<std::shared_ptr<asio::io_context>> m_shards;
     std::string m_bucket;
-    std::atomic<int> m_in_flight;
+    // One counter per connection, not one shared across all of them -
+    // see handle_line()'s comment on get_next_connection() for why.
+    std::vector<std::atomic<int>> m_in_flight;
     int m_max_in_flight;
     std::string m_separator;
     std::chrono::milliseconds m_kv_timeout;
