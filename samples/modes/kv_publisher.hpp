@@ -27,12 +27,9 @@ SOFTWARE.
 
 #include "../include/js_ack_pipeline.hpp"
 #include "../include/worker.hpp"
-#include "common.hpp"
 #include <nats_asio/nats_asio.hpp>
+#include <nats_asio/input_reader.hpp>
 #include <asio/awaitable.hpp>
-#include <asio/posix/stream_descriptor.hpp>
-#include <asio/read_until.hpp>
-#include <asio/as_tuple.hpp>
 #include <asio/detached.hpp>
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
@@ -41,7 +38,6 @@ SOFTWARE.
 #include <string>
 #include <chrono>
 #include <memory>
-#include <unistd.h>
 #include <vector>
 
 namespace nats_tool {
@@ -91,7 +87,7 @@ public:
           m_shards(std::move(shards)), m_bucket(bucket), m_delete_in_flight(0),
           m_max_in_flight(max_in_flight), m_separator(separator),
           m_kv_timeout(std::chrono::milliseconds(kv_timeout_ms)),
-          m_stdin(ioc, ::dup(STDIN_FILENO)), m_next_conn(0) {
+          m_input_reader(ioc, nats_asio::input_source_config{}, console), m_next_conn(0) {
         assert(m_shards.empty() || m_shards.size() == m_connections.size());
         m_ack_pipeline.on_success = [this](const js_ack_task&) { m_counter++; };
         m_ack_pipeline.on_failure = [this](const js_ack_task& task, const std::string& reason) {
@@ -120,9 +116,32 @@ public:
         }
         asio::co_spawn(m_ioc, m_ack_pipeline.timeout_loop(), asio::detached);
 
-        co_await read_stdin_lines(m_stdin, m_log, [this](const std::string& line) {
-            return handle_line(line);
-        });
+        if (!m_input_reader.init()) {
+            m_log->error("Failed to initialize stdin reader");
+            m_ioc.stop();
+            co_return;
+        }
+
+        // Buffered reader (same one publisher.hpp uses for its plain
+        // "line" format): reads in 8KB chunks and extracts lines from an
+        // in-memory buffer via find('\n')/substr, unlike the old
+        // asio::async_read_until-per-line approach this replaced, which
+        // reconstructed a whole composed async operation (plus a
+        // std::istream/getline layer on top) for every single line -
+        // profiled at ~6% of total CPU by itself under load.
+        for (;;) {
+            auto [line, eof, error] = co_await m_input_reader.read_line();
+            if (error) {
+                m_log->error("stdin read error");
+                break;
+            }
+            if (!line.empty()) {
+                co_await handle_line(line);
+            }
+            if (eof) {
+                break;
+            }
+        }
 
         // Wait for all in-flight operations to complete
         m_log->info("EOF reached, waiting for {} in-flight KV operations", total_in_flight());
@@ -270,7 +289,7 @@ private:
     int m_max_in_flight;
     std::string m_separator;
     std::chrono::milliseconds m_kv_timeout;
-    asio::posix::stream_descriptor m_stdin;
+    nats_asio::async_input_reader m_input_reader;
     std::atomic<std::size_t> m_next_conn;
 };
 
