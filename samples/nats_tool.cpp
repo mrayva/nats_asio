@@ -224,7 +224,7 @@ int main(int argc, char* argv[]) {
         ("topic", "topic", cxxopts::value<std::string >(topic))
         ("stats_interval", "stat interval seconds", cxxopts::value<int>(stats_interval))
         ("publish_interval", "publish interval seconds in ms", cxxopts::value<int>(publish_interval))
-        ("n,connections", "Number of connections for pub mode (default: 1)", cxxopts::value<int>(num_connections))
+        ("n,connections", "Number of connections for pub/pubkv mode (default: 1)", cxxopts::value<int>(num_connections))
         ("threads", "Number of threads to run io_context (default: 1, use 0 for hardware_concurrency)", cxxopts::value<int>())
         ("io_shards", "Dedicated io_context shards for pub-mode connections (default: 0 = disabled)", cxxopts::value<int>())
         ("max_in_flight", "Max in-flight publishes for pub mode (default: 1000)", cxxopts::value<int>(max_in_flight))
@@ -569,12 +569,17 @@ int main(int argc, char* argv[]) {
         std::shared_ptr<publisher> pub_ptr;
         std::shared_ptr<benchmarker> bench_ptr;
         std::shared_ptr<batch_publisher> batch_pub_ptr;
+        std::shared_ptr<kv_publisher> kv_pub_ptr;
         std::unique_ptr<mode_runner> runner;
         nats_asio::iconnection_sptr conn;
         std::vector<nats_asio::iconnection_sptr> pub_connections;
         std::vector<std::shared_ptr<asio::io_context>> pub_io_shards;
         std::vector<asio::executor_work_guard<asio::io_context::executor_type>> pub_io_shard_guards;
         std::vector<std::thread> pub_io_shard_threads;
+        std::vector<nats_asio::iconnection_sptr> kv_connections;
+        std::vector<std::shared_ptr<asio::io_context>> kv_io_shards;
+        std::vector<asio::executor_work_guard<asio::io_context::executor_type>> kv_io_shard_guards;
+        std::vector<std::thread> kv_io_shard_threads;
 
         // Parse timestamp option
         bool show_timestamp = result.count("timestamp") > 0;
@@ -947,6 +952,38 @@ int main(int argc, char* argv[]) {
             bench_ptr = std::make_shared<benchmarker>(ioc, console, bench_connections, topic, stats_interval,
                                                        bench_count, bench_size, use_js, bench_rtt, bench_timeout, bench_batch);
             asio::co_spawn(ioc, bench_ptr->run(), asio::detached);
+        } else if (m == mode::kv_publisher && num_connections > 1) {
+            // Dedicated io_context + dedicated OS thread per connection,
+            // mirroring pub mode's io_shards exactly (one shard per
+            // connection, not pub mode's more flexible fewer-shards-than-
+            // connections option) - a shared io_context serviced by
+            // multiple threads was tried first and measured with a real,
+            // unresolved oscillating-throughput pathology (see
+            // kv_publisher's constructor doc). Giving each connection its
+            // own thread means it's never touched from more than one
+            // thread, so there's no cross-thread strand hand-off for that
+            // pathology to come from.
+            console->info("pubkv using {} connection(s), each with its own dedicated io_context/thread",
+                          num_connections);
+
+            kv_io_shards.reserve(static_cast<std::size_t>(num_connections));
+            kv_io_shard_guards.reserve(static_cast<std::size_t>(num_connections));
+            kv_io_shard_threads.reserve(static_cast<std::size_t>(num_connections));
+
+            for (int i = 0; i < num_connections; i++) {
+                auto shard = std::make_shared<asio::io_context>();
+                kv_io_shard_guards.emplace_back(asio::make_work_guard(*shard));
+                kv_io_shard_threads.emplace_back([shard]() { shard->run(); });
+
+                auto c = make_connection(*shard, i);
+                c->start(conf);
+                kv_connections.push_back(c);
+                kv_io_shards.push_back(std::move(shard));
+            }
+
+            kv_pub_ptr = std::make_shared<kv_publisher>(ioc, console, kv_connections, kv_io_shards,
+                                                         ctx.kv_bucket, stats_interval, max_in_flight,
+                                                         ctx.kv_separator, ctx.kv_timeout_ms);
         } else {
             conn = make_connection(ioc);
             conn->start(conf);
@@ -973,6 +1010,16 @@ int main(int argc, char* argv[]) {
                 if (!thread_safe && (m == mode::grubber ||
                                      m == mode::js_grubber || m == mode::js_fetcher)) {
                     console->warn("--threads > 1 not yet supported for this mode (requires strand support), using single thread");
+                    num_threads = 1;
+                }
+                // pubkv's multi-connection parallelism comes from a
+                // dedicated io_context + OS thread per connection (see
+                // the --connections > 1 branch above), not from running
+                // more threads on this shared io_context - which here
+                // only services the single stdin-reading coroutine, so
+                // --threads wouldn't do anything for it either way.
+                if (m == mode::kv_publisher) {
+                    console->warn("--threads has no effect on pubkv - use --connections for parallelism, using single thread");
                     num_threads = 1;
                 }
             }
@@ -1028,15 +1075,38 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // Same reasoning and same ordering for pubkv's own dedicated
+        // shards: kv_publisher's own read_and_publish() already waits
+        // for its in-flight count to hit zero before calling
+        // m_ioc.stop() (which is what let the ioc.run() above return at
+        // all), but the connections' own shard reactor threads can still
+        // have unrelated pending work of their own until stopped here.
+        for (const auto& c : kv_connections) {
+            c->stop();
+        }
+        for (auto& guard : kv_io_shard_guards) {
+            guard.reset();
+        }
+        for (auto& shard_ioc : kv_io_shards) {
+            shard_ioc->stop();
+        }
+        for (auto& t : kv_io_shard_threads) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+
         // Now safe: no other thread can still be touching these.
         pub_ptr.reset();
         batch_pub_ptr.reset();
         bench_ptr.reset();
+        kv_pub_ptr.reset();
         runner.reset();
 
         // Only release connection ownership after shard threads are fully stopped,
         // so detached connection coroutines cannot outlive their owning object.
         pub_connections.clear();
+        kv_connections.clear();
         conn.reset();
 
     } catch (const std::exception& e) {

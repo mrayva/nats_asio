@@ -36,24 +36,62 @@ SOFTWARE.
 #include <asio/steady_timer.hpp>
 #include <asio/use_awaitable.hpp>
 #include <spdlog/spdlog.h>
+#include <cassert>
 #include <span>
 #include <string>
 #include <chrono>
 #include <memory>
 #include <unistd.h>
+#include <vector>
 
 namespace nats_tool {
 
 class kv_publisher : public worker {
 public:
+    // Single-connection constructor - kept so every mode this can be used
+    // in (currently just pubkv) doesn't have to build a vector for the
+    // common (and default) --connections 1 case.
     kv_publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
                  nats_asio::iconnection_sptr conn, const std::string& bucket,
                  int stats_interval, int max_in_flight, const std::string& separator,
                  int kv_timeout_ms)
-        : worker(ioc, console, stats_interval), m_conn(std::move(conn)),
+        : kv_publisher(ioc, console, std::vector<nats_asio::iconnection_sptr>{std::move(conn)}, {},
+                       bucket, stats_interval, max_in_flight, separator, kv_timeout_ms) {}
+
+    // Round-robins each KV operation across `connections`, mirroring
+    // publisher::get_next_connection_with_index() - same skip-if-
+    // disconnected retry, same relaxed-atomic index.
+    //
+    // `shards`, if non-empty, must be the same size as `connections` and
+    // is indexed in lockstep with it: shards[i] is the dedicated
+    // io_context connections[i] was constructed on (mirroring pub mode's
+    // io_shards - one connection, one io_context, one OS thread running
+    // it). Each dispatched operation co_spawns onto *its* connection's
+    // own shard, so the connection is only ever touched from the single
+    // thread that owns it - no cross-thread strand hand-off.
+    //
+    // Left empty, every operation co_spawns onto the shared `ioc`
+    // instead (single-connection default, or --threads servicing one
+    // shared io_context) - measured to have a real, unresolved
+    // oscillating-throughput pathology under multiple threads sharing
+    // one io_context with multiple strand-bound connections (burst then
+    // near-stall, repeating on a ~5s cycle - not a deadlock, confirmed
+    // via gdb thread dumps mid-stall showing genuine in-progress work on
+    // every thread, just badly paced). Use `shards` for real
+    // multi-connection throughput; the no-shards path exists for the
+    // single-connection case where there's only one strand and no
+    // hand-off to have a problem with.
+    kv_publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
+                 std::vector<nats_asio::iconnection_sptr> connections,
+                 std::vector<std::shared_ptr<asio::io_context>> shards, const std::string& bucket,
+                 int stats_interval, int max_in_flight, const std::string& separator,
+                 int kv_timeout_ms)
+        : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
+          m_shards(std::move(shards)),
           m_bucket(bucket), m_in_flight(0), m_max_in_flight(max_in_flight),
           m_separator(separator), m_kv_timeout(std::chrono::milliseconds(kv_timeout_ms)),
-          m_stdin(ioc, ::dup(STDIN_FILENO)) {
+          m_stdin(ioc, ::dup(STDIN_FILENO)), m_next_conn(0) {
+        assert(m_shards.empty() || m_shards.size() == m_connections.size());
         asio::co_spawn(ioc, read_and_publish(), asio::detached);
     }
 
@@ -99,8 +137,8 @@ private:
             is_delete = true;
         }
 
-        // Wait until connection is ready
-        while (!m_conn->is_connected()) {
+        // Wait until at least one connection is ready
+        while (!has_connected_connection()) {
             asio::steady_timer timer(co_await asio::this_coro::executor);
             timer.expires_after(std::chrono::milliseconds(100));
             co_await timer.async_wait(asio::use_awaitable);
@@ -115,16 +153,29 @@ private:
 
         m_in_flight++;
 
+        // Pick this operation's connection once, up front - it keeps
+        // using the same one for its whole lifetime, same as
+        // publisher::get_next_connection_with_index()'s callers.
+        auto [conn, idx] = get_next_connection();
+
+        // Dispatch onto that connection's own dedicated shard when one
+        // exists, so the connection is only ever touched from the single
+        // thread that owns it - see this class's constructor doc for why
+        // that matters. Falls back to the shared m_ioc when there are no
+        // shards (single connection, or the unsharded multi-connection
+        // path).
+        asio::io_context& target_ioc = m_shards.empty() ? m_ioc : *m_shards[idx];
+
         // Capture data for async operation
         auto key_copy = std::make_shared<std::string>(std::move(key));
         auto value_copy = std::make_shared<std::string>(std::move(value_part));
 
         // Fire-and-forget: dispatch KV operation without waiting
         asio::co_spawn(
-            m_ioc,
-            [this, key_copy, value_copy, is_delete]() -> asio::awaitable<void> {
+            target_ioc,
+            [this, conn, key_copy, value_copy, is_delete]() -> asio::awaitable<void> {
                 if (is_delete) {
-                    auto [rev, s] = co_await m_conn->kv_delete(m_bucket, *key_copy, m_kv_timeout);
+                    auto [rev, s] = co_await conn->kv_delete(m_bucket, *key_copy, m_kv_timeout);
                     if (s.failed()) {
                         m_log->error("kv_delete failed for key '{}': {}", *key_copy, s.error());
                     } else {
@@ -133,7 +184,7 @@ private:
                     }
                 } else {
                     std::span<const char> value_span(value_copy->data(), value_copy->size());
-                    auto [rev, s] = co_await m_conn->kv_put(m_bucket, *key_copy, value_span, m_kv_timeout);
+                    auto [rev, s] = co_await conn->kv_put(m_bucket, *key_copy, value_span, m_kv_timeout);
                     if (s.failed()) {
                         m_log->error("kv_put failed for key '{}': {}", *key_copy, s.error());
                     } else {
@@ -149,13 +200,40 @@ private:
         co_return;
     }
 
-    nats_asio::iconnection_sptr m_conn;
+    bool has_connected_connection() const {
+        for (const auto& conn : m_connections) {
+            if (conn->is_connected()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::pair<nats_asio::iconnection_sptr, std::size_t> get_next_connection() {
+        std::size_t attempts = 0;
+        while (attempts < m_connections.size()) {
+            auto idx = m_next_conn.fetch_add(1, std::memory_order_relaxed) % m_connections.size();
+            auto conn = m_connections[idx];
+            if (conn->is_connected()) {
+                return {conn, idx};
+            }
+            attempts++;
+        }
+        // Fallback to first connection (shouldn't happen if
+        // has_connected_connection() passed) - same fallback
+        // publisher::get_next_connection_with_index() uses.
+        return {m_connections[0], 0};
+    }
+
+    std::vector<nats_asio::iconnection_sptr> m_connections;
+    std::vector<std::shared_ptr<asio::io_context>> m_shards;
     std::string m_bucket;
     std::atomic<int> m_in_flight;
     int m_max_in_flight;
     std::string m_separator;
     std::chrono::milliseconds m_kv_timeout;
     asio::posix::stream_descriptor m_stdin;
+    std::atomic<std::size_t> m_next_conn;
 };
 
 } // namespace nats_tool
