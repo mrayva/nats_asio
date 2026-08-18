@@ -89,6 +89,7 @@ public:
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
           m_shards(std::move(shards)),
           m_bucket(bucket), m_in_flight(m_connections.size()), m_max_in_flight(max_in_flight),
+          m_pending_handles(m_connections.size()), m_pending_keys(m_connections.size()),
           m_separator(separator), m_kv_timeout(std::chrono::milliseconds(kv_timeout_ms)),
           m_stdin(ioc, ::dup(STDIN_FILENO)), m_next_conn(0) {
         assert(m_shards.empty() || m_shards.size() == m_connections.size());
@@ -100,9 +101,30 @@ public:
             return handle_line(line);
         });
 
-        // Wait for all in-flight operations to complete
+        // Wait for all in-flight operations to complete, re-draining each
+        // connection's partial batch on every poll tick rather than just
+        // once here. A single one-shot drain right after EOF isn't
+        // enough: handle_line() detaches its fire-and-queue work
+        // (asio::co_spawn(..., asio::detached)) and returns immediately,
+        // so by the time this point runs, the last few lines' fire
+        // operations may not have executed yet - they haven't pushed
+        // their handle into m_pending_handles yet, so a one-shot drain
+        // can win that race and miss them. Nothing would ever drain them
+        // afterward (they'd just sit in m_pending_handles, their
+        // already-incremented m_in_flight entry never decremented),
+        // hanging this wait loop forever. Repeating the drain every tick
+        // guarantees stragglers get picked up on a later pass instead.
         m_log->info("EOF reached, waiting for {} in-flight KV operations", total_in_flight());
         while (total_in_flight() > 0) {
+            for (std::size_t idx = 0; idx < m_connections.size(); ++idx) {
+                asio::co_spawn(
+                    shard_for(idx),
+                    [this, idx]() -> asio::awaitable<void> {
+                        co_await drain_batch(idx);
+                        co_return;
+                    },
+                    asio::detached);
+            }
             asio::steady_timer timer(co_await asio::this_coro::executor);
             timer.expires_after(std::chrono::milliseconds(50));
             co_await timer.async_wait(asio::use_awaitable);
@@ -172,23 +194,18 @@ private:
 
         m_in_flight[idx]++;
 
-        // Dispatch onto that connection's own dedicated shard when one
-        // exists, so the connection is only ever touched from the single
-        // thread that owns it - see this class's constructor doc for why
-        // that matters. Falls back to the shared m_ioc when there are no
-        // shards (single connection, or the unsharded multi-connection
-        // path).
-        asio::io_context& target_ioc = m_shards.empty() ? m_ioc : *m_shards[idx];
-
         // Capture data for async operation
         auto key_copy = std::make_shared<std::string>(std::move(key));
         auto value_copy = std::make_shared<std::string>(std::move(value_part));
 
-        // Fire-and-forget: dispatch KV operation without waiting
-        asio::co_spawn(
-            target_ioc,
-            [this, conn, idx, key_copy, value_copy, is_delete]() -> asio::awaitable<void> {
-                if (is_delete) {
+        if (is_delete) {
+            // kv_delete has no fire/await split (not the throughput-
+            // critical path this was built for) - same individual
+            // fire-and-await-inline shape as before, still on this
+            // connection's own dedicated shard.
+            asio::co_spawn(
+                shard_for(idx),
+                [this, conn, idx, key_copy]() -> asio::awaitable<void> {
                     auto [rev, s] = co_await conn->kv_delete(m_bucket, *key_copy, m_kv_timeout);
                     if (s.failed()) {
                         m_log->error("kv_delete failed for key '{}': {}", *key_copy, s.error());
@@ -196,22 +213,82 @@ private:
                         m_counter++;
                         m_log->debug("deleted key '{}' rev={}", *key_copy, rev);
                     }
-                } else {
-                    std::span<const char> value_span(value_copy->data(), value_copy->size());
-                    auto [rev, s] = co_await conn->kv_put(m_bucket, *key_copy, value_span, m_kv_timeout);
-                    if (s.failed()) {
-                        m_log->error("kv_put failed for key '{}': {}", *key_copy, s.error());
-                    } else {
-                        m_counter++;
-                        m_log->debug("put key '{}' rev={}", *key_copy, rev);
-                    }
+                    m_in_flight[idx]--;
+                    co_return;
+                },
+                asio::detached);
+            co_return;
+        }
+
+        // kv_put: fire now, queue the handle on *this connection's own*
+        // batch (touched only by its one dedicated shard thread, so no
+        // synchronization needed for the queue itself), and drain the
+        // whole batch in one go once it's full - see this class's doc
+        // comment for why batching the await, not just the fire, is the
+        // point.
+        asio::co_spawn(
+            shard_for(idx),
+            [this, conn, idx, key_copy, value_copy]() -> asio::awaitable<void> {
+                std::span<const char> value_span(value_copy->data(), value_copy->size());
+                auto [handle, fire_status] =
+                    co_await conn->kv_put_fire(m_bucket, *key_copy, value_span, m_kv_timeout);
+
+                if (fire_status.failed()) {
+                    m_log->error("kv_put fire failed for key '{}': {}", *key_copy, fire_status.error());
+                    m_in_flight[idx]--;
+                    co_return;
                 }
-                m_in_flight[idx]--;
+
+                m_pending_handles[idx].push_back(std::move(handle));
+                m_pending_keys[idx].push_back(key_copy);
+
+                if (m_pending_handles[idx].size() >= PENDING_ACK_BATCH_SIZE) {
+                    co_await drain_batch(idx);
+                }
                 co_return;
             },
             asio::detached);
 
         co_return;
+    }
+
+    // Awaits every handle queued for connection `idx` since the last
+    // drain, in a plain sequential loop - not a "join_all", but by the
+    // time this runs most of them have typically already had their ack
+    // arrive in the background (the subscription callback that resolves
+    // a handle's wait_state runs independently of anyone awaiting it), so
+    // most iterations here are collecting an already-ready result rather
+    // than paying a real wait. Must run on connection idx's own shard -
+    // every caller here already co_spawns onto shard_for(idx) before
+    // calling this.
+    asio::awaitable<void> drain_batch(std::size_t idx) {
+        auto handles = std::move(m_pending_handles[idx]);
+        auto keys = std::move(m_pending_keys[idx]);
+        m_pending_handles[idx].clear();
+        m_pending_keys[idx].clear();
+
+        auto conn = m_connections[idx];
+        for (std::size_t i = 0; i < handles.size(); ++i) {
+            auto [rev, s] = co_await conn->kv_put_await(std::move(handles[i]));
+            if (s.failed()) {
+                m_log->error("kv_put failed for key '{}': {}", *keys[i], s.error());
+            } else {
+                m_counter++;
+                m_log->debug("put key '{}' rev={}", *keys[i], rev);
+            }
+            m_in_flight[idx]--;
+        }
+        co_return;
+    }
+
+    // Dispatch onto connection idx's own dedicated shard when one
+    // exists, so the connection is only ever touched from the single
+    // thread that owns it - see this class's constructor doc for why
+    // that matters. Falls back to the shared m_ioc when there are no
+    // shards (single connection, or the unsharded multi-connection
+    // path).
+    asio::io_context& shard_for(std::size_t idx) {
+        return m_shards.empty() ? m_ioc : *m_shards[idx];
     }
 
     bool has_connected_connection() const {
@@ -250,6 +327,13 @@ private:
         return total;
     }
 
+    // Stop-and-wait batch size for drain_batch(), same idea (and same
+    // starting point, before empirical tuning) as pgnats's
+    // PENDING_STREAM_ACK_LIMIT: fire this many kv_put()s on a connection,
+    // then await the whole batch in one pass, rather than awaiting each
+    // one right after firing it.
+    static constexpr std::size_t PENDING_ACK_BATCH_SIZE = 500;
+
     std::vector<nats_asio::iconnection_sptr> m_connections;
     std::vector<std::shared_ptr<asio::io_context>> m_shards;
     std::string m_bucket;
@@ -257,6 +341,12 @@ private:
     // see handle_line()'s comment on get_next_connection() for why.
     std::vector<std::atomic<int>> m_in_flight;
     int m_max_in_flight;
+    // Indexed by connection, like m_in_flight - each entry only ever
+    // touched by that connection's own dedicated shard thread (every
+    // push in handle_line() and every drain in drain_batch() already
+    // runs there), so no synchronization needed for these two.
+    std::vector<std::vector<nats_asio::js_ack_handle>> m_pending_handles;
+    std::vector<std::vector<std::shared_ptr<std::string>>> m_pending_keys;
     std::string m_separator;
     std::chrono::milliseconds m_kv_timeout;
     asio::posix::stream_descriptor m_stdin;

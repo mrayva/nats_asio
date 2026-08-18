@@ -120,6 +120,19 @@ struct js_pub_ack {
     bool duplicate = false;
 };
 
+// Opaque handle for a pipelined JetStream/KV publish: fire it now with
+// js_publish_fire()/kv_put_fire(), collect a batch of these, then get the
+// actual result later with js_publish_await()/kv_put_await() - the point
+// being to decouple "the message was handed to the connection" from "the
+// ack came back", so a caller can fire many before paying for any of
+// their individual round trips. Callers only ever hold and pass these
+// around; `impl` is implementation-defined and never dereferenced here -
+// see connection::js_ack_wait_state (nats_asio.hpp) for what it actually
+// points to.
+struct js_ack_handle {
+    std::shared_ptr<void> impl;
+};
+
 // JetStream batch publish message
 struct js_batch_message {
     std::string subject;
@@ -847,6 +860,25 @@ struct iconnection {
     [[nodiscard]] virtual asio::awaitable<std::pair<uint64_t, status>>
     kv_put(string_view bucket, string_view key, std::span<const char> value,
            std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Pipelined kv_put(): returns as soon as the put is handed to the
+    // connection (after ensure_js_ack_router() + the actual publish, same
+    // as kv_put() up to that point) instead of waiting for its ack -
+    // collect handles from many of these, then batch-await them with
+    // kv_put_await() to get the real per-message result once they're
+    // ready, which is typically most of them by the time you ask. A
+    // handle not passed to kv_put_await() is silently never durable -
+    // there is no implicit flush.
+    [[nodiscard]] virtual asio::awaitable<std::pair<js_ack_handle, status>>
+    kv_put_fire(string_view bucket, string_view key, std::span<const char> value,
+                std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) = 0;
+
+    // Awaits one handle from kv_put_fire() and returns its revision
+    // number, same as kv_put() would have. Safe to call from a different
+    // coroutine/point in time than the one that fired it, as long as it's
+    // still on this same connection.
+    [[nodiscard]] virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_put_await(js_ack_handle handle) = 0;
 
     // Get a value from KV bucket
     [[nodiscard]] virtual asio::awaitable<std::pair<kv_entry, status>>

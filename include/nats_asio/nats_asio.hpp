@@ -3345,6 +3345,19 @@ public:
         co_return co_await kv_put_impl(bucket, key, value, timeout);
     }
 
+    // KV put, pipelined (fire half)
+    virtual asio::awaitable<std::pair<js_ack_handle, status>>
+    kv_put_fire(string_view bucket, string_view key, std::span<const char> value,
+                std::chrono::milliseconds timeout) override {
+        co_return co_await kv_put_fire_impl(bucket, key, value, timeout);
+    }
+
+    // KV put, pipelined (await half)
+    virtual asio::awaitable<std::pair<uint64_t, status>>
+    kv_put_await(js_ack_handle handle) override {
+        co_return co_await kv_put_await_impl(std::move(handle));
+    }
+
     // KV get
     virtual asio::awaitable<std::pair<kv_entry, status>>
     kv_get(string_view bucket, string_view key,
@@ -3480,6 +3493,13 @@ private:
         js_pub_ack ack;
         status ack_status;
         std::shared_ptr<asio::steady_timer> wake_timer;
+        // Only needed by js_publish_fire()/js_publish_await(): the
+        // combined js_publish_impl() already has `token` in scope from
+        // its own local variable, but the two-part split needs it
+        // carried inside the handle so the await half can find (and, on
+        // timeout, erase) this wait_state's entry in m_js_ack_waiters
+        // without the fire half needing to also return it separately.
+        uint64_t token = 0;
     };
 
     // Shared state for request-reply pattern
@@ -3805,6 +3825,119 @@ private:
             }
             co_return std::pair<js_pub_ack, status>{
                 {}, status(error_code::ack_timeout, "JetStream publish ack timeout")};
+        }
+
+        co_return std::pair<js_pub_ack, status>{std::move(wait_state->ack),
+                                                std::move(wait_state->ack_status)};
+    }
+
+    // The "fire" half of js_publish_impl's wait_for_ack=true path: same
+    // strand-redispatch/ensure_js_ack_router()/token/reply-subject/
+    // publish() sequence, but stops right after starting the ack-wait
+    // timer instead of awaiting it - the timeout clock is already
+    // running by the time this returns, it's just not been waited on
+    // yet. Pass the returned handle to js_publish_await() later (from
+    // this same connection) to get the actual result. Does not support
+    // wait_for_ack=false (fire-and-forget) - there's nothing to await
+    // there, callers should just use publish()/js_publish_impl() directly
+    // for that.
+    asio::awaitable<std::pair<js_ack_handle, status>> js_publish_fire(
+        string_view subject, std::span<const char> payload,
+        const headers_t& headers, std::chrono::milliseconds timeout) {
+
+        if (!m_strand.running_in_this_thread()) {
+            auto subject_copy = capture_arg(subject);
+            auto payload_copy = capture_arg(payload);
+            auto headers_copy = headers;
+
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, subject_copy = std::move(subject_copy), payload_copy,
+                 headers_copy = std::move(headers_copy),
+                 timeout]() -> asio::awaitable<std::pair<js_ack_handle, status>> {
+                    co_return co_await js_publish_fire(
+                        restore_arg(subject_copy), restore_arg(payload_copy), headers_copy, timeout);
+                },
+                asio::use_awaitable);
+        }
+
+        auto router_status = co_await ensure_js_ack_router();
+        if (router_status.failed()) {
+            co_return std::pair<js_ack_handle, status>{{}, router_status};
+        }
+
+        uint64_t token = ++m_js_ack_next_token;
+        std::string reply_subject = m_js_ack_inbox_base;
+        reply_subject.push_back('.');
+        reply_subject += std::to_string(token);
+
+        auto wait_state = std::make_shared<js_ack_wait_state>();
+        wait_state->token = token;
+        m_js_ack_waiters.emplace(token, wait_state);
+
+        status pub_status;
+        if (headers.empty()) {
+            pub_status = co_await publish(subject, payload, optional<string_view>{reply_subject});
+        } else {
+            pub_status = co_await publish(subject, payload, headers, optional<string_view>{reply_subject});
+        }
+
+        if (pub_status.failed()) {
+            m_js_ack_waiters.erase(token);
+            co_return std::pair<js_ack_handle, status>{{}, pub_status};
+        }
+
+        wait_state->wake_timer =
+            std::make_shared<asio::steady_timer>(co_await asio::this_coro::executor);
+        wait_state->wake_timer->expires_after(timeout);
+        // Deliberately not awaited here - js_publish_await() does that.
+
+        co_return std::pair<js_ack_handle, status>{js_ack_handle{std::move(wait_state)}, status()};
+    }
+
+    // The "await" half: awaits the timer js_publish_fire() already
+    // started and returns the ack, same result js_publish_impl()'s
+    // combined call would have produced. Must be called from this same
+    // connection (redispatches onto its own strand otherwise, same as
+    // every other connection-affine operation here) - the handle's
+    // wait_state is only ever mutated by this connection's own ack
+    // subscription callback, so awaiting it from elsewhere would be a
+    // real data race, not just a slow path.
+    asio::awaitable<std::pair<js_pub_ack, status>> js_publish_await(js_ack_handle handle) {
+        if (!m_strand.running_in_this_thread()) {
+            co_return co_await asio::co_spawn(
+                m_strand,
+                [this, handle]() -> asio::awaitable<std::pair<js_pub_ack, status>> {
+                    co_return co_await js_publish_await(handle);
+                },
+                asio::use_awaitable);
+        }
+
+        auto wait_state = std::static_pointer_cast<js_ack_wait_state>(handle.impl);
+
+        // The ack may well have already arrived and set ready=true before
+        // this await was even called (that's the entire point of the fire/
+        // await split - firing a whole batch before awaiting any of it).
+        // wake_timer->cancel() in that case was called with no pending
+        // wait to cancel, so it's a no-op that does NOT move the timer's
+        // expiry up - calling async_wait() unconditionally here would just
+        // sit until the original fire-time-plus-timeout deadline for every
+        // handle whose ack already landed, instead of returning instantly.
+        // Only actually wait when the ack genuinely hasn't arrived yet.
+        if (!wait_state->ready) {
+            auto [ec] = co_await wait_state->wake_timer->async_wait(asio::as_tuple(asio::use_awaitable));
+
+            if (!wait_state->ready) {
+                auto it = m_js_ack_waiters.find(wait_state->token);
+                if (it != m_js_ack_waiters.end()) {
+                    m_js_ack_waiters.erase(it);
+                }
+                if (ec && ec != asio::error::operation_aborted) {
+                    co_return std::pair<js_pub_ack, status>{{}, status(ec.message())};
+                }
+                co_return std::pair<js_pub_ack, status>{
+                    {}, status(error_code::ack_timeout, "JetStream publish ack timeout")};
+            }
         }
 
         co_return std::pair<js_pub_ack, status>{std::move(wait_state->ack),
@@ -4224,6 +4357,41 @@ private:
 
         // Use JetStream publish to get acknowledgment with sequence number
         auto [ack, pub_status] = co_await js_publish_impl(subject, value, {}, timeout, true);
+
+        if (pub_status.failed()) {
+            co_return std::pair<uint64_t, status>{0, pub_status};
+        }
+
+        co_return std::pair<uint64_t, status>{ack.sequence, status()};
+    }
+
+    // Pipelined kv_put(): same validation and subject computation as
+    // kv_put_impl(), then js_publish_fire() instead of the combined
+    // js_publish_impl(). See js_publish_fire()'s doc for what "fired"
+    // means here.
+    asio::awaitable<std::pair<js_ack_handle, status>> kv_put_fire_impl(
+        string_view bucket, string_view key, std::span<const char> value,
+        std::chrono::milliseconds timeout) {
+
+        if (auto err = validate_kv_bucket(bucket); !err.empty()) {
+            co_return std::pair<js_ack_handle, status>{{}, status(err)};
+        }
+        if (auto err = validate_kv_key(key); !err.empty()) {
+            co_return std::pair<js_ack_handle, status>{{}, status(err)};
+        }
+
+        if (!m_is_connected) {
+            co_return std::pair<js_ack_handle, status>{{}, status(error_code::not_connected)};
+        }
+
+        std::string subject = m_kv_cache.kv_subject(bucket, key);
+        co_return co_await js_publish_fire(subject, value, {}, timeout);
+    }
+
+    // The other half of kv_put_fire_impl(): awaits the handle and
+    // extracts the revision number, same shape kv_put_impl() returns.
+    asio::awaitable<std::pair<uint64_t, status>> kv_put_await_impl(js_ack_handle handle) {
+        auto [ack, pub_status] = co_await js_publish_await(std::move(handle));
 
         if (pub_status.failed()) {
             co_return std::pair<uint64_t, status>{0, pub_status};
