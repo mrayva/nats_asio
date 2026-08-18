@@ -25,6 +25,7 @@ SOFTWARE.
 
 #pragma once
 
+#include "../include/js_ack_pipeline.hpp"
 #include "../include/worker.hpp"
 #include "../include/string_utils.hpp"
 #include "../include/zerialize_json.hpp"
@@ -42,11 +43,8 @@ SOFTWARE.
 #include <span>
 #include <string>
 #include <vector>
-#include <deque>
 #include <memory>
 #include <chrono>
-#include <mutex>
-#include <random>
 
 namespace nats_tool {
 
@@ -73,14 +71,17 @@ public:
               bool js_create_stream = false,
               int js_max_retries = 3)
         : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
+          m_ack_pipeline(m_log, m_connections, m_ioc.get_executor(), js_max_retries,
+                         std::chrono::milliseconds(js_timeout_ms), headers),
           m_topic(topic), m_next_conn(0), m_in_flight(0), m_max_in_flight(max_in_flight),
           m_jetstream(jetstream), m_js_timeout(std::chrono::milliseconds(js_timeout_ms)),
           m_wait_for_ack(wait_for_ack), m_headers(headers), m_reply_to(reply_to),
           m_count(count), m_sleep_ms(sleep_ms), m_data(data), m_input_cfg(in_cfg),
           m_src_cfg(src_cfg), m_format(format), m_input_reader(ioc, src_cfg, console),
           m_js_window_size(js_window_size), m_js_stream(js_stream),
-          m_js_create_stream(js_create_stream), m_js_max_retries(js_max_retries),
-          m_strand(asio::make_strand(ioc)) {
+          m_js_create_stream(js_create_stream), m_strand(asio::make_strand(ioc)) {
+
+        m_ack_pipeline.on_success = [this](const nats_tool::js_ack_task&) { m_counter++; };
 
         m_log->debug("Publisher constructor complete, starting read_and_publish on strand");
 
@@ -93,22 +94,34 @@ public:
     }
 
     asio::awaitable<void> read_and_publish() {
-        // Wait until at least one connection is ready
-        while (!has_connected_connection()) {
-            asio::steady_timer timer(co_await asio::this_coro::executor);
-            timer.expires_after(std::chrono::milliseconds(100));
-            co_await timer.async_wait(asio::use_awaitable);
+        // m_ack_pipeline.init() (below) subscribes on every connection,
+        // not just one, so the ack-wait path needs all of them up first
+        // or subscribe() fails outright on whichever hasn't finished
+        // connecting yet. The other paths only ever need one to make
+        // progress (get_next_connection() skips any that aren't ready).
+        if (m_jetstream && m_wait_for_ack) {
+            while (!has_all_connections_connected()) {
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(100));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+        } else {
+            while (!has_connected_connection()) {
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(100));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
         }
 
         if (m_jetstream && m_wait_for_ack) {
-            auto s = co_await init_js_ack_pipeline();
+            auto s = co_await m_ack_pipeline.init();
             if (s.failed()) {
                 m_log->error("Failed to initialize JetStream ACK pipeline: {}", s.error());
                 mark_failed();
                 m_ioc.stop();
                 co_return;
             }
-            asio::co_spawn(m_strand, ack_timeout_loop(), asio::detached);
+            asio::co_spawn(m_strand, m_ack_pipeline.timeout_loop(), asio::detached);
         }
 
         // Ensure JetStream stream exists if requested
@@ -269,20 +282,17 @@ public:
             co_await timer.async_wait(asio::use_awaitable);
         }
         if (m_jetstream && m_wait_for_ack) {
-            m_log->info("Input complete, waiting for {} in-flight ACKs", m_ack_pending.load());
-            while (m_ack_pending > 0) {
+            m_log->info("Input complete, waiting for {} in-flight ACKs", m_ack_pipeline.pending());
+            while (m_ack_pipeline.pending() > 0) {
                 asio::steady_timer timer(co_await asio::this_coro::executor);
                 timer.expires_after(std::chrono::milliseconds(10));
                 co_await timer.async_wait(asio::use_awaitable);
             }
-            m_ack_pipeline_stop.store(true, std::memory_order_release);
-        }
-        if (m_jetstream && m_wait_for_ack) {
+            m_ack_pipeline.stop();
             m_log->info("ACK mode stats: acked={}, failed={}, retries={}",
-                        m_ack_success_total.load(std::memory_order_relaxed),
-                        m_ack_failures.load(std::memory_order_relaxed),
-                        m_ack_retries.load(std::memory_order_relaxed));
-            if (m_ack_failures.load(std::memory_order_relaxed) != 0) {
+                        m_ack_pipeline.success_total(), m_ack_pipeline.failure_total(),
+                        m_ack_pipeline.retry_total());
+            if (m_ack_pipeline.failure_total() != 0) {
                 mark_failed();
             }
         }
@@ -404,32 +414,14 @@ private:
     asio::awaitable<void> publish_message(const std::string& subject, const std::string& payload) {
         // JetStream ACK pipeline path: publish with reply token and process ACKs asynchronously.
         if (m_jetstream && m_wait_for_ack) {
-            while (m_ack_pending >= static_cast<int>(m_js_window_size)) {
+            while (m_ack_pipeline.pending() >= static_cast<int>(m_js_window_size)) {
                 asio::steady_timer timer(co_await asio::this_coro::executor);
                 timer.expires_after(std::chrono::milliseconds(1));
                 co_await timer.async_wait(asio::use_awaitable);
             }
 
-            auto [conn, conn_idx] = get_next_connection_with_index();
-            if (!conn || conn_idx >= m_ack_conns.size()) {
-                m_ack_failures.fetch_add(1, std::memory_order_relaxed);
-                co_return;
-            }
-
-            auto token = m_ack_conns[conn_idx].next_token++;
-            std::string reply = m_ack_conns[conn_idx].inbox_base;
-            reply.push_back('.');
-            reply += std::to_string(token);
-
-            ack_publish_task task;
-            task.conn = std::move(conn);
-            task.conn_idx = conn_idx;
-            task.token = token;
-            task.reply_subject = std::move(reply);
-            task.subject = subject;
-            task.payload = payload;
-            task.retry_count = 0;
-            schedule_ack_publish(std::move(task));
+            auto conn_idx = get_next_connection_with_index().second;
+            m_ack_pipeline.schedule_put(conn_idx, subject, payload);
             co_return;
         }
 
@@ -458,13 +450,10 @@ private:
             co_return;
         }
 
-        // Original implementation for non-JetStream or fire-and-forget mode
-        // Backpressure: wait if too many publishes in flight
-        auto in_flight_limit = m_max_in_flight;
-        if (m_jetstream && m_wait_for_ack) {
-            in_flight_limit = std::max(m_max_in_flight, static_cast<int>(m_js_window_size));
-        }
-        while (m_in_flight >= in_flight_limit) {
+        // Plain (non-JetStream) publish path. m_jetstream is always false
+        // here: the wait_for_ack and fire-and-forget JetStream cases both
+        // return early above, so this is the only case left.
+        while (m_in_flight >= m_max_in_flight) {
             asio::steady_timer timer(co_await asio::this_coro::executor);
             timer.expires_after(std::chrono::milliseconds(5));
             co_await timer.async_wait(asio::use_awaitable);
@@ -480,46 +469,19 @@ private:
             m_ioc,
             [this, conn, subj, msg]() -> asio::awaitable<void> {
                 std::span<const char> payload_span(msg->data(), msg->size());
+                std::optional<nats_asio::string_view> reply_opt = m_reply_to.empty()
+                    ? std::nullopt
+                    : std::optional<nats_asio::string_view>(m_reply_to);
                 nats_asio::status s;
-
-                if (m_jetstream) {
-                    int attempts = 1;
-                    if (m_wait_for_ack && m_js_max_retries > 0) {
-                        attempts += m_js_max_retries;
-                    }
-                    for (int attempt = 0; attempt < attempts; ++attempt) {
-                        if (m_headers.empty()) {
-                            auto [ack, status] = co_await conn->js_publish(*subj, payload_span, m_js_timeout, m_wait_for_ack);
-                            s = status;
-                        } else {
-                            auto [ack, status] = co_await conn->js_publish(*subj, payload_span, m_headers, m_js_timeout, m_wait_for_ack);
-                            s = status;
-                        }
-                        if (s.ok()) {
-                            break;
-                        }
-                        if (m_wait_for_ack && attempt + 1 < attempts) {
-                            m_ack_retries.fetch_add(1, std::memory_order_relaxed);
-                        }
-                    }
+                if (m_headers.empty()) {
+                    s = co_await conn->publish(*subj, payload_span, reply_opt);
                 } else {
-                    std::optional<nats_asio::string_view> reply_opt = m_reply_to.empty()
-                        ? std::nullopt
-                        : std::optional<nats_asio::string_view>(m_reply_to);
-                    if (m_headers.empty()) {
-                        s = co_await conn->publish(*subj, payload_span, reply_opt);
-                    } else {
-                        s = co_await conn->publish(*subj, payload_span, m_headers, reply_opt);
-                    }
+                    s = co_await conn->publish(*subj, payload_span, m_headers, reply_opt);
                 }
 
                 if (s.failed()) {
-                    if (m_jetstream && m_wait_for_ack) {
-                        m_ack_failures.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        m_log->error("publish failed: {}", s.error());
-                        mark_failed();
-                    }
+                    m_log->error("publish failed: {}", s.error());
+                    mark_failed();
                 } else {
                     m_counter++;
                 }
@@ -539,6 +501,15 @@ private:
             }
         }
         return false;
+    }
+
+    bool has_all_connections_connected() const {
+        for (const auto& conn : m_connections) {
+            if (!conn->is_connected()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     nats_asio::iconnection_sptr get_next_connection() {
@@ -568,264 +539,8 @@ private:
         return {m_connections[0], 0};
     }
 
-    struct ack_conn_state {
-        nats_asio::iconnection_sptr conn;
-        std::string inbox_base;
-        uint64_t next_token{1};
-        nats_asio::isubscription_sptr sub;
-    };
-
-    struct ack_publish_task {
-        nats_asio::iconnection_sptr conn;
-        std::size_t conn_idx = 0;
-        uint64_t token = 0;
-        std::string reply_subject;
-        std::string subject;
-        std::string payload;
-        int retry_count = 0;
-    };
-
-    struct ack_pending_slot {
-        bool active = false;
-        uint64_t token = 0;
-        ack_publish_task task;
-        std::chrono::steady_clock::time_point sent_at;
-    };
-
-    std::size_t ack_slot_index(std::size_t conn_idx, uint64_t token) const {
-        const auto& slots = m_ack_pending_slots[conn_idx];
-        return static_cast<std::size_t>(token % slots.size());
-    }
-
-    std::string build_ack_inbox_base(std::size_t conn_idx) {
-        std::uniform_int_distribution<uint64_t> dist;
-        std::string base("_INBOX.NATS_TOOL_ACK.");
-        base += std::to_string(dist(m_ack_rng));
-        base.push_back('.');
-        base += std::to_string(conn_idx);
-        return base;
-    }
-
-    void on_ack_message(std::size_t conn_idx, nats_asio::string_view subject,
-                        std::span<const char> data) {
-        if (conn_idx >= m_ack_conns.size()) {
-            return;
-        }
-        const auto& base = m_ack_conns[conn_idx].inbox_base;
-        if (subject.size() <= base.size() + 1 ||
-            subject.substr(0, base.size()) != base ||
-            subject[base.size()] != '.') {
-            return;
-        }
-
-        auto token_sv = subject.substr(base.size() + 1);
-        uint64_t token = 0;
-        auto [end, ec] = std::from_chars(token_sv.data(), token_sv.data() + token_sv.size(), token);
-        if (ec != std::errc{} || end != token_sv.data() + token_sv.size()) {
-            return;
-        }
-
-        bool success = true;
-        nats_asio::string_view payload_sv(data.data(), data.size());
-        if (payload_sv.find("\"error\"") != nats_asio::string_view::npos) {
-            success = false;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(m_ack_pending_mutexes[conn_idx]);
-            auto& slots = m_ack_pending_slots[conn_idx];
-            auto idx = ack_slot_index(conn_idx, token);
-            auto& slot = slots[idx];
-            if (!slot.active || slot.token != token) {
-                return;  // Timed out or already handled.
-            }
-            slot.active = false;
-        }
-        m_ack_pending.fetch_sub(1, std::memory_order_relaxed);
-        if (success) {
-            m_counter.fetch_add(1, std::memory_order_relaxed);
-            m_ack_success_total.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            m_ack_failures.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    void schedule_ack_publish(ack_publish_task task) {
-        if (m_ack_pipeline_stop.load(std::memory_order_acquire)) {
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(m_ack_pending_mutexes[task.conn_idx]);
-            auto& slots = m_ack_pending_slots[task.conn_idx];
-            auto idx = ack_slot_index(task.conn_idx, task.token);
-            auto& slot = slots[idx];
-            if (slot.active && slot.token != task.token) {
-                m_ack_failures.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-            slot.active = true;
-            slot.token = task.token;
-            slot.task = task;
-            slot.sent_at = std::chrono::steady_clock::now();
-        }
-        m_ack_pending.fetch_add(1, std::memory_order_relaxed);
-        m_in_flight.fetch_add(1, std::memory_order_relaxed);
-
-        if (m_headers.empty()) {
-            std::span<const char> payload_span(task.payload.data(), task.payload.size());
-            std::optional<nats_asio::string_view> reply_to(task.reply_subject);
-            auto s = task.conn->publish_queued(task.subject, payload_span, reply_to);
-            if (s.failed()) {
-                handle_ack_publish_failure(std::move(task));
-            }
-            m_in_flight.fetch_sub(1, std::memory_order_relaxed);
-            return;
-        }
-
-        m_ack_send_queues[task.conn_idx].push_back(std::move(task));
-        if (!m_ack_sender_running[task.conn_idx]) {
-            m_ack_sender_running[task.conn_idx] = true;
-            asio::co_spawn(m_strand, ack_send_loop(task.conn_idx), asio::detached);
-        }
-    }
-
-    void handle_ack_publish_failure(ack_publish_task task) {
-        bool removed = false;
-        {
-            std::lock_guard<std::mutex> lock(m_ack_pending_mutexes[task.conn_idx]);
-            auto& slots = m_ack_pending_slots[task.conn_idx];
-            auto idx = ack_slot_index(task.conn_idx, task.token);
-            auto& slot = slots[idx];
-            if (slot.active && slot.token == task.token) {
-                slot.active = false;
-                removed = true;
-            }
-        }
-
-        if (!removed) {
-            return;
-        }
-
-        m_ack_pending.fetch_sub(1, std::memory_order_relaxed);
-        if (task.retry_count < m_js_max_retries) {
-            task.retry_count++;
-            m_ack_retries.fetch_add(1, std::memory_order_relaxed);
-            schedule_ack_publish(std::move(task));
-        } else {
-            m_ack_failures.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    asio::awaitable<void> ack_send_loop(std::size_t conn_idx) {
-        while (!m_ack_pipeline_stop.load(std::memory_order_acquire)) {
-            auto& queue = m_ack_send_queues[conn_idx];
-            if (queue.empty()) {
-                break;
-            }
-
-            auto task = std::move(queue.front());
-            queue.pop_front();
-
-            std::span<const char> payload_span(task.payload.data(), task.payload.size());
-            std::optional<nats_asio::string_view> reply_to(task.reply_subject);
-
-            nats_asio::status s;
-            if (m_headers.empty()) {
-                s = co_await task.conn->publish(task.subject, payload_span, reply_to);
-            } else {
-                s = co_await task.conn->publish(task.subject, payload_span, m_headers, reply_to);
-            }
-
-            if (s.failed()) {
-                handle_ack_publish_failure(std::move(task));
-            }
-
-            m_in_flight.fetch_sub(1, std::memory_order_relaxed);
-        }
-
-        m_ack_sender_running[conn_idx] = false;
-        co_return;
-    }
-
-    asio::awaitable<nats_asio::status> init_js_ack_pipeline() {
-        m_ack_conns.clear();
-        m_ack_conns.resize(m_connections.size());
-        m_ack_pending_slots.clear();
-        m_ack_pending_slots.resize(m_connections.size());
-        m_ack_pending_mutexes.clear();
-        m_ack_pending_mutexes.resize(m_connections.size());
-        m_ack_send_queues.clear();
-        m_ack_send_queues.resize(m_connections.size());
-        m_ack_sender_running.clear();
-        m_ack_sender_running.resize(m_connections.size(), false);
-
-        auto slot_count = std::max<std::size_t>(4096, m_js_window_size * 4);
-        for (auto& slots : m_ack_pending_slots) {
-            slots.clear();
-            slots.resize(slot_count);
-        }
-
-        for (std::size_t i = 0; i < m_connections.size(); ++i) {
-            auto& state = m_ack_conns[i];
-            state.conn = m_connections[i];
-            state.inbox_base = build_ack_inbox_base(i);
-            std::string filter = state.inbox_base + ".*";
-
-            auto [sub, s] = co_await state.conn->subscribe(
-                filter,
-                [this, i](nats_asio::string_view subject,
-                          std::optional<nats_asio::string_view> /*reply*/,
-                          std::span<const char> data) -> asio::awaitable<void> {
-                    on_ack_message(i, subject, data);
-                    co_return;
-                });
-            if (s.failed()) {
-                co_return s;
-            }
-            state.sub = sub;
-        }
-
-        co_return nats_asio::status();
-    }
-
-    asio::awaitable<void> ack_timeout_loop() {
-        while (!m_ack_pipeline_stop.load(std::memory_order_acquire)) {
-            asio::steady_timer timer(co_await asio::this_coro::executor);
-            timer.expires_after(std::chrono::milliseconds(10));
-            co_await timer.async_wait(asio::use_awaitable);
-
-            auto now = std::chrono::steady_clock::now();
-            std::vector<ack_publish_task> retry_tasks;
-            for (std::size_t i = 0; i < m_ack_pending_slots.size(); ++i) {
-                std::lock_guard<std::mutex> lock(m_ack_pending_mutexes[i]);
-                auto& slots = m_ack_pending_slots[i];
-                for (auto& slot : slots) {
-                    if (!slot.active) {
-                        continue;
-                    }
-                    if (now - slot.sent_at > m_js_timeout) {
-                        auto task = slot.task;
-                        slot.active = false;
-                        m_ack_pending.fetch_sub(1, std::memory_order_relaxed);
-                        if (task.retry_count < m_js_max_retries) {
-                            task.retry_count++;
-                            m_ack_retries.fetch_add(1, std::memory_order_relaxed);
-                            retry_tasks.push_back(std::move(task));
-                        } else {
-                            m_ack_failures.fetch_add(1, std::memory_order_relaxed);
-                        }
-                    }
-                }
-            }
-
-            for (auto& task : retry_tasks) {
-                schedule_ack_publish(std::move(task));
-            }
-        }
-        co_return;
-    }
-
     std::vector<nats_asio::iconnection_sptr> m_connections;
+    js_ack_pipeline m_ack_pipeline;
     std::string m_topic;
     std::atomic<std::size_t> m_next_conn;
     std::atomic<int> m_in_flight;
@@ -859,19 +574,7 @@ private:
     std::size_t m_js_window_size;
     std::string m_js_stream;
     bool m_js_create_stream;
-    int m_js_max_retries;
     std::atomic<bool> m_failed{false};
-    std::atomic<uint64_t> m_ack_failures{0};
-    std::atomic<uint64_t> m_ack_retries{0};
-    std::atomic<uint64_t> m_ack_success_total{0};
-    std::atomic<int> m_ack_pending{0};
-    std::atomic<bool> m_ack_pipeline_stop{false};
-    std::vector<ack_conn_state> m_ack_conns;
-    std::vector<std::vector<ack_pending_slot>> m_ack_pending_slots;
-    std::deque<std::mutex> m_ack_pending_mutexes;
-    std::vector<std::deque<ack_publish_task>> m_ack_send_queues;
-    std::vector<bool> m_ack_sender_running;
-    std::mt19937_64 m_ack_rng{std::random_device{}()};
 
     // Strand for thread-safe multi-threaded execution
     asio::strand<asio::io_context::executor_type> m_strand;

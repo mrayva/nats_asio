@@ -25,6 +25,7 @@ SOFTWARE.
 
 #pragma once
 
+#include "../include/js_ack_pipeline.hpp"
 #include "../include/worker.hpp"
 #include "common.hpp"
 #include <nats_asio/nats_asio.hpp>
@@ -37,7 +38,6 @@ SOFTWARE.
 #include <asio/use_awaitable.hpp>
 #include <spdlog/spdlog.h>
 #include <cassert>
-#include <span>
 #include <string>
 #include <chrono>
 #include <memory>
@@ -66,36 +66,60 @@ public:
     // is indexed in lockstep with it: shards[i] is the dedicated
     // io_context connections[i] was constructed on (mirroring pub mode's
     // io_shards - one connection, one io_context, one OS thread running
-    // it). Each dispatched operation co_spawns onto *its* connection's
-    // own shard, so the connection is only ever touched from the single
-    // thread that owns it - no cross-thread strand hand-off.
+    // it). kv_delete (the only operation still dispatched as an
+    // individual coroutine - see handle_line()) co_spawns onto *its*
+    // connection's own shard, so the connection is only ever touched
+    // from the single thread that owns it for that path - no
+    // cross-thread strand hand-off.
     //
-    // Left empty, every operation co_spawns onto the shared `ioc`
-    // instead (single-connection default, or --threads servicing one
-    // shared io_context) - measured to have a real, unresolved
-    // oscillating-throughput pathology under multiple threads sharing
-    // one io_context with multiple strand-bound connections (burst then
-    // near-stall, repeating on a ~5s cycle - not a deadlock, confirmed
-    // via gdb thread dumps mid-stall showing genuine in-progress work on
-    // every thread, just badly paced). Use `shards` for real
-    // multi-connection throughput; the no-shards path exists for the
-    // single-connection case where there's only one strand and no
-    // hand-off to have a problem with.
+    // kv_put itself no longer needs shard dispatch at all: it goes
+    // through m_ack_pipeline, which fires via publish_queued() - a
+    // lock-based, thread-safe fast path connections expose specifically
+    // so callers don't need strand affinity to use it. See
+    // js_ack_pipeline.hpp's doc comment for the full rationale (this
+    // pipeline is shared with publisher.hpp's --js --wait_for_ack path;
+    // ~2x the throughput of the older per-message-coroutine design this
+    // class used to have).
     kv_publisher(asio::io_context& ioc, std::shared_ptr<spdlog::logger>& console,
                  std::vector<nats_asio::iconnection_sptr> connections,
                  std::vector<std::shared_ptr<asio::io_context>> shards, const std::string& bucket,
                  int stats_interval, int max_in_flight, const std::string& separator,
                  int kv_timeout_ms)
-        : worker(ioc, console, stats_interval), m_connections(std::move(connections)),
-          m_shards(std::move(shards)),
-          m_bucket(bucket), m_in_flight(m_connections.size()), m_max_in_flight(max_in_flight),
-          m_separator(separator), m_kv_timeout(std::chrono::milliseconds(kv_timeout_ms)),
+        : worker(ioc, console, stats_interval), m_connections(connections),
+          m_ack_pipeline(m_log, std::move(connections), ioc.get_executor(), kDefaultMaxRetries,
+                         std::chrono::milliseconds(kv_timeout_ms)),
+          m_shards(std::move(shards)), m_bucket(bucket), m_delete_in_flight(0),
+          m_max_in_flight(max_in_flight), m_separator(separator),
+          m_kv_timeout(std::chrono::milliseconds(kv_timeout_ms)),
           m_stdin(ioc, ::dup(STDIN_FILENO)), m_next_conn(0) {
         assert(m_shards.empty() || m_shards.size() == m_connections.size());
+        m_ack_pipeline.on_success = [this](const js_ack_task&) { m_counter++; };
+        m_ack_pipeline.on_failure = [this](const js_ack_task& task, const std::string& reason) {
+            m_log->error("kv_put failed for key '{}': {}", task.tag, reason);
+        };
         asio::co_spawn(ioc, read_and_publish(), asio::detached);
     }
 
     asio::awaitable<void> read_and_publish() {
+        // m_ack_pipeline.init() subscribes on every connection in
+        // m_connections, not just one - unlike handle_line()'s per-op
+        // wait (any one connection is enough to make progress), this
+        // needs all of them up first, or subscribe() fails outright on
+        // whichever hasn't finished connecting yet.
+        while (!has_all_connections_connected()) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(100));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        auto init_status = co_await m_ack_pipeline.init();
+        if (init_status.failed()) {
+            m_log->error("Failed to initialize KV put ACK pipeline: {}", init_status.error());
+            m_ioc.stop();
+            co_return;
+        }
+        asio::co_spawn(m_ioc, m_ack_pipeline.timeout_loop(), asio::detached);
+
         co_await read_stdin_lines(m_stdin, m_log, [this](const std::string& line) {
             return handle_line(line);
         });
@@ -107,6 +131,7 @@ public:
             timer.expires_after(std::chrono::milliseconds(50));
             co_await timer.async_wait(asio::use_awaitable);
         }
+        m_ack_pipeline.stop();
 
         m_log->info("All KV operations complete, stopping");
         m_ioc.stop();
@@ -114,6 +139,11 @@ public:
     }
 
 private:
+    // Same starting point as publisher mode's --js_max_retries default -
+    // pubkv has no CLI flag of its own for this yet, so it just inherits
+    // that default rather than adding one before it's needed.
+    static constexpr int kDefaultMaxRetries = 3;
+
     asio::awaitable<void> handle_line(const std::string& line) {
         // Parse key|value - find first separator
         auto sep_pos = line.find(m_separator);
@@ -137,58 +167,31 @@ private:
             is_delete = true;
         }
 
-        // Wait until at least one connection is ready
-        while (!has_connected_connection()) {
-            asio::steady_timer timer(co_await asio::this_coro::executor);
-            timer.expires_after(std::chrono::milliseconds(100));
-            co_await timer.async_wait(asio::use_awaitable);
-        }
-
-        // Pick this operation's connection once, up front - it keeps
-        // using the same one for its whole lifetime, same as
-        // publisher::get_next_connection_with_index()'s callers. Picked
-        // before the backpressure check below so that check (and the
-        // in-flight counter it gates) is per-connection, not shared
-        // across every connection - a single counter incremented by the
-        // main thread and decremented by whichever of N shard threads
-        // happens to finish an op is a real, measured source of
-        // cross-thread cache-line contention (confirmed via perf: a
-        // meaningful chunk of __pv_queued_spin_lock_slowpath/
-        // pthread_mutex_lock time). Splitting it per connection still
-        // crosses threads (main increments, that connection's one shard
-        // thread decrements), but only ever between those same two
-        // threads instead of all of them fighting over one cache line.
+        // No per-line connection-readiness wait here: read_and_publish()
+        // already waited for every connection before it started reading,
+        // and get_next_connection() below has its own defensive skip-if-
+        // disconnected retry - re-scanning all connections on every
+        // single line on top of that was pure redundant overhead on the
+        // hot path.
         auto [conn, idx] = get_next_connection();
 
-        // Backpressure: wait if too many operations in flight *on this
-        // connection* - --max_in_flight is a per-connection cap, same as
-        // it always effectively was (round-robin already spread load
-        // across connections; this just makes the counter match that).
-        while (m_in_flight[idx] >= m_max_in_flight) {
-            asio::steady_timer timer(co_await asio::this_coro::executor);
-            timer.expires_after(std::chrono::milliseconds(5));
-            co_await timer.async_wait(asio::use_awaitable);
-        }
+        if (is_delete) {
+            // kv_delete has no ack-pipeline equivalent (not the
+            // throughput-critical path this was built for) - same
+            // individual fire-and-await-inline shape as before, still on
+            // this connection's own dedicated shard, with its own small
+            // backpressure budget separate from puts.
+            while (m_delete_in_flight >= m_max_in_flight) {
+                asio::steady_timer timer(co_await asio::this_coro::executor);
+                timer.expires_after(std::chrono::milliseconds(5));
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+            m_delete_in_flight++;
 
-        m_in_flight[idx]++;
-
-        // Dispatch onto that connection's own dedicated shard when one
-        // exists, so the connection is only ever touched from the single
-        // thread that owns it - see this class's constructor doc for why
-        // that matters. Falls back to the shared m_ioc when there are no
-        // shards (single connection, or the unsharded multi-connection
-        // path).
-        asio::io_context& target_ioc = m_shards.empty() ? m_ioc : *m_shards[idx];
-
-        // Capture data for async operation
-        auto key_copy = std::make_shared<std::string>(std::move(key));
-        auto value_copy = std::make_shared<std::string>(std::move(value_part));
-
-        // Fire-and-forget: dispatch KV operation without waiting
-        asio::co_spawn(
-            target_ioc,
-            [this, conn, idx, key_copy, value_copy, is_delete]() -> asio::awaitable<void> {
-                if (is_delete) {
+            auto key_copy = std::make_shared<std::string>(std::move(key));
+            asio::co_spawn(
+                shard_for(idx),
+                [this, conn, key_copy]() -> asio::awaitable<void> {
                     auto [rev, s] = co_await conn->kv_delete(m_bucket, *key_copy, m_kv_timeout);
                     if (s.failed()) {
                         m_log->error("kv_delete failed for key '{}': {}", *key_copy, s.error());
@@ -196,31 +199,36 @@ private:
                         m_counter++;
                         m_log->debug("deleted key '{}' rev={}", *key_copy, rev);
                     }
-                } else {
-                    std::span<const char> value_span(value_copy->data(), value_copy->size());
-                    auto [rev, s] = co_await conn->kv_put(m_bucket, *key_copy, value_span, m_kv_timeout);
-                    if (s.failed()) {
-                        m_log->error("kv_put failed for key '{}': {}", *key_copy, s.error());
-                    } else {
-                        m_counter++;
-                        m_log->debug("put key '{}' rev={}", *key_copy, rev);
-                    }
-                }
-                m_in_flight[idx]--;
-                co_return;
-            },
-            asio::detached);
+                    m_delete_in_flight--;
+                    co_return;
+                },
+                asio::detached);
+            co_return;
+        }
 
+        // kv_put: backpressure against the pipeline's own global pending
+        // count (mirrors publisher mode's --js_window check), then fire
+        // synchronously - schedule_put() is not a coroutine and doesn't
+        // need shard dispatch, so this returns immediately with no
+        // per-message co_spawn at all.
+        while (m_ack_pipeline.pending() >= m_max_in_flight) {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(1));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+
+        std::string subject = nats_asio::subjects::kv_subject(m_bucket, key);
+        m_ack_pipeline.schedule_put(idx, std::move(subject), std::move(value_part), std::move(key));
         co_return;
     }
 
-    bool has_connected_connection() const {
+    bool has_all_connections_connected() const {
         for (const auto& conn : m_connections) {
-            if (conn->is_connected()) {
-                return true;
+            if (!conn->is_connected()) {
+                return false;
             }
         }
-        return false;
+        return true;
     }
 
     std::pair<nats_asio::iconnection_sptr, std::size_t> get_next_connection() {
@@ -239,23 +247,26 @@ private:
         return {m_connections[0], 0};
     }
 
+    // Dispatch onto connection idx's own dedicated shard when one
+    // exists (used only by kv_delete now - see this class's constructor
+    // doc for why kv_put no longer needs this). Falls back to the shared
+    // m_ioc when there are no shards (single connection, or the
+    // unsharded multi-connection path).
+    asio::io_context& shard_for(std::size_t idx) {
+        return m_shards.empty() ? m_ioc : *m_shards[idx];
+    }
+
     // Only used for the EOF drain-wait log/poll, which happens once per
-    // run (not per message) - summing every connection's counter here is
-    // fine, unlike doing it on the hot per-message path.
+    // run (not per message).
     int total_in_flight() const {
-        int total = 0;
-        for (const auto& c : m_in_flight) {
-            total += c.load(std::memory_order_relaxed);
-        }
-        return total;
+        return m_ack_pipeline.pending() + m_delete_in_flight.load(std::memory_order_relaxed);
     }
 
     std::vector<nats_asio::iconnection_sptr> m_connections;
+    js_ack_pipeline m_ack_pipeline;
     std::vector<std::shared_ptr<asio::io_context>> m_shards;
     std::string m_bucket;
-    // One counter per connection, not one shared across all of them -
-    // see handle_line()'s comment on get_next_connection() for why.
-    std::vector<std::atomic<int>> m_in_flight;
+    std::atomic<int> m_delete_in_flight;
     int m_max_in_flight;
     std::string m_separator;
     std::chrono::milliseconds m_kv_timeout;
