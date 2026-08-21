@@ -27,6 +27,9 @@ SOFTWARE.
 
 #include "../include/worker.hpp"
 #include <nats_asio/nats_asio.hpp>
+#include <zerialize/zerialize.hpp>
+#include <zerialize/dynamic.hpp>
+#include <zerialize/protocols/msgpack.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/posix/stream_descriptor.hpp>
 #include <asio/read_until.hpp>
@@ -64,6 +67,17 @@ public:
         }
         // Pre-format single PUB command for pipelined mode
         m_pub_cmd = fmt::format("PUB {} {}\r\n", m_topic, m_msg_size);
+    }
+
+    // Opt-in: replace the fixed-size dummy payload with a real msgpack
+    // {field: N} document per message - the shape nats_sidecar's
+    // matching_engine reads via zerialize (message body, not NATS headers).
+    // N cycles min..max by message index, so a downstream filter expecting
+    // a known distribution (e.g. "field == min") gets a reproducible one.
+    void set_msgpack_field(std::string field, int min_val, int max_val) {
+        m_msgpack_field = std::move(field);
+        m_msgpack_min = min_val;
+        m_msgpack_max = max_val;
     }
 
     asio::awaitable<void> run() {
@@ -130,13 +144,29 @@ public:
     }
 
 private:
+    // region/etc. cycles min..max by absolute message index, msgpack-encoded
+    // as a single-field map. Small non-negative ints (the common case, e.g.
+    // 1..8) are fixed-width in msgpack (1-byte "positive fixint"), but this
+    // doesn't assume that - callers needing a fixed-size PUB header (the
+    // pipelined path) must still ask this per message and use the real size.
+    std::string build_msgpack_payload(long msg_index) const {
+        long span = static_cast<long>(m_msgpack_max) - m_msgpack_min + 1;
+        int value = m_msgpack_min + static_cast<int>(msg_index % span);
+        auto buf = zerialize::serialize<zerialize::MsgPack>(
+            zerialize::dyn::map({{m_msgpack_field, value}}));
+        return std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+    }
+
     asio::awaitable<void> run_pipelined() {
+        bool msgpack_mode = !m_msgpack_field.empty();
+
         // Build batches of PUB commands and write them using write_raw
         std::string batch_buffer;
         // Pre-calculate single message size: "PUB topic len\r\npayload\r\n"
         size_t single_msg_size = m_pub_cmd.size() + m_payload.size() + 2; // +2 for \r\n after payload
         batch_buffer.reserve(single_msg_size * m_batch_size);
 
+        long msg_index = 0;
         int remaining = m_msg_count;
         while (remaining > 0 && !m_ioc.stopped()) {
             int batch_count = std::min(remaining, m_batch_size);
@@ -144,9 +174,20 @@ private:
 
             // Build batch of PUB commands
             for (int i = 0; i < batch_count; i++) {
-                batch_buffer += m_pub_cmd;
-                batch_buffer += m_payload;
-                batch_buffer += "\r\n";
+                if (msgpack_mode) {
+                    // Variable-length payload in general (even though the
+                    // small-int case here happens to be fixed-width) - each
+                    // message gets its own correctly-sized PUB header,
+                    // can't reuse the pre-formatted m_pub_cmd.
+                    std::string payload = build_msgpack_payload(msg_index++);
+                    batch_buffer += fmt::format("PUB {} {}\r\n", m_topic, payload.size());
+                    batch_buffer += payload;
+                    batch_buffer += "\r\n";
+                } else {
+                    batch_buffer += m_pub_cmd;
+                    batch_buffer += m_payload;
+                    batch_buffer += "\r\n";
+                }
             }
 
             // Write batch using write_raw
@@ -167,10 +208,18 @@ private:
     }
 
     asio::awaitable<void> run_sequential() {
-        std::span<const char> payload_span(m_payload.data(), m_payload.size());
+        bool msgpack_mode = !m_msgpack_field.empty();
+        std::span<const char> fixed_payload_span(m_payload.data(), m_payload.size());
         for (int i = 0; i < m_msg_count && !m_ioc.stopped(); i++) {
             auto conn = get_next_connection();
-            auto s = co_await conn->publish(m_topic, payload_span, std::nullopt);
+            nats_asio::status s;
+            if (msgpack_mode) {
+                std::string payload = build_msgpack_payload(i);
+                std::span<const char> payload_span(payload.data(), payload.size());
+                s = co_await conn->publish(m_topic, payload_span, std::nullopt);
+            } else {
+                s = co_await conn->publish(m_topic, fixed_payload_span, std::nullopt);
+            }
             if (s.failed()) {
                 m_log->error("publish failed: {}", s.error());
             } else {
@@ -246,6 +295,9 @@ private:
     int m_batch_size;
     std::string m_payload;
     std::string m_pub_cmd;
+    std::string m_msgpack_field;  // empty = disabled, use m_payload/m_pub_cmd as before
+    int m_msgpack_min = 0;
+    int m_msgpack_max = 0;
     std::chrono::steady_clock::time_point m_start_time;
     std::vector<long long> m_latencies;
     std::size_t m_next_conn = 0;

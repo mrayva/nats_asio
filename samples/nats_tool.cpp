@@ -272,6 +272,12 @@ int main(int argc, char* argv[]) {
         ("pub_size", "Message size in bytes for bench mode (default: 128)", cxxopts::value<int>())
         ("bench_rtt", "Bench mode: measure round-trip latency using request-reply")
         ("bench_batch", "Bench mode: messages per batch for pipelined publishing (default: 1000)", cxxopts::value<int>())
+        ("msgpack_field", "Bench mode: publish msgpack {field: N} payloads instead of dummy bytes - "
+                           "N cycles msgpack_min..msgpack_max by message index. The shape nats_sidecar's "
+                           "matching_engine reads from the message body via zerialize, not NATS headers.",
+                           cxxopts::value<std::string>())
+        ("msgpack_min", "Bench mode: with --msgpack_field, cycle range lower bound (default: 0)", cxxopts::value<int>())
+        ("msgpack_max", "Bench mode: with --msgpack_field, cycle range upper bound (default: 0)", cxxopts::value<int>())
         ("input_format", "Input format: line (default), json, csv", cxxopts::value<std::string>())
         ("subject_template", "Subject template with {{field}} placeholders (requires json/csv input)", cxxopts::value<std::string>())
         ("payload_fields", "Comma-separated fields to include in payload (default: all)", cxxopts::value<std::string>())
@@ -951,6 +957,16 @@ int main(int argc, char* argv[]) {
 
             bench_ptr = std::make_shared<benchmarker>(ioc, console, bench_connections, topic, stats_interval,
                                                        bench_count, bench_size, use_js, bench_rtt, bench_timeout, bench_batch);
+            if (result.count("msgpack_field")) {
+                int mp_min = result.count("msgpack_min") ? result["msgpack_min"].as<int>() : 0;
+                int mp_max = result.count("msgpack_max") ? result["msgpack_max"].as<int>() : 0;
+                if (mp_max < mp_min) {
+                    console->error("--msgpack_max must be >= --msgpack_min");
+                    return 1;
+                }
+                bench_ptr->set_msgpack_field(result["msgpack_field"].as<std::string>(), mp_min, mp_max);
+                console->info("Bench payloads: msgpack {{{}: {}..{}}}", result["msgpack_field"].as<std::string>(), mp_min, mp_max);
+            }
             asio::co_spawn(ioc, bench_ptr->run(), asio::detached);
         } else if (m == mode::kv_publisher && num_connections > 1) {
             // Dedicated io_context + dedicated OS thread per connection,
