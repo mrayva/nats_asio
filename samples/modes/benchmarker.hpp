@@ -97,7 +97,7 @@ public:
         auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - m_start_time).count();
         double duration_sec = duration_ms / 1000.0;
 
-        std::size_t total_msgs = m_counter;
+        std::size_t total_msgs = m_total_counter;
         std::size_t total_bytes = total_msgs * m_msg_size;
         double msgs_per_sec = duration_sec > 0 ? total_msgs / duration_sec : 0;
         double mb_per_sec = duration_sec > 0 ? (total_bytes / 1024.0 / 1024.0) / duration_sec : 0;
@@ -158,6 +158,7 @@ private:
                 m_log->error("write_raw failed: {}", s.error());
             } else {
                 m_counter += batch_count;
+                m_total_counter += batch_count;
             }
 
             remaining -= batch_count;
@@ -174,6 +175,7 @@ private:
                 m_log->error("publish failed: {}", s.error());
             } else {
                 m_counter++;
+                m_total_counter++;
             }
         }
         co_return;
@@ -188,6 +190,7 @@ private:
                 m_log->error("js_publish failed: {}", s.error());
             } else {
                 m_counter++;
+                m_total_counter++;
             }
         }
         co_return;
@@ -207,6 +210,7 @@ private:
                 auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
                 m_latencies.push_back(latency_us);
                 m_counter++;
+                m_total_counter++;
             }
         }
         co_return;
@@ -245,6 +249,13 @@ private:
     std::chrono::steady_clock::time_point m_start_time;
     std::vector<long long> m_latencies;
     std::size_t m_next_conn = 0;
+    // Separate from worker::m_counter, which stats_timer() exchanges to 0
+    // every stats_interval seconds for the periodic "Stats: N events/sec"
+    // line - reusing that same counter for the final cumulative total
+    // silently discarded almost the whole count on any run spanning more
+    // than one stats tick (i.e. anything slower than ~1 stats_interval),
+    // leaving only whatever accumulated since the last periodic reset.
+    std::atomic<std::size_t> m_total_counter{0};
 };
 
 } // namespace nats_tool
